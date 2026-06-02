@@ -1,0 +1,33 @@
+# Familiar dependencies — everything needed to run, in one file.
+# Install with: pip install -r requirements.txt
+
+# ── UI stack (PyQt6 + WebEngine for the embedded browser) ────────────────
+# Pinned: the binding, its bundled Qt6 runtime, sip, and WebEngine must agree.
+PyQt6==6.10.2
+PyQt6-Qt6==6.10.1
+PyQt6-sip==13.10.3
+PyQt6-WebEngine==6.9.0
+PyQt6-WebEngine-Qt6==6.9.2
+
+# ── Agent runtime ────────────────────────────────────────────────────────
+openai          # LLM API client
+httpx           # async HTTP (used by openai SDK)
+requests        # sync HTTP
+numpy           # numerical ops
+vispy           # GPU-accelerated visualization
+watchdog        # filesystem change detection for hot-reload
+
+# ── Integrated terminal (real PTY so claude/vim/htop run interactively) ──
+pyte                              # VT100/ANSI screen emulator
+pywinpty ; sys_platform == "win32"   # ConPTY pseudo-terminal (Windows)
+ptyprocess ; sys_platform != "win32" # PTY (POSIX fallback)
+
+# ── Code validation (REQUIRED — agent will error on missing imports if absent) ──
+ruff            # Python linter: undefined names, missing imports, syntax. Fast.
+pyflakes        # Python linter: fallback if ruff unavailable
+python-lsp-server  # LSP server for Python semantic analysis (pylsp)
+
+# ── Semantic code indexing (REQUIRED for vector_search tool) ─────────────
+tree-sitter                    # Parser framework used for AST-aware chunking
+tree-sitter-language-pack      # Pre-built grammars: Python, JS, TS, Go, Rust, ...
+sqlite-vec                     # Vector search extension for SQLite
