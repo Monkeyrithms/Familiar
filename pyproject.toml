@@ -1,24 +1,92 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "familiar"
-version = "0.0.1"
+version = "0.1.0"
+description = "Familiar — a local LLM chat agent with modular tools, an integrated PTY terminal, semantic code indexing, and a PyQt6 desktop UI."
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Sara Whitley"}]
+keywords = ["llm", "agent", "pyqt6", "assistant", "tools", "terminal"]
+
 dependencies = [
-    "httpx>=0.28.1",
-    "markdown2>=2.5.5",
-    "numpy>=2.4.6",
-    "openai>=2.40.0",
-    "pyflakes>=3.4.0",
-    "pyqt6==6.10.2",
-    "pyqt6-webengine==6.9.0",
-    "pyte>=0.8.2",
-    "python-lsp-server>=1.14.0",
-    "pywinpty>=3.0.3; sys_platform == 'win32'",
-    "ptyprocess>=0.7.0; sys_platform != 'win32'",
-    "requests>=2.34.2",
-    "ruff>=0.15.15",
-    "sqlite-vec>=0.1.9",
-    "tree-sitter>=0.25.2",
-    "tree-sitter-language-pack>=1.8.1",
-    "vispy>=0.16.2",
-    "watchdog>=6.0.0",
+    # ── UI stack (PyQt6 + WebEngine for the embedded browser) ───────────────
+    # Pinned: the binding, its bundled Qt6 runtime, sip, and WebEngine must agree.
+    "PyQt6==6.10.2",
+    "PyQt6-Qt6==6.10.1",
+    "PyQt6-sip==13.10.3",
+    "PyQt6-WebEngine==6.9.0",
+    "PyQt6-WebEngine-Qt6==6.9.2",
+
+    # ── Agent runtime ──────────────────────────────────────────────────────
+    "openai",              # LLM API client
+    "httpx",               # async HTTP (used by the openai SDK)
+    "requests",            # sync HTTP
+    "numpy",               # numerical ops
+    "vispy",               # GPU-accelerated visualization
+    "watchdog",            # filesystem change detection for hot-reload
+    "Pillow",              # image thumbnails / decoding (PIL) in the chat UI
+
+    # ── Integrated terminal (real PTY so claude/vim/htop run interactively) ─
+    "pyte",                                  # VT100/ANSI screen emulator
+    "pywinpty; sys_platform == 'win32'",     # ConPTY pseudo-terminal (Windows)
+    "ptyprocess; sys_platform != 'win32'",   # PTY (POSIX fallback)
+
+    # ── Code validation (REQUIRED — the agent errors on missing imports) ────
+    "ruff",                # fast linter: undefined names, missing imports, syntax
+    "pyflakes",            # linter fallback if ruff is unavailable
+    "python-lsp-server",   # LSP server for Python semantic analysis (pylsp)
+
+    # ── Semantic code indexing (REQUIRED for the vector_search tool) ────────
+    "tree-sitter",                 # parser framework for AST-aware chunking
+    "tree-sitter-language-pack",   # pre-built grammars: Python, JS, TS, Go, Rust, ...
+    "sqlite-vec",                  # vector-search extension for SQLite
 ]
+
+[project.urls]
+Repository = "https://github.com/Monkeyrithms/Familiar"
+
+# GUI entry point — launches the desktop app without a console window.
+[project.gui-scripts]
+familiar = "main:main"
+
+# ── Packaging layout ──────────────────────────────────────────────────────
+# Flat layout: top-level packages plus the main module. The data/ tree and
+# distribution scaffolding are user-state / artifacts, never packaged.
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["core*", "tools*", "ui*"]
+exclude = ["data*", "logs*", "sandbox*", "Distributable*"]
+
+# ─────────────────────────────────────────────────────────────────────────
+# Ruff — the agent itself runs this to validate edits, so config matches the
+# codebase's house style: keep the load-bearing checks (undefined names,
+# unused/missing imports), relax the cosmetic ones (aligned assignments,
+# long lines, late imports).
+# ─────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["data", "logs", "sandbox", "Distributable", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line too long — long f-strings / URLs are fine
+    "E402",  # module import not at top — late/conditional imports are intentional
+    "E203",  # whitespace before ':' — conflicts with slice alignment
+    "E221",  # multiple spaces before operator — assignments are column-aligned
+    "E226",  # missing whitespace around arithmetic operator
+    "E241",  # multiple spaces after comma — table-style dict/call alignment
+    "W291",  # trailing whitespace
+    "W293",  # whitespace on blank line
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]   # re-exports / registration side-effects
+"tools/__init__.py" = ["F401"]
