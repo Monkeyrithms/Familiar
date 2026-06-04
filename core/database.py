@@ -184,6 +184,14 @@ def init_conversations_db():
         )
     except Exception:
         pass
+    # context_note: per-conversation "author's note" injected as the LAST system
+    # message every turn (after the conversation) for heavy recency weight.
+    try:
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN context_note TEXT NOT NULL DEFAULT ''"
+        )
+    except Exception:
+        pass
     # reflect_json: persisted conversation-scoped self-review rule
     # ({when, scope, criteria}); empty when no standing rule.
     try:
@@ -308,7 +316,7 @@ def save_conversation(conv_id: str, name: str, messages: list[dict],
                       workspace: str = "", model: str = "",
                       system_prompt: str = "", streams: list[str] = None,
                       include_timestamps: bool = None, provider: str | None = None,
-                      prompt_replace: bool = None):
+                      prompt_replace: bool = None, context_note: str | None = None):
     """Save or update a conversation and all its messages."""
     image_paths: list[tuple[int, str]] = []
     embed_queue: list[tuple] = []
@@ -357,26 +365,37 @@ def save_conversation(conv_id: str, name: str, messages: list[dict],
                 ).fetchone()
                 prompt_replace = (bool(row_pr["prompt_replace"])
                                   if (row_pr and "prompt_replace" in row_pr.keys()) else False)
+            # Preserve context_note if not explicitly passed
+            if context_note is None:
+                row_cn = conn.execute(
+                    "SELECT context_note FROM conversations WHERE id=?", (conv_id,)
+                ).fetchone()
+                context_note = (row_cn["context_note"]
+                                if (row_cn and "context_note" in row_cn.keys()) else "") or ""
 
             conn.execute("""
                 UPDATE conversations SET name=?, workspace=?, model=?, provider=?,
                        system_prompt=?, streams_json=?, include_timestamps=?,
-                       prompt_replace=?, modified_at=?
+                       prompt_replace=?, context_note=?, modified_at=?
                 WHERE id=?
             """, (name, workspace, model, provider or "", system_prompt, streams_json,
-                  1 if include_timestamps else 0, 1 if prompt_replace else 0, now, conv_id))
+                  1 if include_timestamps else 0, 1 if prompt_replace else 0,
+                  context_note, now, conv_id))
         else:
             if include_timestamps is None:
                 include_timestamps = True
             if prompt_replace is None:
                 prompt_replace = False
+            if context_note is None:
+                context_note = ""
             conn.execute("""
                 INSERT INTO conversations (id, name, workspace, model, provider, system_prompt,
                                            streams_json, include_timestamps, prompt_replace,
-                                           created_at, modified_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                           context_note, created_at, modified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (conv_id, name, workspace, model, provider or "", system_prompt, streams_json,
-                  1 if include_timestamps else 0, 1 if prompt_replace else 0, now, now))
+                  1 if include_timestamps else 0, 1 if prompt_replace else 0,
+                  context_note, now, now))
 
         # Count existing messages to only embed NEW ones
         existing_count = conn.execute(
@@ -426,6 +445,13 @@ def save_conversation(conv_id: str, name: str, messages: list[dict],
             tl = msg.get("_stream_timeline")
             if isinstance(tl, list) and tl:
                 extra["stream_timeline"] = tl
+            # Diff cards: persist the precomputed diff so they reload with content
+            # instead of empty +0/-0 shells.
+            if role == "diff_card":
+                extra["diff_path"] = msg.get("_diff_path", "")
+                extra["diff_rows"] = msg.get("_diff_rows", [])
+                extra["diff_adds"] = msg.get("_diff_adds", 0)
+                extra["diff_dels"] = msg.get("_diff_dels", 0)
             metadata_json = json.dumps(extra) if extra else None
             cur = conn.execute("""
                 INSERT INTO messages (conversation_id, position, role, content,
@@ -585,6 +611,11 @@ def load_conversation(conv_id: str) -> dict | None:
                     msg["_summary_snapshot"] = extra["summary_snapshot"]
                 if "stream_timeline" in extra:
                     msg["_stream_timeline"] = extra["stream_timeline"]
+                if "diff_rows" in extra:
+                    msg["_diff_rows"] = extra["diff_rows"]
+                    msg["_diff_path"] = extra.get("diff_path", "")
+                    msg["_diff_adds"] = extra.get("diff_adds", 0)
+                    msg["_diff_dels"] = extra.get("diff_dels", 0)
             except (json.JSONDecodeError, ValueError):
                 pass
         # Restore image path from DB cache
@@ -628,6 +659,8 @@ def load_conversation(conv_id: str) -> dict | None:
         "include_timestamps": inc_ts,
         "prompt_replace": (bool(row["prompt_replace"])
                            if "prompt_replace" in row.keys() else False),
+        "context_note": (row["context_note"]
+                         if "context_note" in row.keys() else "") or "",
         "conversation_cwd": conv_cwd,
         "composer_draft": composer_draft,
         "reflect": reflect,
@@ -890,6 +923,7 @@ def enqueue_conversation_save(
     include_timestamps: bool | None = None,
     provider: str | None = None,
     prompt_replace: bool | None = None,
+    context_note: str | None = None,
     resolve_name: bool = False,
 ) -> None:
     """Non-blocking save_conversation — latest-wins per conv_id.
@@ -914,6 +948,7 @@ def enqueue_conversation_save(
             "include_timestamps": include_timestamps,
             "provider": provider,
             "prompt_replace": prompt_replace,
+            "context_note": context_note,
             "resolve_name": resolve_name,
         }
     _conv_save_wake.set()

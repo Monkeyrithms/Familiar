@@ -477,6 +477,10 @@ class Agent:
         self.config = load_config()
         self.context: list[dict] = []
         self.tool_call_log: list[dict] = []
+        # Read-state ledger: path -> {"mtime": float, "ranges": set[(offset,limit)]}.
+        # Lets us short-circuit redundant re-reads while content is still live in
+        # context, and flag edits to files that changed since we last read them.
+        self._read_ledger: dict[str, dict] = {}
         self._workspace_name: str = ""
         self._cached_system_msg: str | None = None
         self._system_msg_cache_key: tuple = ()
@@ -484,6 +488,10 @@ class Agent:
         # When True, the conversation prompt REPLACES the base system prompt
         # instead of layering on top of it (per-conversation total control).
         self._system_prompt_replace: bool = False
+        # Per-conversation "author's note": injected as the LAST system message
+        # on every model call (after the conversation), so it carries heavy
+        # recency weight each turn. Good for short standing reminders.
+        self._context_note: str = ""
         self._provider_override: str = ""
         self._model_override: str = ""
         self._tool_callback = None  # optional: called with (name, args) on each tool exec
@@ -542,6 +550,19 @@ class Agent:
 
     def set_system_prompt_override(self, prompt: str):
         self._system_prompt_override = prompt
+
+    def _with_context_note(self, messages: list) -> list:
+        """Return ``messages`` with the per-conversation context note appended
+        as a final system message (after the whole conversation), without
+        mutating the original list. No-op when no note is set.
+
+        Appended fresh on every API call so it stays the LAST message even as
+        tool rounds grow the conversation — that trailing position is what gives
+        an author's note its outsized, every-turn recency weight."""
+        note = (getattr(self, "_context_note", "") or "").strip()
+        if not note:
+            return messages
+        return messages + [{"role": "system", "content": note}]
 
     @property
     def workspace_path(self) -> str:
@@ -723,6 +744,7 @@ class Agent:
 
     def clear_context(self):
         self.context.clear()
+        self._read_ledger.clear()
 
     def get_current_summary_snapshot(self) -> dict:
         """
@@ -1062,6 +1084,95 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
             parts.append(f"A Python virtual environment is available at: {venv}")
         header = "--- Runtime ctx (volatile, per-turn; stable facts in system msg above) ---"
         return header + "\n" + "\n".join(parts)
+
+    # ── Read-state ledger helpers (anti read-loop) ──────────────────────
+
+    @staticmethod
+    def _read_range_key(args: dict) -> tuple:
+        return (args.get("offset"), args.get("limit"))
+
+    def _note_file_read(self, args: dict, result: str) -> None:
+        """Record a successful file_read in the ledger keyed by path + mtime."""
+        path = args.get("path", "")
+        if not path:
+            return
+        # Skip error results — nothing useful was read.
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict) and "error" in parsed:
+                return
+        except (json.JSONDecodeError, TypeError):
+            pass
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        rng = self._read_range_key(args)
+        rec = self._read_ledger.get(path)
+        if not rec or rec.get("mtime") != mtime:
+            # New file or changed since last read — reset the range set.
+            self._read_ledger[path] = {"mtime": mtime, "ranges": {rng}}
+        else:
+            rec["ranges"].add(rng)
+
+    def _touch_file_ledger(self, path: str) -> None:
+        """Refresh stored mtime after we write/edit a file so later reads of the
+        new content aren't falsely deduped against the pre-edit version."""
+        if not path:
+            return
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            self._read_ledger.pop(path, None)
+            return
+        rec = self._read_ledger.get(path)
+        if rec:
+            rec["mtime"] = mtime
+            rec["ranges"] = set()
+
+    def _stale_edit_note(self, args: dict) -> str:
+        """If `path` was read earlier and has since changed on disk (measured
+        BEFORE the edit runs), return an advisory string; else ''."""
+        path = args.get("path", "")
+        rec = self._read_ledger.get(path)
+        if not rec:
+            return ""
+        try:
+            cur = os.path.getmtime(path)
+        except OSError:
+            return ""
+        if cur > rec.get("mtime", cur):
+            return (f'"{path}" changed on disk after you last read it — '
+                    f"your edit was applied to the newer version. Re-read if "
+                    f"the result looks unexpected.")
+        return ""
+
+    def _redundant_read_note(self, args: dict, working_messages: list[dict]) -> str:
+        """Return a short pointer note if this file_read exactly repeats an
+        earlier read of an unchanged file whose content is STILL live in context
+        (so re-reading wastes tokens). Returns '' when the re-read is legitimate
+        (different range, file changed, or earlier content already pruned)."""
+        path = args.get("path", "")
+        if not path:
+            return ""
+        rec = self._read_ledger.get(path)
+        if not rec:
+            return ""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return ""
+        if rec.get("mtime") != mtime:
+            return ""  # file changed — let the re-read through
+        if self._read_range_key(args) not in rec.get("ranges", set()):
+            return ""  # different line range — legitimate
+        from core.context_compressor import read_still_live
+        if not read_still_live(working_messages, path):
+            return ""  # earlier read was pruned — model genuinely needs it back
+        return (f'Already read "{path}" this session and it is unchanged on disk. '
+                f"The content is still above in this conversation — reuse it "
+                f"instead of re-reading. For a different section, pass a new "
+                f"offset/limit.")
 
     def _build_messages(self) -> list[dict]:
         cfg = self.config
@@ -1552,6 +1663,7 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
         round_num = 0
         empty_streak = 0
         _error_streak: dict[str, int] = {}
+        stale_notes: dict[str, str] = {}  # tc.id -> stale-edit advisory (captured pre-edit)
         self._turn_usage = {"prompt_tokens": 0, "completion_tokens": 0,
                             "cache_read": 0, "cache_write": 0}
         self._turn_thinking = None
@@ -1685,7 +1797,9 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                     pass
 
             try:
-                response = self._api_call(client, self.model, working_messages, tools_list)
+                response = self._api_call(client, self.model,
+                                          self._with_context_note(working_messages),
+                                          tools_list)
             except Exception as e:
                 _log(f"ERROR: API call failed after retries: {e}")
                 debug_recorder.finalize_turn(_debug_turn_id, error=f"{type(e).__name__}: {e}")
@@ -1907,6 +2021,26 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                     skipped_as_loop += 1
                     continue
 
+                # Read-state dedup: short-circuit an exact re-read of an unchanged
+                # file whose content is still live in context (breaks read loops
+                # without ever blocking a needed re-read of pruned content).
+                if name == "file_read":
+                    _dedup = self._redundant_read_note(args, working_messages)
+                    if _dedup:
+                        _log(f"  DEDUP: redundant re-read of {args.get('path', '')}")
+                        tool_msg = {"role": "tool", "tool_call_id": tc.id,
+                                    "content": json.dumps({"note": _dedup})}
+                        self.context.append(tool_msg)
+                        working_messages.append(tool_msg)
+                        continue
+
+                # Capture stale-edit advisory BEFORE the edit runs (mtime check
+                # is meaningless once the tool has modified the file).
+                if name == "file_edit":
+                    _sn = self._stale_edit_note(args)
+                    if _sn:
+                        stale_notes[tc.id] = _sn
+
                 prepared.append((tc, name, args))
 
             # If this round's tool calls were ALL loop-skipped, the model is stuck
@@ -2085,6 +2219,24 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                     for k in stale:
                         del _error_streak[k]
 
+                # ── Read-state ledger upkeep ──────────────────────────────
+                if name == "file_read" and "path" in args:
+                    self._note_file_read(args, result)
+                elif name in ("file_edit", "file_write") and "path" in args:
+                    # Inject the pre-edit staleness advisory, then refresh mtime.
+                    note = stale_notes.pop(tc.id, "")
+                    if note:
+                        try:
+                            _p = json.loads(result)
+                            if isinstance(_p, dict):
+                                _p["_advisory"] = note
+                                result = json.dumps(_p, ensure_ascii=False)
+                            else:
+                                result = result + f"\n\n[{note}]"
+                        except (json.JSONDecodeError, TypeError):
+                            result = result + f"\n\n[{note}]"
+                    self._touch_file_ledger(args.get("path", ""))
+
                 # Handle workspace switch
                 if name == "workspace":
                     try:
@@ -2185,12 +2337,14 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                 self.context.append(ctx_tool_msg)
 
             # Compress between rounds — prune old tool results if approaching model's context limit
-            working_messages = compress_if_needed(working_messages, model=self.model)
+            working_messages = compress_if_needed(
+                working_messages, model=self.model, config=self.config)
 
         # Hard stop — force text answer (no tools so model must respond with text)
         _log("Forcing final answer (no tools)")
         try:
-            response = self._api_call(client, self.model, working_messages)
+            response = self._api_call(client, self.model,
+                                      self._with_context_note(working_messages))
             reply = response.choices[0].message.content or "(No response)"
         except KeyboardInterrupt:
             debug_recorder.finalize_turn(_debug_turn_id, error="KeyboardInterrupt")

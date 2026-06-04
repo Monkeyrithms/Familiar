@@ -313,7 +313,14 @@ class LspServer:
         config = _SERVER_CONFIGS.get(self.language)
         if not config:
             return None
+        from core.tool_resolver import resolve_argv
         for cmd in config["commands"]:
+            # Prefer the robust resolver (finds pip-installed servers like pylsp
+            # in the interpreter's Scripts dir even when it's not on PATH); fall
+            # back to a plain PATH lookup for external servers.
+            resolved = resolve_argv(cmd[0])
+            if resolved:
+                return resolved + list(cmd[1:])
             if shutil.which(cmd[0]):
                 return cmd
         return None

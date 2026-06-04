@@ -25,6 +25,58 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 
 
+def _load_config() -> dict:
+    config_path = Path(__file__).parent.parent / "config.json"
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def resolve_subagent_llm(config: dict | None = None, mode: str = "",
+                         provider: str = "", model: str = "") -> tuple[str, str]:
+    """Resolve the (provider, model) a sub-agent should use.
+
+    Sub-agents INHERIT the main agent's provider+model by default — that's the
+    only pair guaranteed to be coherent (model id matches the provider) AND to
+    have working credentials. A sub-agent override is honored only when it's
+    coherent:
+      * both subagent provider AND model set → use them
+      * only a subagent model set            → use it with the MAIN provider
+      * provider-only override (no model)    → IGNORED. A provider expects model
+        ids in its own namespace, so pairing e.g. 'openrouter' with a bare
+        'claude-haiku-4-5' (+ no OpenRouter key) failed every sub-agent call.
+
+    Note: we deliberately do NOT use ``config.get(key, default)`` for overrides —
+    a key present with a ``null`` value returns None and silently defeats the
+    default. ``or``-chaining treats None/"" as 'not set'.
+    """
+    if config is None:
+        config = _load_config()
+
+    main_provider = (provider or config.get("provider") or "openrouter")
+    main_model = (model or config.get("model") or "")
+
+    # A fully-specified override passed in by the caller is assumed coherent.
+    if provider and model:
+        return provider, model
+
+    ov_model = ""
+    ov_provider = ""
+    if mode:
+        ov_model = config.get(f"subagent_{mode}_model") or ""
+        ov_provider = config.get(f"subagent_{mode}_provider") or ""
+    ov_model = ov_model or config.get("subagent_model") or ""
+    ov_provider = ov_provider or config.get("subagent_provider") or ""
+
+    if ov_model and ov_provider:
+        return ov_provider, ov_model
+    if ov_model:  # model override, no provider → keep the main provider
+        return main_provider, ov_model
+    # No usable model override → inherit the main agent entirely.
+    return main_provider, main_model
+
+
 def _strip_emoji_pictographs(s: str) -> str:
     """Remove emoji and common pictographic symbols from task strings."""
     if not s:
@@ -316,26 +368,13 @@ def _run_single_agent(task: SubTask, shared_mem: SharedMemory,
     from core.providers import get_client
     from tools.registry import registry
 
-    # Load config defaults if needed, with per-mode model overrides.
-    # Config keys: subagent_search_model, subagent_plan_model, subagent_code_model,
-    #              subagent_test_model, subagent_model (fallback for all modes).
-    # Provider keys: same pattern with _provider suffix.
-    config_path = Path(__file__).parent.parent / "config.json"
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        config = {}
-    if not provider or not model:
-        mode_key = f"subagent_{task.mode}_model"
-        mode_prov_key = f"subagent_{task.mode}_provider"
-        provider = (provider
-                    or config.get(mode_prov_key)
-                    or config.get("subagent_provider")
-                    or config.get("provider", "openrouter"))
-        model = (model
-                 or config.get(mode_key)
-                 or config.get("subagent_model")
-                 or config.get("model", ""))
+    # Resolve a COHERENT (provider, model). Defaults to the main agent's pair so
+    # sub-agents use the same working client/model unless a coherent override is
+    # configured. See resolve_subagent_llm for why a provider-only override is
+    # ignored (that mismatch made every sub-agent fail).
+    config = _load_config()
+    provider, model = resolve_subagent_llm(config, mode=task.mode,
+                                           provider=provider, model=model)
 
     client = get_client(provider)
 
@@ -674,29 +713,16 @@ class Orchestrator:
 
         Returns the list of SubTasks (also added to the queue).
         """
-        self._model = model
-        self._provider = provider
         self._workspace = workspace
 
         from core.providers import get_client
 
-        if not provider or not model:
-            config_path = Path(__file__).parent.parent / "config.json"
-            try:
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                config = {}
-            # decompose_model is a cheap fast model just for JSON task-graph generation
-            provider = (provider
-                        or config.get("subagent_decompose_provider")
-                        or config.get("subagent_provider")
-                        or config.get("provider", "openrouter"))
-            model = (model
-                     or config.get("subagent_decompose_model")
-                     or config.get("subagent_model")
-                     or config.get("model", ""))
-            self._provider = provider
-            self._model = model
+        # Coherent (provider, model); inherits the main agent's pair unless a
+        # coherent subagent/decompose override is configured.
+        provider, model = resolve_subagent_llm(mode="decompose",
+                                               provider=provider, model=model)
+        self._provider = provider
+        self._model = model
 
         client = get_client(provider)
 
@@ -774,11 +800,9 @@ Return ONLY the JSON array, no other text."""
     def add_single_task(self, title: str, description: str,
                         mode: str = "general") -> SubTask:
         """Add a single task without decomposition (simple mode)."""
-        if not self._model:
-            config_path = Path(__file__).parent.parent / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            self._provider = self._provider or config.get("provider", "openrouter")
-            self._model = self._model or config.get("model", "")
+        if not self._model or not self._provider:
+            self._provider, self._model = resolve_subagent_llm(
+                mode=mode, provider=self._provider, model=self._model)
 
         task = SubTask(
             task_id=f"{self._job_id}-{str(uuid.uuid4())[:4]}",
@@ -795,19 +819,8 @@ Return ONLY the JSON array, no other text."""
         """Add a single-shot explore task — pre-reads files, one cheap LLM call,
         no agent loop. Caller is responsible for batching."""
         if not self._model or not self._provider:
-            config_path = Path(__file__).parent.parent / "config.json"
-            try:
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                config = {}
-            self._provider = (self._provider
-                              or config.get("subagent_explore_provider")
-                              or config.get("subagent_provider")
-                              or config.get("provider", "openrouter"))
-            self._model = (self._model
-                           or config.get("subagent_explore_model")
-                           or config.get("subagent_model")
-                           or config.get("model", ""))
+            self._provider, self._model = resolve_subagent_llm(
+                mode="explore", provider=self._provider, model=self._model)
 
         if len(files) == 1:
             title = f"Read {Path(files[0]).name}"
