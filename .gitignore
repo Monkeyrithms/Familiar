@@ -1,8 +1,102 @@
-.vscode/
-.idea/
+# ─────────────────────────────────────────────────────────────────────────
+# Familiar — .gitignore
+# The data/ folder is the user-state boundary: anything sensitive, generated,
+# or machine-local lives there and never ships. Source lives in core/, tools/,
+# ui/, main.py. (Mirrors package.bat's exclude lists.)
+# ─────────────────────────────────────────────────────────────────────────
 
-.venv*/
-uv.lock
-
+# ── User / runtime state (ALL of it) ─────────────────────────────────────
 data/
+logs/
+
+# ── Secrets & user config ────────────────────────────────────────────────
+keys.json
 config.json
+tasks.json
+mcp_tokens.json
+.env
+.env.*
+*.pem
+*.key
+
+# ── Cloudflared (bundled binary + runtime state) ─────────────────────────
+cloudflared.exe
+.familiar_cf_pid
+.familiar_cf_url
+
+# ── Third-party binaries the user installs themselves ────────────────────
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ── Build / distribution artifacts ───────────────────────────────────────
+Distributable/
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+*.spec
+*.zip
+sandbox/
+
+# ── Python bytecode / caches ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# ── Virtual environments ─────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── Databases, logs, generated state ─────────────────────────────────────
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.log
+error_log.txt
+window_state.json
+
+# ── Tool / type-checker / test caches ────────────────────────────────────
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.ipynb_checkpoints/
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.history/
+*.code-workspace
+
+# ── Local Claude Code project settings ───────────────────────────────────
+.claude/
+
+# ── Temp / backup files ──────────────────────────────────────────────────
+*.tmp
+*.tmp.*
+*.bak
+*.broken-bak
+*~
+
+# ── OS cruft ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Windows shortcuts ────────────────────────────────────────────────────
+*.lnk
