@@ -713,6 +713,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Persist geometry, stop watchdog, release processes and timers."""
+        # Mark shutdown BEFORE stopping inference: aborting a turn that's blocked
+        # on an open question board would otherwise tear the board down and wipe
+        # the durable record, so the question wouldn't be restored next launch.
+        try:
+            self.chat._shutting_down = True
+        except Exception:
+            pass
         self._save_geometry()
         try:
             self.chat._composer_draft_timer.stop()

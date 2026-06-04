@@ -222,6 +222,20 @@ class SettingsDialog(GlassDialog):
         self._chat_mode_combo.setCurrentIndex(0 if current_mode == "fancy" else 1)
         layout.addRow(QLabel("Chat Output Mode"), self._chat_mode_combo)
 
+        # Which side the tools/workspace splitter docks on
+        self._workspace_side_combo = QComboBox()
+        self._workspace_side_combo.addItem("Right", "right")
+        self._workspace_side_combo.addItem("Left", "left")
+        ws_side = str(cfg.get("workspace_side", "right") or "right").lower()
+        for i in range(self._workspace_side_combo.count()):
+            if self._workspace_side_combo.itemData(i) == ws_side:
+                self._workspace_side_combo.setCurrentIndex(i)
+                break
+        self._workspace_side_combo.setToolTip(
+            "Dock the tools/workspace panel (file viewer, browser, terminal) on "
+            "the left or right side of the chat.")
+        layout.addRow(QLabel("Workspace Side"), self._workspace_side_combo)
+
 
 
         # Show tool-call summary chips above agent messages
@@ -296,6 +310,20 @@ class SettingsDialog(GlassDialog):
         mono_browser_layout.addWidget(self._monocolor_browser_check)
         mono_browser_layout.addStretch()
         cyber_layout.addWidget(mono_browser_row)
+
+        mono_images_row = QWidget()
+        mono_images_layout = QHBoxLayout(mono_images_row)
+        mono_images_layout.setContentsMargins(24, 0, 0, 0)
+        mono_images_layout.setSpacing(8)
+        self._monocolor_images_check = QCheckBox("Images")
+        self._monocolor_images_check.setChecked(bool(cfg.get("monocolor_images", False)))
+        self._monocolor_images_check.setToolTip(
+            "Apply the accent-tinted monochrome filter to images shown in chat "
+            "(attached, pasted, or produced). Requires Monocolor."
+        )
+        mono_images_layout.addWidget(self._monocolor_images_check)
+        mono_images_layout.addStretch()
+        cyber_layout.addWidget(mono_images_row)
 
         crt_row = QHBoxLayout()
         crt_row.setSpacing(8)
@@ -381,9 +409,10 @@ class SettingsDialog(GlassDialog):
 
     def _sync_monocolor_browser_visibility(self):
         visible = self._monocolor_check.isChecked()
-        row = self._monocolor_browser_check.parentWidget()
-        if row is not None:
-            row.setVisible(visible)
+        for chk in (self._monocolor_browser_check, self._monocolor_images_check):
+            row = chk.parentWidget()
+            if row is not None:
+                row.setVisible(visible)
 
     def _sync_colors_section_visibility(self):
         # The Colors overrides only matter when the monochrome look is OFF.
@@ -3021,6 +3050,7 @@ class SettingsDialog(GlassDialog):
         cfg["animate_ellipsis"] = self._animate_ellipsis_check.isChecked()
         cfg["stream_display"] = self._stream_display_combo.currentData() or "chat"
         cfg["chat_mode"] = self._chat_mode_combo.currentData() or "fancy"
+        cfg["workspace_side"] = self._workspace_side_combo.currentData() or "right"
         cfg["show_tools_called"] = self._show_tools_called_check.isChecked()
         cfg["tool_display_mode"] = self._tool_display_combo.currentData() or "chips"
         cfg["show_tools_hint"] = self._show_tools_hint_check.isChecked()
@@ -3029,6 +3059,7 @@ class SettingsDialog(GlassDialog):
         cfg["show_usage"] = self._show_usage_check.isChecked()
         cfg["monocolor"] = self._monocolor_check.isChecked()
         cfg["monocolor_browser"] = self._monocolor_browser_check.isChecked()
+        cfg["monocolor_images"] = self._monocolor_images_check.isChecked()
         # Per-element color overrides (honored only when Monocolor is off). Only
         # rewrite them when Monocolor is OFF, so toggling Monocolor on and saving
         # doesn't clobber a saved custom palette. Store valid, non-blank entries

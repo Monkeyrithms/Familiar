@@ -502,6 +502,18 @@ class PtyTerminalView(QWidget):
         self.resize_requested.emit(rows, cols)
         self.update()
 
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        # When re-shown after being hidden (QStackedWidget page switch, conversation
+        # switch, Cols/Grid reparent, minimize/restore), Qt can drop our backing
+        # store without delivering a full expose. The next blink/output repaint only
+        # touches a few rows (WA_OpaquePaintEvent = no auto-erase), so the rest of the
+        # screen stays blank — the "text disappeared" glitch. The pyte buffer is
+        # intact; force a full rebuild + repaint so it comes right back.
+        self._color_cache_dirty = True
+        self._dirty_content_rows.clear()
+        self.update()
+
     # ── Reading scrollback (agent / read_terminal) ──────────────────
     def toPlainText(self) -> str:
         # Parse any buffered-but-undrained output so the reader sees the latest

@@ -101,18 +101,11 @@ def subagent(action: str, goal: str = "", mode: str = "general",
 
         orch = get_orchestrator()
 
-        # Get model/provider from agent config
-        model, provider = "", ""
-        try:
-            config_path = __import__("pathlib").Path(__file__).parent.parent / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            provider = config.get("provider", "openrouter")
-            model = config.get("model", "")
-            # Use a cheaper model for sub-agents if configured
-            model = config.get("subagent_model", model)
-            provider = config.get("subagent_provider", provider)
-        except Exception:
-            pass
+        # Coherent (provider, model). Inherits the main agent's working pair
+        # unless a coherent subagent override is configured. (A provider-only
+        # override with no matching model used to fail every sub-agent.)
+        from core.subagent import resolve_subagent_llm
+        provider, model = resolve_subagent_llm(mode="decompose")
 
         orch._workspace = workspace
 
@@ -151,14 +144,8 @@ def subagent(action: str, goal: str = "", mode: str = "general",
 
         orch = get_orchestrator()
 
-        model, provider = "", ""
-        try:
-            config_path = __import__("pathlib").Path(__file__).parent.parent / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            provider = config.get("subagent_provider", config.get("provider", "openrouter"))
-            model = config.get("subagent_model", config.get("model", ""))
-        except Exception:
-            pass
+        from core.subagent import resolve_subagent_llm
+        provider, model = resolve_subagent_llm(mode=mode)
 
         orch._workspace = workspace
         orch._model = model

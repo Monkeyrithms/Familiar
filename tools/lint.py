@@ -39,10 +39,22 @@ _available: dict[str, bool] = {}
 
 
 def _is_available(cmd: str) -> bool:
-    """Check if a command exists in PATH. Cached."""
+    """Check if a command can be run. Cached.
+
+    Uses the robust resolver for our own pip-installed tools (ruff, pyflakes,
+    pylsp) so they're found even when Python's Scripts dir isn't on PATH; falls
+    back to a plain PATH lookup for external tooling (node, go, rustfmt, …).
+    """
     if cmd not in _available:
-        _available[cmd] = shutil.which(cmd) is not None
+        from core.tool_resolver import resolve
+        _available[cmd] = (resolve(cmd) is not None) or (shutil.which(cmd) is not None)
     return _available[cmd]
+
+
+def _tool_argv(cmd: str) -> list[str]:
+    """Resolved launch prefix for a console-script, or just [cmd] as a fallback."""
+    from core.tool_resolver import resolve_argv
+    return resolve_argv(cmd) or [cmd]
 
 
 # ── Python checker cascade ──────────────────────────────────────────────
@@ -185,7 +197,7 @@ def _run_ruff(path: str) -> list[dict]:
     """Invoke `ruff check --output-format=json` and parse diagnostics."""
     try:
         result = subprocess.run(
-            ["ruff", "check", "--output-format=json", "--exit-zero", str(path)],
+            _tool_argv("ruff") + ["check", "--output-format=json", "--exit-zero", str(path)],
             capture_output=True, text=True, timeout=TIMEOUT,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -221,7 +233,7 @@ def _run_pyflakes(path: str) -> list[dict]:
     """Invoke pyflakes and parse its `path:line:col: message` output."""
     try:
         result = subprocess.run(
-            ["pyflakes", str(path)],
+            _tool_argv("pyflakes") + [str(path)],
             capture_output=True, text=True, timeout=TIMEOUT,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):

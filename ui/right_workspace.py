@@ -1117,6 +1117,35 @@ class RightWorkspacePanel(QFrame):
         index = max(0, min(4, index))
         self._set_page(index)
 
+    def flash_file_tab(self, times: int = 3) -> None:
+        """Briefly flash the File tab button to signal a background agent edit
+        without switching to it. Self-stopping; restores the button's style."""
+        btn = getattr(self, "_btn_files", None)
+        if btn is None:
+            return
+        from PyQt6.QtCore import QTimer as _QTimer
+        p = PALETTE
+        base_ss = btn.styleSheet()
+        hot_ss = (base_ss + f"\nQPushButton {{ color:{p['glow_hot']};"
+                  f" border-color:{p['accent_bright']}; }}")
+        state = {"n": 0}
+
+        def _tick():
+            try:
+                btn.setStyleSheet(hot_ss if state["n"] % 2 == 0 else base_ss)
+            except Exception:
+                return
+            state["n"] += 1
+            if state["n"] >= times * 2:
+                try:
+                    btn.setStyleSheet(base_ss)
+                except Exception:
+                    pass
+                return
+            _QTimer.singleShot(160, _tick)
+
+        _tick()
+
     def apply_theme(self):
         p = PALETTE
         self.setStyleSheet(

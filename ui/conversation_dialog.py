@@ -157,6 +157,21 @@ class ConversationDialog(GlassDialog):
             "Off: layered on top of the base prompt.")
         pl.addWidget(self._replace_check)
 
+        # Context Note — a short "author's note" injected as the LAST system
+        # message every turn (after the whole conversation), so it carries heavy
+        # recency weight while the base prompt gets buried by comparison.
+        pl.addWidget(QLabel("Context Note"))
+        note_hint = QLabel("Injected last, after the conversation — strong every-turn weight.")
+        note_hint.setStyleSheet(f"color:{p['muted_text']};font-size:8pt;border:none;")
+        pl.addWidget(note_hint)
+        self._note_edit = QTextEdit()
+        self._note_edit.setAcceptRichText(False)
+        self._note_edit.setFont(mono9)
+        self._note_edit.setPlainText(getattr(self.agent, "_context_note", "") or "")
+        self._note_edit.setPlaceholderText("Short standing reminder (optional)")
+        self._note_edit.setFixedHeight(64)
+        pl.addWidget(self._note_edit)
+
         # Include timestamps in context
         self._timestamps_check = QCheckBox("Include Timestamps in Context")
         self._timestamps_check.setFont(small)
@@ -450,6 +465,7 @@ class ConversationDialog(GlassDialog):
         prompt = self._prompt_edit.toPlainText().strip()
         self.agent.set_system_prompt_override(prompt)
         self.agent._system_prompt_replace = self._replace_check.isChecked()
+        self.agent._context_note = self._note_edit.toPlainText().strip()
         self.agent._include_context_timestamps = self._timestamps_check.isChecked()
         # Per-conversation live streaming → apply to the agent + persist.
         self.agent._stream_live = self._stream_live_check.isChecked()

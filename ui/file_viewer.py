@@ -2619,32 +2619,44 @@ class FileViewer(QFrame):
                     display.append(line)
         return "\n".join(display), added, removed
 
-    def show_edit(self, path: str, original: str) -> None:
-        """Open *path* in a tab, overlay the diff against *original*, and
-        blink the tab. Called by the edit_notified bridge from agent tools.
+    def show_edit(self, path: str, original: str, surface: bool = True) -> None:
+        """Open *path* in a tab and overlay the diff against *original*.
 
-        Bursts of tool edits coalesce per path so we don't run difflib +
-        setPlainText on the main thread for every call in a multi_edit batch.
+        When ``surface`` is True (a user-initiated reveal) the viewer also
+        switches its active tab to this file, surfaces the panel, and blinks the
+        tab. When False (the ambient agent-edit path) it loads + applies the diff
+        overlay in the BACKGROUND only — no tab switch, no surface — so the user
+        isn't yanked away from whatever they're looking at; the diff is simply
+        ready for when they click through from the in-chat card.
+
+        Bursts of tool edits coalesce per path. A pending surface=True wins over
+        surface=False so an explicit reveal is never downgraded by a later edit.
         """
         if not path:
             print("[FileViewer] show_edit: refused — empty path")
             return
 
         abs_path = os.path.abspath(path)
-        self._pending_show_edits[abs_path] = (original or "", 4)
+        prev = self._pending_show_edits.get(abs_path)
+        want_surface = surface or bool(prev and prev[2])
+        self._pending_show_edits[abs_path] = (original or "", 4, want_surface)
         self._show_edit_timer.start()
 
     def _flush_pending_show_edits(self) -> None:
         pending = dict(self._pending_show_edits)
         self._pending_show_edits.clear()
-        for abs_path, (original, attempts) in pending.items():
-            self._show_edit_attempt(abs_path, original, attempts_left=attempts)
+        for abs_path, entry in pending.items():
+            original, attempts = entry[0], entry[1]
+            surface = entry[2] if len(entry) > 2 else True
+            self._show_edit_attempt(abs_path, original, attempts_left=attempts,
+                                    surface=surface)
 
-    def _show_edit_attempt(self, abs_path: str, original: str, attempts_left: int) -> None:
+    def _show_edit_attempt(self, abs_path: str, original: str, attempts_left: int,
+                           surface: bool = True) -> None:
         if not os.path.isfile(abs_path):
             if attempts_left > 0:
                 QTimer.singleShot(50, lambda: self._show_edit_attempt(
-                    abs_path, original, attempts_left - 1))
+                    abs_path, original, attempts_left - 1, surface))
                 return
             print(f"[FileViewer] show_edit: gave up — file never appeared on disk: {abs_path!r}")
             return
@@ -2661,7 +2673,8 @@ class FileViewer(QFrame):
             print(f"[FileViewer] show_edit: load_file failed to create a tab for {abs_path!r}")
             # Still surface the panel so the user knows something happened —
             # even if we can't render the diff, they can manually re-open.
-            self.attention_requested.emit()
+            if surface:
+                self.attention_requested.emit()
             return
 
         tab = self._tabs[idx]
@@ -2715,9 +2728,11 @@ class FileViewer(QFrame):
                 print(f"[FileViewer] show_edit diff error: {e}")
                 import traceback; traceback.print_exc()
 
-        # Surface the panel + switch to this tab + start blink — UNCONDITIONAL.
-        # These calls must run regardless of whether the diff overlay succeeded;
-        # they are the contract of show_edit: the user sees the file.
+        # Surface the panel + switch to this tab + start blink — only on an
+        # explicit reveal (surface=True). The ambient agent-edit path keeps the
+        # diff overlay ready in the background WITHOUT stealing the user's view.
+        if not surface:
+            return
         self.attention_requested.emit()
         try:
             self._tab_widget.setCurrentIndex(idx)
@@ -2864,6 +2879,52 @@ class FileViewer(QFrame):
             except Exception:
                 continue
         return -1
+
+    def blink_tree_path(self, path: str, times: int = 3) -> None:
+        """Briefly flash a file's row in the explorer tree to point at a just-
+        edited file — WITHOUT changing the active file or the persistent
+        selection. Used when the user is already on the File tab so the signal
+        is 'this one changed' rather than yanking their view to it."""
+        try:
+            abs_path = os.path.abspath(path)
+            ix = self._fs_model.index(abs_path)
+            if not ix.isValid():
+                return
+            tree = self._file_tree
+            try:
+                tree.scrollTo(ix)
+            except Exception:
+                pass
+            sm = tree.selectionModel()
+            if sm is None:
+                return
+            from PyQt6.QtCore import QItemSelectionModel, QTimer as _QTimer
+            sel = QItemSelectionModel.SelectionFlag
+            prev = list(sm.selectedRows()) if hasattr(sm, "selectedRows") else []
+            state = {"n": 0}
+
+            def _tick():
+                try:
+                    if state["n"] % 2 == 0:
+                        sm.select(ix, sel.Select | sel.Rows)
+                    else:
+                        sm.select(ix, sel.Deselect | sel.Rows)
+                except Exception:
+                    return
+                state["n"] += 1
+                if state["n"] >= times * 2:
+                    try:
+                        sm.clearSelection()
+                        for pix in prev:
+                            sm.select(pix, sel.Select | sel.Rows)
+                    except Exception:
+                        pass
+                    return
+                _QTimer.singleShot(180, _tick)
+
+            _tick()
+        except Exception:
+            pass
 
     def _start_tab_blink(self, idx: int) -> None:
         """Alternate the tab text color until the user visits the tab."""

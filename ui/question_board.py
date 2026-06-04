@@ -16,7 +16,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QScrollArea, QFrame,
+    QScrollArea, QFrame, QSizePolicy,
 )
 
 from ui.theme import PALETTE, selection_css
@@ -33,6 +33,12 @@ def _accent_rgba(alpha: float) -> str:
 class _OptionRow(QPushButton):
     """One selectable option. Checkable; fills with a dim accent when chosen.
 
+    A QPushButton can't word-wrap its own text, so long labels used to spill off
+    the right edge. Instead the text lives in word-wrapped child QLabels (made
+    click-transparent so the button still toggles), and the row reports a proper
+    height-for-width — so it grows TALLER to fit wrapped text and the board's
+    vertical scrollbar handles the overflow.
+
     In single-select mode the parent _QuestionBlock manages mutual exclusion;
     in multi-select mode each row toggles independently.
     """
@@ -43,19 +49,65 @@ class _OptionRow(QPushButton):
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        text = f"  ▸  {label}"
+        # Expanding width, height driven by wrapped content. Qt layouts ONLY honor
+        # heightForWidth() when the size policy explicitly opts in — without this
+        # the override below is dead code and the row stays clamped to one line,
+        # clipping long labels off the right edge.
+        sp = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(3)
+        self._title = QLabel(f"▸  {label}")
+        self._title.setWordWrap(True)
+        self._title.setFont(QFont("Consolas", 10))
+        self._title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        lay.addWidget(self._title)
+        self._desc = None
         if description:
-            text += f"\n        {description}"
-        self.setText(text)
-        self.setFont(QFont("Consolas", 10))
+            self._desc = QLabel(description)
+            self._desc.setWordWrap(True)
+            self._desc.setFont(QFont("Consolas", 9))
+            self._desc.setContentsMargins(16, 0, 0, 0)
+            self._desc.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            lay.addWidget(self._desc)
+
+        self.toggled.connect(lambda _checked: self._apply_style())
         self._apply_style()
+
+    # Let the row grow vertically to fit wrapped text instead of clipping it.
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, w: int) -> int:
+        lay = self.layout()
+        if lay is not None:
+            h = lay.heightForWidth(w)
+            if h > 0:
+                return h
+        return super().heightForWidth(w)
+
+    def sizeHint(self):
+        lay = self.layout()
+        return lay.sizeHint() if lay is not None else super().sizeHint()
+
+    def minimumSizeHint(self):
+        lay = self.layout()
+        return lay.minimumSize() if lay is not None else super().minimumSizeHint()
 
     def _apply_style(self):
         p = PALETTE
+        title_color = p['accent_bright'] if self.isChecked() else p['text']
+        self._title.setStyleSheet(
+            f"color: {title_color}; background: transparent; border: none;")
+        if self._desc is not None:
+            self._desc.setStyleSheet(
+                f"color: {p['muted_text']}; background: transparent; border: none;")
         self.setStyleSheet(f"""
             QPushButton {{
                 text-align: left;
-                padding: 8px 10px;
                 color: {p['text']};
                 background: {p['panel_alt']};
                 border: 1px solid {p['border']};
@@ -66,7 +118,6 @@ class _OptionRow(QPushButton):
                 background: {_accent_rgba(0.10)};
             }}
             QPushButton:checked {{
-                color: {p['accent_bright']};
                 border: 1px solid {p['accent']};
                 background: {_accent_rgba(0.22)};
             }}
@@ -82,6 +133,12 @@ class _QuestionBlock(QWidget):
         self.spec = spec
         self.multi = bool(spec.get("multiSelect", False))
         self._rows: list[_OptionRow] = []
+        # The block must also advertise height-for-width, otherwise the scroll
+        # area's layout (which consults the block's size policy, not its child
+        # rows') won't give it enough vertical room and the wrapped rows clip.
+        sp = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
         self._build()
 
     def _build(self):

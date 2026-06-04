@@ -41,10 +41,26 @@ def build_palette(base_color: str = DEFAULT_ACCENT, brightness: float = DEFAULT_
 
     def _shade(hex_color, factor):
         c = QColor(hex_color)
-        r = min(255, max(0, int(c.red() * factor)))
-        g = min(255, max(0, int(c.green() * factor)))
-        b_val = min(255, max(0, int(c.blue() * factor)))
-        return f"#{r:02x}{g:02x}{b_val:02x}"
+        if factor <= 1.0:
+            # Darkening scales every channel by the same factor, so the channel
+            # RATIOS — and therefore the hue and saturation — are preserved. Plain
+            # RGB multiply is already correct (and clip-free) on this path.
+            r = max(0, int(c.red() * factor))
+            g = max(0, int(c.green() * factor))
+            b_val = max(0, int(c.blue() * factor))
+            return f"#{r:02x}{g:02x}{b_val:02x}"
+        # Brightening must NOT scale RGB: channels clip at 255 at different rates,
+        # which rotates the hue (e.g. a teal's green+blue rail out to pure cyan
+        # while red keeps climbing — that's the blue/green split across shades).
+        # Instead raise Value with the hue LOCKED; once Value tops out, bleed
+        # Saturation toward white. The hue angle never moves.
+        h, s, v, a = c.getHsv()
+        nv = v * factor
+        if nv > 255:
+            overflow = nv - 255
+            s = max(0, int(round(s * (1.0 - overflow / 255.0))))
+            nv = 255
+        return QColor.fromHsv(h, s, int(round(nv)), a).name()
 
     def _neon(hex_color):
         """White-hot glow: keep the hue tint, crush saturation, max brightness."""

@@ -7,6 +7,7 @@ streaming, and permission checks for dangerous commands.
 """
 
 import json
+import re
 import signal
 import subprocess
 import sys
@@ -227,7 +228,6 @@ _UNIX_TO_WIN = {
     "cp":   ("copy {args}",  "copy"),
     "mv":   ("move {args}",  "move"),
     "rm":   ("del {args}",   "del"),
-    "mkdir":("mkdir {args}", "mkdir"),
     "touch":('type nul > {args}', "type nul >"),
 }
 
@@ -257,6 +257,11 @@ def _strip_quotes(s: str) -> str:
 
 # Shell operators — stop treating positional args once we hit one of these
 _SHELL_OPS = {"|", "||", "&", "&&", ">", ">>", "<", "<<"}
+
+# Redirects that travel as a single token, e.g. `2>nul`, `1>out.txt`, `2>&1`.
+# These aren't in _SHELL_OPS (which holds standalone operators), so match them
+# separately when deciding whether a command is "compound".
+_REDIRECT_RE = re.compile(r"^\d*>>?&?\d*$|^\d*<")
 
 
 def _parse_rg_args(args: list[str]) -> dict:
@@ -384,6 +389,14 @@ def _try_convert_command(command: str, cwd: str | None) -> str | None:
         parts = command.split()
 
     if not parts:
+        return None
+
+    # Compound commands (operators / redirects) must run intact in the real
+    # shell. The single-command converters below truncate at the first shell
+    # operator and would silently execute only the first fragment — and a
+    # redirect like `2>nul` would get mangled into a bogus path. Bail out and
+    # let cmd.exe handle the whole line.
+    if any(tok in _SHELL_OPS or _REDIRECT_RE.match(tok) for tok in parts):
         return None
 
     cmd = _cmd_name(parts[0])
