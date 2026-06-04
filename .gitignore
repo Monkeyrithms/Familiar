@@ -1,0 +1,8 @@
+.vscode/
+.idea/
+
+.venv*/
+uv.lock
+
+data/
+config.json
