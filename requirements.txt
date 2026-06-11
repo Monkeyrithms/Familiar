@@ -1,5 +1,10 @@
 # Familiar dependencies — everything needed to run, in one file.
-# Install with: pip install -r requirements.txt
+# Install:  py -m pip install -r requirements.txt            (Windows)
+#           python3 -m pip install -r requirements.txt       (macOS / Linux)
+#
+# Tip: a brand-new Python release (e.g. 3.14 the week it ships) may not have
+# prebuilt wheels for every compiled package yet, which makes pip try to build
+# from source and fail. If you hit that, use Python 3.11–3.13.
 
 # ── UI stack (PyQt6 + WebEngine for the embedded browser) ────────────────
 # Pinned: the binding, its bundled Qt6 runtime, sip, and WebEngine must agree.
@@ -9,25 +14,63 @@ PyQt6-sip==13.10.3
 PyQt6-WebEngine==6.9.0
 PyQt6-WebEngine-Qt6==6.9.2
 
-# ── Agent runtime ────────────────────────────────────────────────────────
-openai          # LLM API client
-httpx           # async HTTP (used by openai SDK)
+# ── LLM providers ────────────────────────────────────────────────────────
+openai          # OpenAI-compatible client (most providers route through it)
+anthropic       # Anthropic native SDK (Claude provider)
+httpx           # async HTTP (used by the SDKs)
 requests        # sync HTTP
-numpy           # numerical ops
-vispy           # GPU-accelerated visualization
-watchdog        # filesystem change detection for hot-reload
+
+# ── Chat UI rendering ────────────────────────────────────────────────────
+markdown2       # markdown → HTML for chat bubbles (imported at startup)
+Pygments        # code syntax highlighting
+Pillow          # image thumbnails / media handling
+pygame          # UI sound effects
+
+# ── Numerical / visualization ────────────────────────────────────────────
+numpy
+vispy           # GPU-accelerated chart tool
+
+# ── System / process ─────────────────────────────────────────────────────
+psutil          # process + cwd inspection (terminals, session persistence)
+watchdog        # filesystem change detection (tools hot-reload, file watcher)
 
 # ── Integrated terminal (real PTY so claude/vim/htop run interactively) ──
-pyte                              # VT100/ANSI screen emulator
-pywinpty ; sys_platform == "win32"   # ConPTY pseudo-terminal (Windows)
-ptyprocess ; sys_platform != "win32" # PTY (POSIX fallback)
+pyte                                  # VT100/ANSI screen emulator
+pywinpty ; sys_platform == "win32"    # ConPTY pseudo-terminal (Windows)
+ptyprocess ; sys_platform != "win32"  # PTY (POSIX)
 
-# ── Code validation (REQUIRED — agent will error on missing imports if absent) ──
-ruff            # Python linter: undefined names, missing imports, syntax. Fast.
-pyflakes        # Python linter: fallback if ruff unavailable
-python-lsp-server  # LSP server for Python semantic analysis (pylsp)
+# ── Code validation (REQUIRED — agent errors on missing imports if absent) ──
+ruff
+pyflakes
+python-lsp-server      # pylsp
 
-# ── Semantic code indexing (REQUIRED for vector_search tool) ─────────────
-tree-sitter                    # Parser framework used for AST-aware chunking
-tree-sitter-language-pack      # Pre-built grammars: Python, JS, TS, Go, Rust, ...
-sqlite-vec                     # Vector search extension for SQLite
+# ── Semantic code indexing (REQUIRED for vector_search) ──────────────────
+tree-sitter
+tree-sitter-language-pack
+sqlite-vec
+
+# ── Scheduler / MCP ──────────────────────────────────────────────────────
+croniter        # cron parsing for scheduled tasks
+mcp             # Model Context Protocol client
+
+# ── Document parsing (file_read auto-parses these) + PDF generation ──────
+PyMuPDF         # PDF read/render (fitz)
+python-docx     # .docx
+openpyxl        # .xlsx
+fpdf2           # PDF generation (pdf_gen)
+reportlab       # PDF generation (pdf_gen)
+
+# ── Voice ────────────────────────────────────────────────────────────────
+edge-tts        # default text-to-speech backend
+
+# ── Optional extras (uncomment to enable those tools) ────────────────────
+# python-pptx     # .pptx parsing in file_read
+# send2trash      # move-to-Recycle-Bin in the file viewer (else a normal delete)
+# paramiko        # ssh_tool (remote command execution)
+# pytesseract     # OCR tool (also needs the Tesseract binary installed)
+# docutils        # reStructuredText rendering
+# playwright      # browser_auto fallback (also run: playwright install)
+#
+# Local TTS / transcription backends (chatterbox-tts, torch, torchaudio,
+# openai-whisper, resemble-perth) install into their OWN venv on demand via
+# Settings → Voice — they are intentionally NOT in this file (they're huge).
