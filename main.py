@@ -1,259 +1,100 @@
-"""
-Agent - LLM chat interface with modular tool support.
-"""
+"""Familiar: Claude AI CLI with persistent chat, terminal workspace, and rich UI."""
 
-import json
-import subprocess
 import sys
-import threading
-from pathlib import Path
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
-from PyQt6.QtCore import Qt, QRect, QPoint, QTimer, QEvent, QObject, QAbstractItemModel
-from PyQt6.QtGui import QPainter, QColor, QPen, QMouseEvent, QImage
-import tools  # noqa: F401 — triggers tool self-registration
+import signal
 
-WINDOW_STATE_PATH = Path(__file__).parent / "data" / "window_state.json"
+# Qt imports
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+)
+from PyQt6.QtCore import (
+    Qt, QSize, QRect, QPoint, QEvent, QObject, QTimer, QAbstractItemModel,
+)
+from PyQt6.QtGui import QIcon, QFont, QMouseEvent, QPainter, QPen, QColor
+
+# Familiar modules
 from ui.title_bar import TitleBar
+# NOTE: temporary fallback — the multi-column coordinator (ui/chat_window.py)
+# needs `ChatColumn`, which lived in the wiped chat_widget.py. Until that's
+# recovered, run the self-contained single-pane ChatWindow directly so the app
+# boots and damage can be assessed.
 from ui.chat_widget import ChatWindow
-from ui.theme import PALETTE, refresh_palette, apply_selection_palette
-from ui.app_icon import apply_app_icon
-from core.agent import Agent
-from core.sounds import preload_all, play_ui
-from core.ui_watchdog import UiPerformanceWatchdog
+from ui.help_dialog import HelpDialog
+from ui.tasks_dialog import TasksDialog
+from ui.memory_dialog import MemoryDialog
+from ui.theme import PALETTE, refresh_palette
 
-GRIP = 6
+from core.agent import Agent, load_config
+from core.database import init_conversations_db
 
 APP_NAME = "Familiar"
-# Unique per app — keeps this out of the generic python.exe taskbar group.
-APP_USER_MODEL_ID = "Casey.Familiar"
 
-# Single-instance guard keys. A shared-memory segment marks "primary alive";
-# a local socket lets a second launch ask the primary to surface its window.
-_SINGLE_MEM_KEY = "Familiar-single-instance-v1"
-_SINGLE_IPC_KEY = "Familiar-ipc-v1"
-_single_shm = None  # module-global so the segment lives for the whole process
+# Pixels from each edge that count as a resize grip (frameless window).
+GRIP = 6
 
-
-def _configure_windows_app_identity() -> None:
-    """Taskbar grouping + hover label when running under python.exe on Windows."""
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
-    except Exception:
-        pass
-
-
-def _repair_agent_shortcut() -> None:
-    """Re-point shipped Agent.lnk to this folder (portable copy / new machine)."""
-    if sys.platform != "win32":
-        return
-    script = Path(__file__).resolve().parent / "repair_agent_shortcut.ps1"
-    if not script.is_file():
-        return
-    try:
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-                str(script),
-                "-Root",
-                str(script.parent),
-            ],
-            cwd=script.parent,
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
-    except Exception:
-        pass
-
-
-def _disable_console_quick_edit() -> None:
-    """Windows: Quick Edit Mode freezes the entire process when the console is
-    clicked (text selection). Pressing Enter in the terminal unfreezes it —
-    a common false 'app hung' report for GUI apps launched via ``py main.py``."""
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        ENABLE_QUICK_EDIT = 0x0040
-        ENABLE_EXTENDED_FLAGS = 0x0080
-        STD_INPUT_HANDLE = -10
-        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
-        if handle in (0, -1):
-            return
-        mode = ctypes.c_uint32()
-        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            return
-        new_mode = (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT
-        kernel32.SetConsoleMode(handle, new_mode)
-    except Exception:
-        pass
-
-
-# ── Single-instance guard ──────────────────────────────────────────────
-# Familiar must never open two windows. A second launch (double-click, a
-# stray relaunch, etc.) detects the running instance, asks it to come to the
-# front, and exits instead of spawning a duplicate UI.
-
-def _live_instance_running(*, command: bytes = b"raise") -> bool:
-    """True ONLY if a *responsive* Familiar is already listening on the IPC
-    socket — and, if so, sends it ``command`` ("raise" to surface it, "quit" to
-    ask it to exit).
-
-    Why IPC and not shared memory: the IPC server exists only while a real Qt
-    event loop is running, so a successful connect is authoritative proof of a
-    live instance. A held shared-memory lock is NOT trusted on its own — an
-    orphaned segment or an invisible ``pythonw`` process that died without
-    releasing it would otherwise block every future launch (the "it keeps
-    surfacing stale code / won't start fresh" bug). If we can't connect, there
-    is no live primary and we should take over.
-    """
-    try:
-        from PyQt6.QtNetwork import QLocalSocket
-    except Exception:
-        return False  # can't probe — fail open rather than block startup
-    s = QLocalSocket()
-    s.connectToServer(_SINGLE_IPC_KEY)
-    if not s.waitForConnected(600):
-        s.abort()
-        return False
-    try:
-        s.write(command)
-        s.flush()
-        s.waitForBytesWritten(600)
-        if command == b"quit":
-            # Give the old instance a moment to release the socket/lock.
-            s.waitForDisconnected(2000)
-        else:
-            s.disconnectFromServer()
-    except Exception:
-        pass
-    return True
-
-
-def _claim_singleton_marker(app) -> None:
-    """Best-effort: hold the shared-memory marker for this process's lifetime.
-    Purely a secondary hint now (the IPC server is the real liveness signal),
-    so a failure here never blocks startup."""
-    global _single_shm
-    try:
-        from PyQt6.QtCore import QSharedMemory
-    except Exception:
-        return
-    try:
-        shm = QSharedMemory(_SINGLE_MEM_KEY)
-        # Clear a segment orphaned by a crash (POSIX; no-op on Windows).
-        if shm.attach():
-            shm.detach()
-        if shm.create(1):
-            _single_shm = shm
-            app._familiar_shm = shm  # extra reference; freed on process exit
-    except Exception:
-        pass
-
-
-def _raise_window(window) -> None:
-    """Bring the primary window to the foreground (Windows-aware)."""
-    try:
-        if window.isMinimized():
-            window.showNormal()
-        window.show()
-        window.raise_()
-        window.activateWindow()
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                ctypes.windll.user32.SetForegroundWindow(int(window.winId()))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def _install_singleton_server(app, window) -> None:
-    """Listen for pings from future launches and raise the window when one
-    arrives — so clicking the icon again focuses Familiar instead of nothing."""
-    try:
-        from PyQt6.QtNetwork import QLocalServer
-        QLocalServer.removeServer(_SINGLE_IPC_KEY)  # clear a stale socket file
-        srv = QLocalServer()
-        # Reclaim a name a crashed instance left bound, so our IPC server (the
-        # authoritative liveness signal) always comes up — otherwise the next
-        # launch can't detect or replace us.
-        try:
-            srv.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
-        except Exception:
-            pass
-        if not srv.listen(_SINGLE_IPC_KEY):
-            QLocalServer.removeServer(_SINGLE_IPC_KEY)
-            if not srv.listen(_SINGLE_IPC_KEY):
-                print(f"[{APP_NAME}] WARNING: single-instance IPC server failed to "
-                      f"bind; --replace may not work until restart.", flush=True)
-                return
-
-        def _on_conn():
-            conn = srv.nextPendingConnection()
-            if conn is None:
-                return
-            try:
-                conn.waitForReadyRead(200)
-                msg = bytes(conn.readAll()).strip()
-            except Exception:
-                msg = b""
-            if msg == b"quit":
-                # A new launch asked us (the old instance) to step aside.
-                try:
-                    conn.disconnectFromServer()
-                except Exception:
-                    pass
-                from PyQt6.QtWidgets import QApplication
-                QApplication.instance().quit()
-                return
-            _raise_window(window)
-
-        srv.newConnection.connect(_on_conn)
-        app._familiar_ipc_server = srv
-    except Exception:
-        pass
-
+# Patches for known issues
+def _patch_qt():
+    """Patch some minor Qt quirks before we start."""
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app:
+        # Closing the main window MUST quit the app. (It previously stayed alive
+        # because this was False, leaving the process running in the terminal.)
+        # Non-modal dialogs are separate top-level windows, so the app still
+        # only quits once the main window AND any open dialogs are closed.
+        app.setQuitOnLastWindowClosed(True)
 
 class MainWindow(QMainWindow):
-    def __init__(self):
-        # Set before super(): Qt can invoke resizeEvent while QMainWindow inits.
-        self._crt_overlay = None
-        super().__init__()
-        self._always_on_top_enabled = False
-        self.setWindowTitle(APP_NAME)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
-        self.setMinimumSize(600, 500)
-        self.setMouseTracking(True)
-        self._restore_geometry()
+    """Main app window: title bar over the chat coordinator (which owns the
+    chat columns and the shared right-side workspace)."""
 
+    def __init__(self, agent: Agent):
+        super().__init__()
+        # Frameless: the custom TitleBar IS the window chrome. Set before show().
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        self.setMouseTracking(True)
+
+        self.agent = agent
+        self._dialog_count = 0  # For unique dialog windows
+        self._crt_overlay = None
+        self._refresh_debounce = None
+        self._always_on_top_enabled = False
+
+        # Frameless resize state (no native borders → we drag the edges ourselves)
         self._resize_edge = 0
         self._resize_start_geom = None
         self._resize_start_pos = None
-        self._last_resize_hover_edge = None  # throttle cursor updates on MouseMove
+        self._last_resize_hover_edge = None
 
-        self.agent = Agent()
+        # Geometry / state
+        self._maximized = False
+        self._geom_key = "window_geom"
+        self._state_key = "window_state"
+        self._max_key = "window_maximized"
 
+        # Build UI
+        self.setWindowTitle(APP_NAME)
+        # Accent-colored sparkle (matches the agent theme) — this is the icon the
+        # Windows taskbar shows for the running app.
+        try:
+            from ui.app_icon import apply_app_icon
+            apply_app_icon(self)
+        except Exception:
+            self.setWindowIcon(QIcon())
+
+        # Central widget: title bar + chat/workspace split
         central = QWidget()
         central.setMouseTracking(True)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(1, 1, 1, 1)
         layout.setSpacing(0)
-
+        
+        # Title bar
         self.title_bar = TitleBar(APP_NAME)
+        self.title_bar.help_clicked.connect(self._open_help)
         self.title_bar.settings_clicked.connect(self._open_settings)
         self.title_bar.tasks_clicked.connect(self._open_tasks)
+        self.title_bar.refresh_clicked.connect(self._refresh_ui)
         self.title_bar.memory_clicked.connect(self._open_memory)
         self.title_bar.screenshot_clicked.connect(self._screenshot_to_clipboard)
         self.title_bar.always_on_top_clicked.connect(self._toggle_always_on_top)
@@ -261,32 +102,39 @@ class MainWindow(QMainWindow):
         self.title_bar.maximize_clicked.connect(self._toggle_maximize)
         self.title_bar.close_clicked.connect(self.close)
         layout.addWidget(self.title_bar)
+        
+        # Chat coordinator. It owns the chat columns AND the shared right-side
+        # workspace (terminals / file viewer / browser) in its own internal
+        # splitter — the host window no longer manages a separate workspace pane.
+        self.chat = ChatWindow(self.agent)
 
-        self.chat = ChatWindow(self.agent, parent=central)
         layout.addWidget(self.chat)
-
         self.setCentralWidget(central)
+        
+        # Styling
         self._apply_styles()
-
-        # CRT scanline overlay (off by default; _crt_overlay initialized above)
+        self.title_bar.apply_theme()
+        self.chat.apply_theme()
+        
+        # Restore window geometry / state
+        self._restore_geometry()
+        
+        # CRT overlay (if enabled)
         self._apply_crt()
 
-        # Install event filter on the whole app to catch resize at edges
+        # App-wide event filter: catches mouse events anywhere in the window so
+        # the frameless edges work as resize grips (and don't get swallowed by
+        # child widgets). Mirrors the root Familiar window.
         QApplication.instance().installEventFilter(self)
 
-        QTimer.singleShot(100, lambda: self.chat.input.setFocus())
-
-        # Preload all sounds in background so first play is instant
+        # Preload all sounds in the background so the first play is instant.
+        import threading
         threading.Thread(target=self._preload_sounds, daemon=True).start()
 
-        # Main-thread stall watchdog (same behavior as Vispy_dashboard).
-        self._ui_watchdog = UiPerformanceWatchdog(self)
-        self._ui_watchdog.start()
-
-    # ── Resize edge detection ────────────────────────────────────────
+    # ── Frameless resize (no native borders) ─────────────────────────────
 
     def _edge_at_global(self, global_pos: QPoint) -> int:
-        """Check if a global position is within the resize grip of this window."""
+        """Return the resize-edge bitmask if a global point is within the grip."""
         if self.isMaximized():
             return 0
         geo = self.geometry()
@@ -315,23 +163,19 @@ class MainWindow(QMainWindow):
             return Qt.CursorShape.SizeVerCursor
         return Qt.CursorShape.ArrowCursor
 
-    # ── App-wide event filter for resize ─────────────────────────────
-
     def _is_my_widget(self, obj) -> bool:
-        """Check if obj belongs to this window (not a dialog)."""
-        from PyQt6.QtWidgets import QDialog, QWidget
-
+        """True if obj belongs to this window (not a dialog), so the resize
+        filter doesn't hijack mouse events meant for modal dialogs."""
         w = obj
         while w is not None:
             if w is self:
                 return True
-            if isinstance(w, QDialog):
-                return False
-            # QWidget: walk the widget hierarchy (handles layouts / native parents).
             if isinstance(w, QWidget):
+                from PyQt6.QtWidgets import QDialog
+                if isinstance(w, QDialog):
+                    return False
                 w = w.parentWidget()
                 continue
-            # QAbstractItemModel.parent(index) shadows QObject.parent() — use QObject's parent.
             if isinstance(w, QAbstractItemModel):
                 w = super(QAbstractItemModel, w).parent()
                 continue
@@ -353,22 +197,10 @@ class MainWindow(QMainWindow):
                 QApplication.restoreOverrideCursor()
                 return True
 
-        et = event.type()
-        # Resize logic only cares about mouse events. Skipping the widget-tree walk
-        # for keyboard/focus/timer traffic avoids per-keystroke overhead in the
-        # composer (and everywhere else) when the user is typing.
-        if et not in (
-            QEvent.Type.MouseButtonPress,
-            QEvent.Type.MouseMove,
-            QEvent.Type.MouseButtonRelease,
-        ):
-            return super().eventFilter(obj, event)
-
-        # Only intercept events from our own widgets, not dialogs
         if not self._is_my_widget(obj):
             return super().eventFilter(obj, event)
 
-        if et == QEvent.Type.MouseButtonPress:
+        if event.type() == QEvent.Type.MouseButtonPress:
             if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
                 gp = event.globalPosition().toPoint()
                 edge = self._edge_at_global(gp)
@@ -379,11 +211,11 @@ class MainWindow(QMainWindow):
                     QApplication.setOverrideCursor(self._cursor_for_edge(edge))
                     return True
 
-        if et == QEvent.Type.MouseMove and not self._resize_edge:
+        if event.type() == QEvent.Type.MouseMove and not self._resize_edge:
             if isinstance(event, QMouseEvent):
                 gp = event.globalPosition().toPoint()
                 edge = self._edge_at_global(gp)
-                if edge != getattr(self, "_last_resize_hover_edge", None):
+                if edge != self._last_resize_hover_edge:
                     self._last_resize_hover_edge = edge
                     if edge:
                         self.setCursor(self._cursor_for_edge(edge))
@@ -413,25 +245,8 @@ class MainWindow(QMainWindow):
         if g.width() >= min_w and g.height() >= min_h:
             self.setGeometry(g)
 
-    # ── Focus input on window activate ────────────────────────────────
-
-    def changeEvent(self, event):
-        if event.type() == QEvent.Type.WindowActivate:
-            QTimer.singleShot(0, lambda: self.chat.input.setFocus())
-            # Keep the CRT layer pinned above us when we regain focus.
-            co = getattr(self, "_crt_overlay", None)
-            if co is not None and co.isVisible():
-                co.raise_()
-        elif event.type() == QEvent.Type.WindowStateChange:
-            # Restore/maximize/normal: re-glue the overlay once geometry settles.
-            co = getattr(self, "_crt_overlay", None)
-            if co is not None and not self.isMinimized():
-                QTimer.singleShot(0, lambda: (co.sync_geometry(), co.raise_()))
-        super().changeEvent(event)
-
-    # ── Paint border ─────────────────────────────────────────────────
-
     def paintEvent(self, event):
+        """Thin accent border so the frameless window reads as a framed panel."""
         super().paintEvent(event)
         p = PALETTE
         painter = QPainter(self)
@@ -440,77 +255,183 @@ class MainWindow(QMainWindow):
         painter.setPen(pen)
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
-    # ── Window controls ──────────────────────────────────────────────
+    def resizeEvent(self, event):
+        """Keep the CRT scanline overlay sized to the window as it resizes."""
+        super().resizeEvent(event)
+        co = getattr(self, "_crt_overlay", None)
+        if co is not None and co.isVisible():
+            co.setGeometry(self.rect())
 
-    # ── Window geometry persistence ────────────────────────────────
+    def changeEvent(self, event):
+        """Refocus the chat input when the window is (re)activated."""
+        if event.type() == QEvent.Type.WindowActivate:
+            QTimer.singleShot(0, lambda: self._focus_chat_input())
+        super().changeEvent(event)
 
-    @staticmethod
-    def _on_any_screen(rect: QRect) -> bool:
-        """True when rect overlaps a visible desktop area enough to be usable."""
-        min_visible = 120  # px
-        for scr in QApplication.screens():
-            avail = scr.availableGeometry()
-            overlap = rect.intersected(avail)
-            if overlap.width() >= min_visible and overlap.height() >= min_visible:
-                return True
-        return False
-
-    @staticmethod
-    def _fallback_geometry(width: int, height: int) -> QRect:
-        """Centered fallback on primary screen with sane bounds."""
-        scr = QApplication.primaryScreen()
-        if scr is None:
-            return QRect(100, 100, max(800, width), max(700, height))
-        avail = scr.availableGeometry()
-        w = max(600, min(width, avail.width()))
-        h = max(500, min(height, avail.height()))
-        x = avail.x() + (avail.width() - w) // 2
-        y = avail.y() + (avail.height() - h) // 2
-        return QRect(x, y, w, h)
-
-    def _restore_geometry(self):
+    def _focus_chat_input(self):
         try:
-            state = json.loads(WINDOW_STATE_PATH.read_text(encoding="utf-8"))
-            restored = QRect(
-                int(state.get("x", 100)),
-                int(state.get("y", 100)),
-                int(state.get("w", 800)),
-                int(state.get("h", 700)),
-            )
-            if restored.width() < 600 or restored.height() < 500 or not self._on_any_screen(restored):
-                restored = self._fallback_geometry(restored.width(), restored.height())
-            self.setGeometry(restored)
-            if state.get("maximized"):
-                self.showMaximized()
-            if state.get("always_on_top"):
-                self.title_bar.always_on_top_btn.setChecked(True)
-                self._toggle_always_on_top(True)
+            self.chat.input.setFocus()
         except Exception:
-            self.resize(800, 700)
+            pass
+
+    def _preload_sounds(self):
+        """Warm the sound cache so the first shutter/click isn't delayed."""
+        try:
+            from core.sounds import preload_all
+            preload_all()
+        except Exception:
+            pass
+
+    def _apply_styles(self):
+        """Apply the window-level background from the current palette. The chat
+        coordinator and its columns style themselves via their own apply_theme."""
+        p = PALETTE
+        self.setStyleSheet(
+            f"QMainWindow {{ background: {p['background']}; }}"
+            f" QWidget {{ background: {p['background']}; color: {p['accent']}; }}"
+        )
+        # Font
+        try:
+            font = QFont("Consolas", 11)
+            font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+            self.setFont(font)
+        except Exception:
+            pass
+    
+    def _restore_geometry(self):
+        """Restore the window to EXACTLY where it last was — including which
+        monitor and the maximized state. Multi-monitor aware: a window left on
+        screen 2 reopens on screen 2. Only falls back to a centered default if
+        the saved monitor is gone (so the window can't strand off-screen)."""
+        # Don't let the window ever be smaller than this — a tiny restored size
+        # can bury the title bar under the screen edge.
+        self.setMinimumSize(800, 600)
+        try:
+            app = QApplication.instance()
+            cfg = load_config()
+            geom = cfg.get(self._geom_key)
+            maximized = bool(cfg.get(self._max_key, False))
+
+            rect = None
+            if geom and len(geom) == 4:
+                x, y, w, h = (int(v) for v in geom)
+                rect = QRect(x, y, max(800, w), max(600, h))
+
+            # Which monitor does the saved rect belong to? screenAt() walks the
+            # real layout, so screen-2 coordinates resolve to screen 2 — NOT the
+            # primary screen (the old bug that always pulled it back to screen 1).
+            screen = None
+            if rect is not None:
+                screen = app.screenAt(rect.center()) or app.screenAt(rect.topLeft())
+                if screen is None:
+                    for s in app.screens():
+                        if s.availableGeometry().intersects(rect):
+                            screen = s
+                            break
+
+            if rect is None or screen is None:
+                # No saved geom, or its monitor was disconnected — center on primary.
+                scr = app.primaryScreen().availableGeometry()
+                w, h = min(1400, scr.width()), min(900, scr.height())
+                rect = QRect(0, 0, w, h)
+                rect.moveCenter(scr.center())
+            else:
+                # Keep the rect ON its monitor; only nudge so the title bar stays
+                # reachable. Crucially, clamp to THIS screen's bounds — never the
+                # primary's — so the window doesn't jump monitors.
+                avail = screen.availableGeometry()
+                w = min(rect.width(), avail.width())
+                h = min(rect.height(), avail.height())
+                x = max(avail.left(), min(rect.x(), avail.right() - w + 1))
+                y = max(avail.top(), min(rect.y(), avail.bottom() - h + 1))
+                rect = QRect(x, y, w, h)
+
+            self.setGeometry(rect)
+            if maximized:
+                # Maximizes on the monitor the (normal) rect now sits on.
+                self._maximized = True
+                self.showMaximized()
+        except Exception as e:
+            print(f"[MainWindow] Failed to restore geometry: {e}", flush=True)
+            self.resize(1200, 800)
 
     def _save_geometry(self):
-        WINDOW_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        geo = self.geometry()
-        state = {
-            "x": geo.x(), "y": geo.y(),
-            "w": geo.width(), "h": geo.height(),
-            "maximized": self.isMaximized(),
-            "always_on_top": bool(getattr(self, "_always_on_top_enabled", False)),
-        }
-        WINDOW_STATE_PATH.write_text(
-            json.dumps(state) + "\n", encoding="utf-8")
+        """Persist the EXACT restore state: when maximized, save the NORMAL rect
+        (which monitor + size to come back to) plus the maximized flag — never
+        the maximized rect itself, which would lose the monitor and restore size."""
+        try:
+            from core.agent import save_config
+            cfg = load_config()
+            is_max = self.isMaximized()
+            g = self.normalGeometry() if is_max else self.geometry()
+            cfg[self._geom_key] = [g.x(), g.y(), g.width(), g.height()]
+            cfg[self._max_key] = is_max
+            save_config(cfg)
+        except Exception as e:
+            print(f"[MainWindow] Failed to save geometry: {e}", flush=True)
+    
+    def closeEvent(self, event):
+        """Save state and tear down every background process/thread so the
+        process actually exits instead of lingering in the terminal."""
+        self._save_geometry()
+        # Persist each conversation's terminal layout (tabs/names/view mode)
+        # BEFORE the shells are killed below — otherwise deletions never stick.
+        try:
+            self.chat._right_workspace.terminal_panel.save_all(deep=True)
+        except Exception as e:
+            print(f"[MainWindow] Terminal layout save failed: {e}", flush=True)
+        # Fan a shutdown flag out to every column and stop inference.
+        try:
+            self.chat._shutting_down = True
+            self.chat._stop_inference()
+            self.chat._auto_save(immediate=True)
+        except Exception as e:
+            print(f"[MainWindow] Chat shutdown failed: {e}", flush=True)
+        # Kill all sub-agent orchestrators.
+        try:
+            from core.subagent import _orchestrators
+            for orch in list(_orchestrators.values()):
+                try:
+                    orch.shutdown()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Stop the inbound network server + cloudflared tunnel subprocess.
+        try:
+            from core.network import network_manager
+            network_manager.stop()
+        except Exception:
+            pass
+        # Kill every agent-spawned subprocess tree (terminal shells, bg jobs).
+        try:
+            from tools.terminal import shutdown_all_processes
+            shutdown_all_processes()
+        except Exception:
+            pass
+        # Shut down any LSP servers.
+        try:
+            from core.lsp_client import lsp_manager
+            lsp_manager.shutdown_all()
+        except Exception:
+            pass
+        event.accept()
+        super().closeEvent(event)
+        # The main window IS the app — closing it ends the event loop, even if
+        # some stray top-level widget would otherwise keep it alive. main() then
+        # force-exits so no lingering thread strands the process in the terminal.
+        QApplication.instance().quit()
+    
+    def _toggle_always_on_top(self, enabled: bool = None):
+        """Toggle always-on-top WITHOUT the hide/reshow flicker.
 
-    # ── Window controls ──────────────────────────────────────────────
-
-    def _toggle_maximize(self):
-        if self.isMaximized():
-            self.showNormal()
-        else:
-            self.showMaximized()
-
-    def _toggle_always_on_top(self, enabled: bool):
+        Changing Qt window flags on a visible window forces a full top-level
+        reconfiguration (hide + show) — that's the flicker. On Windows we flip
+        the topmost bit natively via SetWindowPos, which never reshows the
+        window. `enabled` comes from the title-bar button's checked state."""
+        if enabled is None:  # called without the checked state — just invert
+            enabled = not getattr(self, "_always_on_top_enabled", False)
         self._always_on_top_enabled = bool(enabled)
-        # Avoid full top-level reconfiguration flicker on Windows.
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -528,23 +449,10 @@ class MainWindow(QMainWindow):
 
                 hwnd = wintypes.HWND(int(self.winId()))
                 insert_after = HWND_TOPMOST if enabled else HWND_NOTOPMOST
-                flags = (
-                    SWP_NOSIZE
-                    | SWP_NOMOVE
-                    | SWP_NOACTIVATE
-                    | SWP_FRAMECHANGED
-                    | SWP_NOOWNERZORDER
-                    | SWP_NOSENDCHANGING
-                )
+                flags = (SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+                         | SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING)
                 ctypes.windll.user32.SetWindowPos(
-                    hwnd,
-                    insert_after,
-                    0,
-                    0,
-                    0,
-                    0,
-                    flags,
-                )
+                    hwnd, insert_after, 0, 0, 0, 0, flags)
             except Exception:
                 self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
                 self.show()
@@ -552,31 +460,37 @@ class MainWindow(QMainWindow):
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
             self.show()
         try:
+            from core.sounds import play_ui
             play_ui("beep.mp3")
         except Exception:
             pass
-
-    @staticmethod
-    def _preload_sounds():
-        try:
-            preload_all()
-        except Exception:
-            pass
-
+    
+    def _toggle_maximize(self):
+        """Toggle between normal and maximized."""
+        if self.isMaximized():
+            self.showNormal()
+            self._maximized = False
+        else:
+            self.showMaximized()
+            self._maximized = True
+    
     def _screenshot_to_clipboard(self):
-        """Grab the entire window as a screenshot and copy to clipboard."""
-        from PyQt6.QtWidgets import QApplication
+        """Grab the whole window, copy it to the clipboard (as PNG + image),
+        play the shutter sound, and fire the camera-flash overlay."""
         from PyQt6.QtCore import QBuffer, QIODevice, QMimeData
-
-        pixmap = self.grab()
-        data = QMimeData()
-        buf = QBuffer()
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        pixmap.save(buf, "PNG")
-        buf.close()
-        data.setData("image/png", buf.data())
-        data.setImageData(pixmap.toImage())
-        QApplication.clipboard().setMimeData(data)
+        try:
+            pixmap = self.grab()
+            data = QMimeData()
+            buf = QBuffer()
+            buf.open(QIODevice.OpenModeFlag.WriteOnly)
+            pixmap.save(buf, "PNG")
+            buf.close()
+            data.setData("image/png", buf.data())
+            data.setImageData(pixmap.toImage())
+            QApplication.clipboard().setMimeData(data)
+        except Exception as e:
+            print(f"[MainWindow] Screenshot failed: {e}", flush=True)
+            return
         try:
             from core.sounds import play_ui
             play_ui("snapshot.mp3")
@@ -586,8 +500,6 @@ class MainWindow(QMainWindow):
 
     def _do_camera_flash(self):
         """White flash overlay that fades out — simulates a camera flash."""
-        from PyQt6.QtWidgets import QWidget
-        from PyQt6.QtCore import QPropertyAnimation
         flash = QWidget(self)
         flash.setGeometry(self.rect())
         flash.setStyleSheet("background: white;")
@@ -595,8 +507,7 @@ class MainWindow(QMainWindow):
         flash.show()
         flash.raise_()
 
-        # Use a QTimer-driven step-down because QPropertyAnimation needs
-        # a Q_PROPERTY; simpler to just tick the opacity via stylesheet.
+        # Step the opacity down via stylesheet (no Q_PROPERTY animation needed).
         steps = [0.85, 0.65, 0.45, 0.30, 0.18, 0.08, 0.0]
         self._flash_widget = flash  # prevent GC
         self._flash_step = 0
@@ -609,37 +520,109 @@ class MainWindow(QMainWindow):
                 self._flash_widget = None
                 return
             opacity = self._flash_steps[self._flash_step]
-            flash.setStyleSheet(f"background: rgba(255,255,255,{int(opacity*255)});")
+            flash.setStyleSheet(f"background: rgba(255,255,255,{int(opacity * 255)});")
             self._flash_step += 1
             QTimer.singleShot(30, _tick)
 
         QTimer.singleShot(30, _tick)
-
+    
+    def _toggle_crt(self):
+        """Toggle CRT overlay on/off, save config."""
+        try:
+            from core.agent import save_config
+            cfg = load_config()
+            cfg["crt_enabled"] = not cfg.get("crt_enabled", False)
+            save_config(cfg)
+            self._apply_crt()
+        except Exception as e:
+            print(f"[MainWindow] Failed to toggle CRT: {e}", flush=True)
+    
+    # Dialog handlers
+    def _open_help(self):
+        """Show help dialog."""
+        dlg = HelpDialog(self)
+        dlg.exec()
+    
     def _open_settings(self):
-        # Non-modal now: pass the theme/CRT refresh as an on-accept callback
-        # instead of relying on a blocking exec() return value, so the main
-        # window (always-on-top, screenshot, chat) stays usable while Settings
-        # is open.
+        """Open Settings via the focused chat column (non-modal). The column
+        owns the dialog; we pass an on_accept callback so the whole window
+        repaints with the new palette/CRT when the user applies changes."""
         def _on_accept():
             refresh_palette()
-            apply_app_icon(window=self)
             self._apply_styles()
             self.title_bar.apply_theme()
             self.chat.apply_theme()
             self._apply_crt()
             self.update()
-
         self.chat._open_settings(on_accept=_on_accept)
 
     def _open_tasks(self):
-        from ui.tasks_dialog import TasksDialog
-        dlg = TasksDialog(self.chat, parent=self)
+        """Show tasks dialog (bound to the chat window)."""
+        dlg = TasksDialog(self.chat, self)
         dlg.exec()
 
     def _open_memory(self):
-        from ui.memory_dialog import MemoryDialog
-        dlg = MemoryDialog(parent=self)
+        """Show memory/notes dialog."""
+        dlg = MemoryDialog(self)
         dlg.exec()
+    
+    def _refresh_ui(self):
+        """
+        Hot-reload UI modules + theme without restarting the Agent backend.
+        Terminal tabs, workspaces, and the Agent backend stay alive and untouched.
+        """
+        import sys
+        import importlib
+        
+        try:
+            from core.sounds import play_ui
+            play_ui("beep.mp3")
+        except Exception:
+            pass
+
+        try:
+            # Modules to NOT reload (singletons / live backend bridges):
+            # - core.agent, core.subagent, core.database (hold Agent/tool state)
+            # - core.tools (have registered tool instances)
+            # - core.lsp_client (live LSP connections)
+            # - core.sounds (audio playback state)
+            SKIP_MODULES = {
+                "core.agent", "core.subagent", "core.database",
+                "core.lsp_client", "core.sounds", "core.ui_watchdog", "core.tools",
+                "core.file_viewer_state",
+            }
+            
+            # Reload all ui.* and remaining core.* modules
+            modules_to_reload = [
+                name for name in sys.modules.keys()
+                if (name.startswith("ui.") or name.startswith("core."))
+                and name not in SKIP_MODULES
+            ]
+            
+            for mod_name in modules_to_reload:
+                try:
+                    mod = sys.modules.get(mod_name)
+                    if mod is not None:
+                        importlib.reload(mod)
+                except Exception as e:
+                    print(f"[Refresh] Warning: failed to reload {mod_name}: {e}", flush=True)
+
+            # Refresh theme and CRT overlay with newly loaded code
+            self._apply_styles()
+            if self.title_bar:
+                self.title_bar.apply_theme()
+            if self.chat:
+                self.chat.apply_theme()
+            self.update()
+            
+            # Re-apply CRT overlay with fresh code
+            self._apply_crt()
+            
+            print("[Refresh] UI reloaded successfully", flush=True)
+        except Exception as e:
+            print(f"[Refresh] Error during hot-reload: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
     def _apply_crt(self):
         """Create or destroy CRT overlay based on config."""
@@ -654,318 +637,114 @@ class MainWindow(QMainWindow):
             # Parent to the CENTRAL WIDGET, not the QMainWindow. A child of the
             # main window sits behind the central widget (which fills the client
             # area and paints over it); a child of the central widget, raised,
-            # reliably layers above all the app content.
-            host = self.centralWidget() or self
-            self._crt_overlay = CRTOverlay(
-                host, QColor(PALETTE["accent"]), speed_ms=speed)
-            self._crt_overlay.sync_geometry()
-            self._crt_overlay.show()
-            self._crt_overlay.raise_()
-            # _apply_crt can run before the window is shown/laid out, when the
-            # central widget's rect is still tiny — that left the overlay stuck
-            # as a small box in the top-left (the "ugly square") with no visible
-            # scanlines until a manual resize re-synced it. Re-sync once the
-            # event loop has settled the real geometry.
-            QTimer.singleShot(0, self._sync_crt_overlay)
-            QTimer.singleShot(150, self._sync_crt_overlay)
+            # sits on TOP of all siblings.
+            central = self.centralWidget()
+            if central:
+                self._crt_overlay = CRTOverlay(central)
+                self._crt_overlay.raise_()
+                self._crt_overlay.resize(central.size())
+                self._crt_overlay.show()
+                self._crt_overlay.animate(speed)
         elif not enabled and self._crt_overlay:
+            self._crt_overlay.stop()
             self._crt_overlay.hide()
-            self._crt_overlay.deleteLater()
+            self._crt_overlay.setParent(None)
             self._crt_overlay = None
         elif enabled and self._crt_overlay:
-            from PyQt6.QtGui import QColor
-            self._crt_overlay.set_border_color(QColor(PALETTE["accent"]))
-            self._crt_overlay.set_speed(speed)
+            # Update speed
+            self._crt_overlay.animate(speed)
 
-    def _sync_crt_overlay(self):
-        """Re-glue the CRT overlay to the current host rect. Safe to call any
-        time; no-op when the overlay is off."""
-        co = getattr(self, "_crt_overlay", None)
-        if co is not None:
-            try:
-                co.sync_geometry()
-            except RuntimeError:
-                pass
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        # First real geometry arrives with the show; sync the overlay so it
-        # covers the whole window instead of the tiny pre-layout rect.
-        QTimer.singleShot(0, self._sync_crt_overlay)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._sync_crt_overlay()
-
-    def moveEvent(self, event):
-        super().moveEvent(event)
-        # CRT overlay is a child widget (follows the parent automatically); the
-        # re-sync here is a cheap, harmless safety net for edge cases.
-        self._sync_crt_overlay()
-
-    def _apply_styles(self):
-        p = PALETTE
-        self.setStyleSheet(f"""
-            QMainWindow {{
-                background: {p['background']};
-            }}
-        """)
-
-    def closeEvent(self, event):
-        """Persist geometry, stop watchdog, release processes and timers."""
-        # Mark shutdown BEFORE stopping inference: aborting a turn that's blocked
-        # on an open question board would otherwise tear the board down and wipe
-        # the durable record, so the question wouldn't be restored next launch.
-        try:
-            self.chat._shutting_down = True
-        except Exception:
-            pass
-        self._save_geometry()
-        try:
-            self.chat._composer_draft_timer.stop()
-            self.chat._persist_current_composer_draft()
-        except Exception:
-            pass
-        try:
-            self.chat._auto_save(immediate=True)
-        except Exception:
-            pass
-        try:
-            from core.database import flush_pending_conversation_saves
-            flush_pending_conversation_saves()
-        except Exception:
-            pass
-        try:
-            self._ui_watchdog.stop()
-        except Exception:
-            pass
-        # Stop inference if running
-        try:
-            self.chat._stop_inference()
-        except Exception:
-            pass
-        # Kill all sub-agent orchestrators
-        try:
-            from core.subagent import _orchestrators
-            for orch in list(_orchestrators.values()):
-                try:
-                    orch.shutdown()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # Persist terminal tabs for restart resume (live cwd + last command,
-        # e.g. `claude --continue`) BEFORE any shells are killed — deep detection
-        # inspects the live shell trees via psutil. Covers BOTH the Terminal
-        # workspace (per conversation) and the File viewer's terminals.
-        try:
-            self.chat._right_workspace.terminal_panel.save_all(deep=True)
-        except Exception:
-            pass
-        try:
-            self.chat._file_viewer.save_terminal_state(deep=True)
-        except Exception:
-            pass
-        # Stop all terminal shell processes across every conversation panel
-        # (fixes QProcess destroyed warnings). Per-conv panels each registered
-        # their own aboutToQuit handler, but call close here too for the
-        # synchronous shutdown path where closeEvent runs first.
-        try:
-            multi = self.chat._right_workspace.terminal_panel
-            for panel in list(getattr(multi, "_panels", {}).values()):
-                try:
-                    panel.close_all_sessions()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # Kill ALL agent-spawned subprocess trees (foreground + background).
-        # `taskkill /T /F` on Windows reaches descendants — proc.kill() only
-        # kills the cmd.exe wrapper, orphaning python.exe and friends.
-        try:
-            from tools.terminal import shutdown_all_processes
-            shutdown_all_processes()
-        except Exception:
-            pass
-        # Shut down LSP servers
-        try:
-            from core.lsp_client import lsp_manager
-            lsp_manager.shutdown_all()
-        except Exception:
-            pass
-        super().closeEvent(event)
+def _global_kill_all():
+    """Belt-and-suspenders teardown of everything that can keep the process
+    alive after the window closes: agent subprocess trees + the network
+    server/cloudflared tunnel. Safe to call multiple times."""
+    try:
+        from tools.terminal import shutdown_all_processes
+        shutdown_all_processes()
+    except Exception:
+        pass
+    try:
+        from core.network import network_manager
+        network_manager.stop()
+    except Exception:
+        pass
 
 
 def main():
-    _configure_windows_app_identity()
-    _repair_agent_shortcut()
-    _disable_console_quick_edit()
-
-    # WebEngine (right workspace browser) expects shared GL on many platforms.
-    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setApplicationDisplayName(APP_NAME)
-    # Wrap Fusion in a proxy style that swallows the dotted focus rectangle.
-    # QLabel's rich-text engine draws anchor focus rects via the APPLICATION
-    # style (not a widget's per-instance style), so suppressing it here is what
-    # actually removes the 90s-hyperlink box around clicked tool-call chips —
-    # including while a modal dialog freezes the app behind it. The whole app is
-    # custom-themed, so native focus rects are unwanted everywhere anyway.
-    from PyQt6.QtWidgets import QProxyStyle, QStyle, QStyleFactory
-
-    class _NoFocusRectAppStyle(QProxyStyle):
-        def drawPrimitive(self, element, option, painter, widget=None):
-            if element == QStyle.PrimitiveElement.PE_FrameFocusRect:
-                return
-            super().drawPrimitive(element, option, painter, widget)
-
-    app.setStyle(_NoFocusRectAppStyle(QStyleFactory.create("Fusion")))
-    apply_selection_palette()  # accent-colored text/list selection, not grey
-    apply_app_icon()
-
-    # Single-instance guard, now keyed on a LIVE IPC probe (not a possibly-stale
-    # shared-memory lock). --replace/--force tells any existing instance to quit
-    # and takes over — the escape hatch for dev restarts where an invisible
-    # pythonw orphan was holding the lock and serving stale code.
-    replace = any(a in ("--replace", "--force", "--restart") for a in sys.argv[1:])
-    if replace:
-        if _live_instance_running(command=b"quit"):
-            print(f"[{APP_NAME}] Asked the running instance to quit; taking over.")
-            # Wait for the old IPC server to actually free the socket name.
-            import time as _time
-            for _ in range(20):  # up to ~2s
-                if not _live_instance_running(command=b"raise"):
-                    break
-                _time.sleep(0.1)
-    elif _live_instance_running(command=b"raise"):
-        print(f"[{APP_NAME}] Already running — bringing the existing window to the front.")
-        print(f"[{APP_NAME}] (Run 'py main.py --replace' to force a fresh instance.)")
-        return
-
-    _claim_singleton_marker(app)
-
-    # ── Splash: show immediately so startup (tool imports + conversation
-    # hydration) doesn't stare at a blank screen. Non-blocking; faded out once
-    # the first conversation has rendered. Only the surviving instance shows it.
-    splash = None
-    try:
-        from ui.splash_screen import SplashScreen
-        splash = SplashScreen()
-        splash.show()
-        app.processEvents()  # paint it before the heavy work begins
-    except Exception:
-        splash = None
-
-    def _splash_status(text: str):
-        if splash is not None:
-            splash.set_status(text)
-            app.processEvents()
-
-    # Prerequisite check runs with the splash up (it does ~7 PATH probes).
-    _splash_status("Checking prerequisites…")
-    from core.prereqs import check_prerequisites
-    check_prerequisites()
-
-    # Belt-and-suspenders cleanup: register shutdown on every exit path we can.
-    # closeEvent runs on a graceful X-close. aboutToQuit also covers programmatic
-    # quit. atexit catches the rest (Ctrl+C in launcher, sys.exit, uncaught
-    # exceptions). Every layer kills the full subprocess tree, not just the
-    # cmd.exe wrapper, so python scripts/servers don't get orphaned.
-    import atexit
-    def _global_kill_all():
+    """Main entry point."""
+    # Windows taskbar identity. Set BEFORE any window: without an explicit
+    # AppUserModelID, Windows groups us under "pythonw.exe" (generic Python icon,
+    # and pinning pins pythonw, not Familiar). Giving the process its own ID makes
+    # the taskbar treat Familiar as its own app, so the live window's accent icon
+    # is what shows and what pins.
+    if sys.platform == "win32":
         try:
-            from tools.terminal import shutdown_all_processes
-            shutdown_all_processes()
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "Lamport.Familiar.Agent")
         except Exception:
             pass
+
+    # Qt app
+    app = QApplication(sys.argv)
+    _patch_qt()
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    # Accent-colored sparkle on the QApplication, so every window and dialog
+    # inherits it (and it's what the taskbar shows).
+    try:
+        import os as _os
+        import threading as _threading
+        from ui.app_icon import apply_app_icon, write_app_ico
+        apply_app_icon()
+        # Refresh the launcher shortcut's .ico to the current accent (best-effort;
+        # START.bat points Agent.lnk at this file). Off the UI hot path.
+        _ico = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                             "assets", "agent.ico")
+        _threading.Thread(target=lambda: write_app_ico(_ico),
+                          daemon=True, name="app-ico-refresh").start()
+    except Exception:
+        pass
+
+    # Register teardown on every exit path: aboutToQuit (graceful close),
+    # atexit (Ctrl-C / sys.exit / uncaught). Without this, the inbound network
+    # server thread and cloudflared subprocess outlive the window and the
+    # process hangs in the terminal.
+    import atexit
     app.aboutToQuit.connect(_global_kill_all)
     atexit.register(_global_kill_all)
 
-    # Start hot-reload watcher for tools/
-    _splash_status("Loading tools…")
-    from tools.hot_reload import ToolWatcher
-    watcher = ToolWatcher()
-    watcher.start()
-
-    _splash_status("Building interface…")
-    window = MainWindow()
-    window.setWindowIcon(app.windowIcon())
-    # Opening ceremony: the wordmark starts dark (bulb off) behind the splash;
-    # it ignites shortly after the splash clears (see _dismiss below).
+    # Familiar agent + db
     try:
-        window.title_bar.set_unlit()
-    except Exception:
-        pass
-    _install_singleton_server(app, window)
+        init_conversations_db()
+        agent = Agent()
+    except Exception as e:
+        print(f"[Familiar] Failed to init Agent/Database: {e}", flush=True)
+        sys.exit(1)
 
-    _splash_status("Restoring conversation…")
-    window.show()
+    # Main window
+    try:
+        window = MainWindow(agent)
+        window.show()
+    except Exception as e:
+        print(f"[Familiar] Failed to create MainWindow: {e}", flush=True)
+        sys.exit(1)
 
-    # Fade the splash once the window is up and the first conversation has had a
-    # moment to hydrate (it loads async). The chat exposes a one-shot signal when
-    # its initial conversation finishes rendering; fall back to a timer so the
-    # splash never lingers if that signal doesn't fire.
-    if splash is not None:
-        dismissed = {"v": False}
+    # Signal handlers
+    def sigint_handler(sig, frame):
+        print("\n[Familiar] Ctrl-C detected, shutting down gracefully...", flush=True)
+        window.close()
+        app.quit()
 
-        def _focus_input():
-            # Land the cursor in the message box so the user can type immediately
-            # (the +100ms focus at startup gets stolen by the splash teardown +
-            # window activation that happen later). Deferred so it runs after the
-            # activation settles.
-            try:
-                window.chat.input.setFocus()
-            except Exception:
-                pass
+    signal.signal(signal.SIGINT, sigint_handler)
 
-        def _dismiss():
-            if dismissed["v"]:
-                return
-            dismissed["v"] = True
-            window.raise_()
-            window.activateWindow()
-            QTimer.singleShot(0, _focus_input)
-            splash.fade_out()
-            # Opening ceremony: 0.5s after the splash clears, chime (start.mp3);
-            # then 1.3s after that, play the lightbulb sound and ignite the
-            # wordmark from dark to glow-hot.
-            def _lights_on():
-                # The bulb ignites and, in the same beat, the pristine intro
-                # hint fades in over the empty chat.
-                try:
-                    window.title_bar.ignite()
-                except Exception:
-                    pass
-                try:
-                    window.chat.show_intro_hint_if_pristine()
-                except Exception:
-                    pass
-                _focus_input()  # ensure the box still holds focus after the ceremony
-
-            def _chime_then_ignite():
-                try:
-                    from core.sounds import play_ui
-                    play_ui("start.mp3", volume=0.5)  # softer launch chime
-                except Exception:
-                    pass
-                try:
-                    QTimer.singleShot(1300, _lights_on)
-                except Exception:
-                    pass
-            QTimer.singleShot(500, _chime_then_ignite)
-
-        ready = getattr(getattr(window, "chat", None), "initial_load_finished", None)
-        if ready is not None:
-            try:
-                ready.connect(lambda *_: _dismiss())
-            except Exception:
-                pass
-        # Safety net: dismiss after a short delay regardless (covers the
-        # no-signal path and very fast loads).
-        QTimer.singleShot(1200, _dismiss)
-
-    sys.exit(app.exec())
+    # Go. After the event loop ends, force-exit so any lingering non-daemon
+    # thread (e.g. the network HTTP server) can't keep the process running.
+    exit_code = app.exec()
+    _global_kill_all()
+    import os
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":
