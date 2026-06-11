@@ -1,5 +1,3 @@
-"""Familiar: Claude AI CLI with persistent chat, terminal workspace, and rich UI."""
-
 import sys
 import signal
 
@@ -698,10 +696,13 @@ def main():
         import threading as _threading
         from ui.app_icon import apply_app_icon, write_app_ico
         apply_app_icon()
-        # Refresh the launcher shortcut's .ico to the current accent (best-effort;
-        # START.bat points Agent.lnk at this file). Off the UI hot path.
+        # Refresh the launcher shortcut's .ico to the current accent (best-effort).
+        # Written to data/ (NOT assets/) because it bakes in the USER'S personal
+        # accent color — data/ is excluded from packaging, so a personalized icon
+        # never ships. START.bat prefers data/agent.ico, falling back to the
+        # committed neutral assets/agent.ico. Off the UI hot path.
         _ico = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
-                             "assets", "agent.ico")
+                             "data", "agent.ico")
         _threading.Thread(target=lambda: write_app_ico(_ico),
                           daemon=True, name="app-ico-refresh").start()
     except Exception:
