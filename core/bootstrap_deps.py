@@ -46,6 +46,7 @@ if str(ROOT) not in sys.path:
 # (e.g. no pywinpty ⇒ pipe-mode terminals ⇒ claude/cursor/codex won't run).
 _CRITICAL: list[tuple[str, str]] = [
     ("PyQt6.QtWidgets", "PyQt6"),
+    ("markdown2", "markdown2"),   # imported at startup in ui/chat_widget — fatal
     ("pyte", "pyte"),
     ("tree_sitter", "tree-sitter"),
     ("tree_sitter_language_pack", "tree-sitter-language-pack"),
