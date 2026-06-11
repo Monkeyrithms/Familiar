@@ -18,7 +18,7 @@ import time
 import uuid
 from pathlib import Path
 
-from PyQt6.QtCore import QDate, Qt, QTimer
+from PyQt6.QtCore import QDate, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QFrame,
@@ -299,12 +299,30 @@ def _task_events_for_month(year: int, month: int) -> dict[str, list[dict]]:
 
 
 class NotesWorkspacePanel(QFrame):
+    # Emitted (possibly from a tool worker thread) when the notes JSON was
+    # changed externally — e.g. the agent's `notes` tool. Cross-thread signal
+    # delivery queues _reload onto the GUI thread for free.
+    _external_change = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("NotesWorkspacePanel")
         self._notes: list[dict] = []
         self._current_id: str | None = None
         self._suppress_save = False
+        # When mirroring a peer, notes load/save/delete route to the host's
+        # notes over the network instead of the local store.
+        self._remote: dict | None = None
+
+        self._external_change.connect(self._reload)
+        try:
+            from core.event_bus import bus
+
+            # If this panel is ever destroyed, emitting on the dead QObject
+            # raises RuntimeError — the bus catches and logs it, nothing breaks.
+            bus.on("notes.changed", lambda **kw: self._external_change.emit())
+        except Exception:
+            pass
 
         root = QHBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -348,6 +366,72 @@ class NotesWorkspacePanel(QFrame):
         self._reload()
         self.apply_theme()
 
+    # ── Remote mirroring ──────────────────────────────────────────────
+    def _switch_store(self, remote: dict | None) -> None:
+        """Flip between local and remote note stores WITHOUT leaking the
+        currently-open note across the boundary. Clearing the editor first is
+        essential: _reload()'s pre-save would otherwise re-create the old store's
+        open note in the new store."""
+        self._suppress_save = True
+        self._editor.clear()
+        self._current_id = None
+        self._suppress_save = False
+        self._remote = remote
+        self._reload()
+
+    def enter_remote(self, peer_url: str, conv_id: str) -> None:
+        """Show/edit a peer's notes (host commits them)."""
+        self._switch_store({"url": peer_url, "conv_id": conv_id})
+
+    def exit_remote(self) -> None:
+        if self._remote is None:
+            return
+        self._switch_store(None)
+
+    def _r_load(self) -> list[dict]:
+        if self._remote:
+            try:
+                from core.network import peer_notes_list
+                ok, notes = peer_notes_list(self._remote["url"])
+                return notes if ok else []
+            except Exception:
+                return []
+        return _load_notes()
+
+    def _r_save_one(self, note_id: str, content: str) -> dict | None:
+        if self._remote:
+            try:
+                from core.network import peer_notes_save
+                ok, note = peer_notes_save(self._remote["url"], note_id, content)
+                return note if ok else None
+            except Exception:
+                return None
+        notes = _load_notes()
+        now = time.time()
+        if note_id:
+            for n in notes:
+                if str(n.get("id") or "") == str(note_id):
+                    n["content"] = content
+                    n["updated_at"] = now
+                    _save_notes(notes)
+                    return n
+        note = {"id": uuid.uuid4().hex[:12], "content": content,
+                "created_at": now, "updated_at": now}
+        notes.append(note)
+        _save_notes(notes)
+        return note
+
+    def _r_delete(self, note_id: str) -> None:
+        if self._remote:
+            try:
+                from core.network import peer_notes_delete
+                peer_notes_delete(self._remote["url"], note_id)
+            except Exception:
+                pass
+            return
+        notes = [n for n in _load_notes() if str(n.get("id") or "") != str(note_id)]
+        _save_notes(notes)
+
     def _schedule_save(self) -> None:
         if self._suppress_save:
             return
@@ -356,7 +440,7 @@ class NotesWorkspacePanel(QFrame):
     def _reload(self) -> None:
         if not self._suppress_save:
             self._save_current()
-        self._notes = sorted(_load_notes(), key=lambda n: float(n.get("updated_at") or 0), reverse=True)
+        self._notes = sorted(self._r_load(), key=lambda n: float(n.get("updated_at") or 0), reverse=True)
         prev_id = self._current_id
         self._suppress_save = True
         self._list.clear()
@@ -400,26 +484,16 @@ class NotesWorkspacePanel(QFrame):
         if self._suppress_save:
             return
         text = self._editor.toPlainText()
-        now = time.time()
-        notes = _load_notes()
         if not self._current_id:
             if not text.strip():
                 return
-            note = {"id": uuid.uuid4().hex[:12], "content": text, "created_at": now, "updated_at": now}
-            notes.append(note)
-            self._current_id = note["id"]
-            _save_notes(notes)
+            note = self._r_save_one("", text)
+            if note:
+                self._current_id = note.get("id")
             self._reload()
             return
-        updated = False
-        for note in notes:
-            if str(note.get("id") or "") == str(self._current_id):
-                note["content"] = text
-                note["updated_at"] = now
-                updated = True
-                break
-        if updated:
-            _save_notes(notes)
+        note = self._r_save_one(str(self._current_id), text)
+        if note:
             first = text.splitlines()[0] if text.splitlines() else ""
             preview = first[:48] if first.strip() else "(empty)"
             for i in range(self._list.count()):
@@ -430,12 +504,8 @@ class NotesWorkspacePanel(QFrame):
 
     def _new_note(self) -> None:
         self._save_current()
-        now = time.time()
-        note = {"id": uuid.uuid4().hex[:12], "content": "", "created_at": now, "updated_at": now}
-        notes = _load_notes()
-        notes.append(note)
-        _save_notes(notes)
-        self._current_id = note["id"]
+        note = self._r_save_one("", "")
+        self._current_id = note.get("id") if note else None
         self._suppress_save = True
         self._editor.clear()
         self._suppress_save = False
@@ -451,8 +521,7 @@ class NotesWorkspacePanel(QFrame):
         note_id = str(item.data(Qt.ItemDataRole.UserRole)) if item else ""
         if not note_id:
             return
-        notes = [n for n in _load_notes() if str(n.get("id") or "") != note_id]
-        _save_notes(notes)
+        self._r_delete(note_id)
         self._suppress_save = True
         self._editor.clear()
         self._current_id = None
@@ -486,6 +555,7 @@ class CalendarWorkspacePanel(QFrame):
         self._selected_iso = QDate.currentDate().toString("yyyy-MM-dd")
         self._view_year = QDate.currentDate().year()
         self._view_month = QDate.currentDate().month()
+        self._remote: dict | None = None   # {url} when mirroring a peer's calendar
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -555,6 +625,27 @@ class CalendarWorkspacePanel(QFrame):
         self.apply_theme()
         self._refresh_calendar()
 
+    def enter_remote(self, peer_url: str) -> None:
+        """Show a peer's scheduled-task calendar (read-only)."""
+        self._remote = {"url": peer_url}
+        self._refresh_calendar()
+
+    def exit_remote(self) -> None:
+        if self._remote is None:
+            return
+        self._remote = None
+        self._refresh_calendar()
+
+    def _events_for_month(self, year: int, month: int) -> dict:
+        if self._remote:
+            try:
+                from core.network import peer_calendar_events
+                ok, ev = peer_calendar_events(self._remote["url"], year, month)
+                return ev if ok else {}
+            except Exception:
+                return {}
+        return _task_events_for_month(year, month)
+
     def _open_tasks_popup(self) -> None:
         opener = getattr(self.window(), "_open_tasks", None)
         if callable(opener):
@@ -588,7 +679,7 @@ class CalendarWorkspacePanel(QFrame):
         else:
             days = (dt.date(self._view_year, self._view_month + 1, 1) - first).days
         self._title.setText(QDate(self._view_year, self._view_month, 1).toString("MMMM yyyy"))
-        task_events = _task_events_for_month(self._view_year, self._view_month)
+        task_events = self._events_for_month(self._view_year, self._view_month)
 
         self._grid.clearContents()
         self._grid.setHorizontalHeaderLabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])

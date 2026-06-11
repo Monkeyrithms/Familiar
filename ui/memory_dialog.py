@@ -469,7 +469,7 @@ class MemoryDialog(GlassDialog):
         if not stream:
             return
         try:
-            from core.database import list_note_categories, list_notes_in_category, read_note
+            from core.database import list_note_categories, list_notes_in_category
             cats = list_note_categories(stream)
         except Exception:
             return
@@ -484,17 +484,17 @@ class MemoryDialog(GlassDialog):
             parts = path.split("/")
             for i in range(len(parts)):
                 all_paths.add("/".join(parts[:i + 1]))
-            # Load direct notes for this category
+            # Load direct notes for this category. The list call returns a
+            # SQL-side preview snippet \u2014 no read_note() per note (that was a
+            # fresh connection + full content read each, freezing the dialog
+            # on streams with many notes).
             try:
                 note_list = list_notes_in_category(stream, path)
                 notes_for_cat = []
                 for n in note_list:
-                    full = read_note(stream, path, n["title"])
-                    preview = ""
-                    if full and full.get("content"):
-                        raw = full["content"].replace("\n", " ").replace("\r", " ").strip()
-                        max_len = 48
-                        preview = raw if len(raw) <= max_len else raw[: max_len - 1] + "\u2026"
+                    raw = (n.get("preview") or "").replace("\n", " ").replace("\r", " ").strip()
+                    max_len = 48
+                    preview = raw if len(raw) <= max_len else raw[: max_len - 1] + "\u2026"
                     notes_for_cat.append((n["title"], preview))
                 if notes_for_cat:
                     cat_notes[path] = notes_for_cat

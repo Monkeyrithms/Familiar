@@ -1,5 +1,5 @@
 """
-Custom titlebar — Settings on left, centered title, min/max/close on right.
+Custom titlebar — Help / Settings / Tasks / Memory on left, centered title, min/max/close on right.
 Supports window dragging.
 """
 
@@ -24,11 +24,13 @@ def _lerp_color(a: QColor, b: QColor, t: float) -> QColor:
 
 
 class TitleBar(QWidget):
+    help_clicked = pyqtSignal()
     settings_clicked = pyqtSignal()
     tasks_clicked = pyqtSignal()
     memory_clicked = pyqtSignal()
     screenshot_clicked = pyqtSignal()
     always_on_top_clicked = pyqtSignal(bool)
+    refresh_clicked = pyqtSignal()
     minimize_clicked = pyqtSignal()
     maximize_clicked = pyqtSignal()
     close_clicked = pyqtSignal()
@@ -57,11 +59,22 @@ class TitleBar(QWidget):
         layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(4)
 
+        # Help button (left, before Settings)
+        self.help_btn = QPushButton("?")
+        self.help_btn.setObjectName("titleBtn")
+        self.help_btn.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        self.help_btn.setFixedSize(24, 24)
+        self.help_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.help_btn.setToolTip("Help & setup guide")
+        self.help_btn.clicked.connect(self.help_clicked.emit)
+        layout.addWidget(self.help_btn)
+
         # Settings button (left)
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.setObjectName("titleBtn")
         self.settings_btn.setFont(QFont("Consolas", 8))
         self.settings_btn.setFixedHeight(24)
+        self.settings_btn.setToolTip("API keys, model, workspaces, tools, and UI options")
         self.settings_btn.clicked.connect(self.settings_clicked.emit)
         layout.addWidget(self.settings_btn)
 
@@ -70,6 +83,7 @@ class TitleBar(QWidget):
         self.tasks_btn.setObjectName("titleBtn")
         self.tasks_btn.setFont(QFont("Consolas", 8))
         self.tasks_btn.setFixedHeight(24)
+        self.tasks_btn.setToolTip("Scheduled prompts — cron-style reminders and automations")
         self.tasks_btn.clicked.connect(self.tasks_clicked.emit)
         layout.addWidget(self.tasks_btn)
 
@@ -78,6 +92,7 @@ class TitleBar(QWidget):
         self.memory_btn.setObjectName("titleBtn")
         self.memory_btn.setFont(QFont("Consolas", 8))
         self.memory_btn.setFixedHeight(24)
+        self.memory_btn.setToolTip("Memory streams, notes, and rolling summaries")
         self.memory_btn.clicked.connect(self.memory_clicked.emit)
         layout.addWidget(self.memory_btn)
 
@@ -87,6 +102,7 @@ class TitleBar(QWidget):
         self.title_label = QLabel(title)
         self.title_label.setFont(self._wordmark_font())
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setWordWrap(False)
         # Enchanted glow around the wordmark (color tracks the theme — set in
         # apply_theme). Offset 0 makes it a halo/bloom rather than a drop shadow.
         self._title_glow = QGraphicsDropShadowEffect(self)
@@ -105,6 +121,7 @@ class TitleBar(QWidget):
         title_row.setSpacing(6)
         title_row.addWidget(self.title_label)
         title_row.addWidget(self.title_icon_label)
+        self._title_center.setStyleSheet("background: transparent; border: none;")
         layout.addWidget(self._title_center)
 
         layout.addStretch()
@@ -121,6 +138,16 @@ class TitleBar(QWidget):
             lambda checked: self.always_on_top_clicked.emit(checked)
         )
         layout.addWidget(self.always_on_top_btn)
+
+        # Refresh button (between always-on-top and screenshot)
+        self.refresh_btn = QPushButton("\u27f3")  # ↻
+        self.refresh_btn.setObjectName("titleBtn")
+        self.refresh_btn.setFont(QFont("Consolas", 10))
+        self.refresh_btn.setFixedSize(24, 24)
+        self.refresh_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.refresh_btn.setToolTip("Refresh UI (hot-reload codebase changes)")
+        self.refresh_btn.clicked.connect(self.refresh_clicked.emit)
+        layout.addWidget(self.refresh_btn)
 
         # Screenshot button (right, before window controls)
         self.screenshot_btn = QPushButton("\u25a3")           # ▣
@@ -315,9 +342,27 @@ class TitleBar(QWidget):
     def mouseMoveEvent(self, event):
         if self._dragging and self._drag_pos is not None:
             win = self.window()
-            delta = event.globalPosition().toPoint() - self._drag_pos
+            gpos = event.globalPosition().toPoint()
+            if win.isMaximized():
+                # Dragging a MAXIMIZED window: calling move() on it is clamped
+                # back to full screen by Windows, leaving the window stuck
+                # maximized. Restore it to normal size positioned under the
+                # cursor first (standard Windows behaviour), then keep dragging.
+                cur_w = max(win.width(), 1)
+                ratio = (gpos.x() - win.x()) / cur_w  # cursor's fractional x
+                restore_w = win.normalGeometry().width() or 1200
+                win.showNormal()
+                if hasattr(win, "_maximized"):
+                    win._maximized = False  # keep the host's bookkeeping in sync
+                new_x = int(gpos.x() - ratio * restore_w)
+                new_y = gpos.y() - self.height() // 2
+                win.move(max(0, new_x), max(0, new_y))
+                self._drag_pos = gpos
+                event.accept()
+                return
+            delta = gpos - self._drag_pos
             win.move(win.pos() + delta)
-            self._drag_pos = event.globalPosition().toPoint()
+            self._drag_pos = gpos
             event.accept()
             return
         super().mouseMoveEvent(event)

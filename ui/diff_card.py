@@ -32,6 +32,11 @@ from ui.theme import PALETTE
 DEFAULT_CAP = 12
 # Context lines kept around each change hunk in the collapsed preview.
 _CONTEXT = 2
+# Top corners rounded; bottom square (edged) — reads like a card docked to the transcript.
+_DIFF_RADIUS_TOP = "8px"
+_DIFF_RADIUS_CSS = f"{_DIFF_RADIUS_TOP} {_DIFF_RADIUS_TOP} 0 0"
+# Slight inset from the chat column edges (widget + inline HTML).
+_DIFF_SIDE_PAD = 8
 
 
 def _hex_rgb(h: str) -> tuple[int, int, int]:
@@ -205,6 +210,7 @@ def build_diff_card(path: str, original: str, current: str, *,
     )
     titlebar = (
         f'<div style="background:{p.get("panel", bg)};border-bottom:1px solid {border};'
+        f'border-top-left-radius:{_DIFF_RADIUS_TOP};border-top-right-radius:{_DIFF_RADIUS_TOP};'
         f'padding:3px 8px;">'
         f'<a href="familiar://openfile?path={enc_path}" '
         f'style="color:{title_c};text-decoration:none;font-weight:bold;'
@@ -216,8 +222,8 @@ def build_diff_card(path: str, original: str, current: str, *,
     )
 
     html = (
-        f'<div style="margin:8px auto;max-width:94%;border:1px solid {border};'
-        f'border-radius:8px;background:{bg};">'
+        f'<div style="margin:8px {_DIFF_SIDE_PAD}px;border:1px solid {border};'
+        f'border-radius:{_DIFF_RADIUS_CSS};background:{bg};overflow:hidden;">'
         f'{titlebar}'
         f'<div style="padding:3px 0;">{"".join(body_parts)}{more_link}</div>'
         f'</div>'
@@ -249,19 +255,44 @@ class DiffCardWidget(QFrame):
     def __init__(self, path: str, rows: list[dict], adds: int, dels: int, parent=None):
         super().__init__(parent)
         self._path = path
-        p = PALETTE
+        # Kept so the card can recolor itself in place (see recolor_in_place)
+        # without the chat needing to tear it down and reconstruct from meta.
+        self._rows = rows
+        self._adds = adds
+        self._dels = dels
         self.setObjectName("DiffCard")
-        self.setStyleSheet(
-            f"QFrame#DiffCard {{ background:{p.get('panel_alt', '#101010')};"
-            f" border:1px solid {p.get('border', '#333')}; border-radius:8px; }}")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(1, 1, 1, 1)
         lay.setSpacing(0)
+        self._lay = lay
+        self._apply_frame_style()
 
         lay.addWidget(self._build_header(path, adds, dels))
         lay.addWidget(self._build_body(rows))
+
+    def _apply_frame_style(self) -> None:
+        p = PALETTE
+        self.setStyleSheet(
+            f"QFrame#DiffCard {{ background:{p.get('panel_alt', '#101010')};"
+            f" border:1px solid {p.get('border', '#333')};"
+            f" border-top-left-radius:{_DIFF_RADIUS_TOP}; border-top-right-radius:{_DIFF_RADIUS_TOP};"
+            f" border-bottom-left-radius:0; border-bottom-right-radius:0;"
+            f" margin-left:{_DIFF_SIDE_PAD}px; margin-right:{_DIFF_SIDE_PAD}px; }}")
+
+    def recolor_in_place(self) -> None:
+        """Re-render the card with the CURRENT palette without a teardown from
+        the chat side. Diff cards are static (a completed edit), so rebuilding
+        their two child widgets in place is safe during a streaming turn."""
+        while self._lay.count():
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._apply_frame_style()
+        self._lay.addWidget(self._build_header(self._path, self._adds, self._dels))
+        self._lay.addWidget(self._build_body(self._rows))
 
     # ── header ──
     def _build_header(self, path: str, adds: int, dels: int) -> QWidget:
@@ -271,7 +302,8 @@ class DiffCardWidget(QFrame):
         header.setStyleSheet(
             f"QWidget#DiffHdr {{ background:{p.get('panel', '#0c0c0c')};"
             f" border-bottom:1px solid {p.get('border', '#333')};"
-            f" border-top-left-radius:8px; border-top-right-radius:8px; }}")
+            f" border-top-left-radius:{_DIFF_RADIUS_TOP};"
+            f" border-top-right-radius:{_DIFF_RADIUS_TOP}; }}")
         h = QHBoxLayout(header)
         h.setContentsMargins(8, 3, 8, 3)
         h.setSpacing(8)
@@ -350,12 +382,20 @@ class DiffCardWidget(QFrame):
         fg = p.get("text", "#ddd")
         thumb = p.get("accent_muted", p.get("border", "#444"))
         track = p.get("panel", "#0c0c0c")
+        border = p.get("border", "#333")
         return (
             f"QPlainTextEdit#DiffBody {{ background:{bg}; color:{fg}; border:none;"
-            f" border-bottom-left-radius:8px; border-bottom-right-radius:8px; }}"
-            f"QScrollBar:vertical, QScrollBar:horizontal {{ background:{track}; "
-            f"width:9px; height:9px; margin:0; }}"
-            f"QScrollBar::handle {{ background:{thumb}; border-radius:0; min-height:24px; min-width:24px; }}"
+            f" border-bottom-left-radius:0; border-bottom-right-radius:0; }}"
+            f"QScrollBar:vertical {{ background:{track}; width:9px; margin:0;"
+            f" border:1px solid {border}; }}"
+            f"QScrollBar:horizontal {{ background:{track}; height:9px; margin:0;"
+            f" border:1px solid {border}; }}"
+            f"QAbstractScrollArea::corner {{ background:{track};"
+            f" border:1px solid {border}; }}"
+            f"QScrollBar::handle:vertical {{ background:{thumb}; border-radius:0;"
+            f" min-height:24px; }}"
+            f"QScrollBar::handle:horizontal {{ background:{thumb}; border-radius:0;"
+            f" min-width:24px; }}"
             f"QScrollBar::add-line, QScrollBar::sub-line {{ width:0; height:0; }}"
             f"QScrollBar::add-page, QScrollBar::sub-page {{ background:transparent; }}"
         )

@@ -6,6 +6,7 @@ tool call bubbles, thinking animation, and browser TV overlay.
 import bisect
 import html as html_module
 import json
+import math
 import markdown2
 import os
 import re
@@ -26,14 +27,14 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QTextCursor, QColor, QPixmap, QImage, QPainter, QPainterPath,
-    QSyntaxHighlighter, QTextCharFormat,
+    QSyntaxHighlighter, QTextCharFormat, QTextDocument,
 )
 from PyQt6.QtWidgets import QProxyStyle, QStyle
 from ui.theme import PALETTE
 
 
 class _NoFocusRectStyle(QProxyStyle):
-    """Proxy style that suppresses the dotted focus rectangle Qt's rich-text
+    """Proxy style that suppresses the dotted focus rectangle Qt's rich-text6
     engine paints around a focused/clicked <a> anchor in a QLabel. Neither
     setFocusPolicy(NoFocus) nor a QSS `outline:none` reaches that primitive —
     only intercepting PE_FrameFocusRect at the style layer kills it. Applied to
@@ -56,6 +57,46 @@ def _no_focus_rect_style() -> "_NoFocusRectStyle":
     if _NO_FOCUS_RECT_STYLE is None:
         _NO_FOCUS_RECT_STYLE = _NoFocusRectStyle()
     return _NO_FOCUS_RECT_STYLE
+
+
+# Idle threshold for suppressing OS attention flashes. Past this with no
+# keyboard/mouse input, the user is considered away from the machine.
+_AWAY_IDLE_MS = 120_000
+
+
+def _user_is_away() -> bool:
+    """True when nobody is at the machine — screensaver running or no
+    keyboard/mouse input for a while. Used to suppress OS attention requests
+    (QApplication.alert / FlashWindowEx): on Windows a taskbar flash counts
+    as activity and yanks down a running screensaver, so flashing on every
+    agent file edit overnight keeps killing it. Flashing for an absent user
+    serves nobody — skip it."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    try:
+        user32 = ctypes.windll.user32
+        # Screensaver actively running?
+        SPI_GETSCREENSAVERRUNNING = 0x0072
+        running = ctypes.c_int(0)
+        if user32.SystemParametersInfoW(SPI_GETSCREENSAVERRUNNING, 0,
+                                        ctypes.byref(running), 0) and running.value:
+            return True
+
+        # No input for a while → away (also covers display-off, which the
+        # screensaver check can't see).
+        class _LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+        lii = _LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if user32.GetLastInputInfo(ctypes.byref(lii)):
+            idle_ms = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+            if idle_ms > _AWAY_IDLE_MS:
+                return True
+    except Exception:
+        pass
+    return False
 from ui.conversation_bar import ConversationBar
 from ui.file_viewer import FileViewer
 from core.agent import Agent, load_config
@@ -248,8 +289,41 @@ _LABEL_RE = re.compile(
     r'(\s*)'
     r'((?:[A-Z][\w&/\- ]{0,28}?)?[A-Za-z0-9])(:)(\s|&nbsp;|<)',
 )
-# Spans of HTML we must NOT touch (code/pre keep their own coloring).
-_PROTECT_RE = re.compile(r'(<(code|pre)\b[^>]*>.*?</\2>)', re.DOTALL | re.IGNORECASE)
+# Spans of HTML we must NOT touch (code/pre keep their own coloring; style holds
+# CSS that must never be brightened/escaped).
+_PROTECT_RE = re.compile(r'(<(code|pre|style)\b[^>]*>.*?</\2>)', re.DOTALL | re.IGNORECASE)
+# Tags to split on when brightening quotes — everything EXCEPT the inline
+# formatting tags a quoted phrase may legitimately span (em/strong/i/b). Splitting
+# here guarantees _QUOTE_RE only ever sees visible text, never the quoted VALUES
+# inside tag attributes (style="...", align="...", title="..."). Wrapping those in
+# a <span> shreds the tag and spills raw markup into the chat — the regression
+# this guards against.
+_SPLIT_TAG_RE = re.compile(r'(</?(?!(?:em|strong|i|b)\b)[a-zA-Z][^>]*>)', re.IGNORECASE)
+
+# ── Extra brightness-hierarchy passes (engagement without a rainbow) ──────────
+# Short parenthetical asides → DIMMED so they recede from the main line.
+_PAREN_RE = re.compile(r'\([^()\n]{1,120}\)')
+# Standalone numbers / counts / %s / money → BRIGHT, so data/figures pop.
+_NUM_RE = re.compile(r'(?<![\w$#.])(\$?\d[\d,]*(?:\.\d+)*%?)(?![\w])')
+# ALL-CAPS words (acronyms + shouted emphasis: NONE, OFF, DB, API) → BRIGHT.
+_CAPS_RE = re.compile(r'\b[A-Z]{2,}\b')
+
+
+def _sub_text_runs(html: str, pattern: "re.Pattern", repl) -> str:
+    """Apply pattern→repl to VISIBLE TEXT ONLY — never inside a tag's attributes.
+    Splits on tags (keeping inline em/strong/i/b within the text), so spans added
+    by an earlier decoration pass are protected from later ones and no tag is ever
+    corrupted (the raw-markup-spill bug guard)."""
+    chunks = _SPLIT_TAG_RE.split(html)
+    for k in range(0, len(chunks), 2):  # even = text, odd = a split-out tag
+        if chunks[k]:
+            chunks[k] = pattern.sub(repl, chunks[k])
+    return "".join(chunks)
+
+# Animated-ellipsis dot spans: data-gd="<group>-<dot>" style="<style>". The
+# animator rewrites the style value in ONE pass with this instead of three
+# str.find() scans per group per tick.
+_ELLIPSIS_DOT_RE = re.compile(r'(data-gd="(\d+)-([123])" style=")([^"]*)(")')
 
 
 # Tools that must ALWAYS appear in the chat timeline even when the user has
@@ -278,14 +352,23 @@ def _md_emphasis_style() -> str:
 
 
 def _emphasize_html(html: str) -> str:
-    """Brighten quoted text (→ glow_hot) and leading 'Label:' prefixes
-    (→ accent_bright). Headings / bold / list items are already brightened via
-    the message <style> block, so they're left alone. Code/pre is protected."""
+    """Layer a readable brightness HIERARCHY onto rendered markdown so prose isn't
+    one flat block of color:
+
+        DIM  (muted)        → parenthetical asides — they recede
+        BODY (text)         → normal prose
+        BRIGHT (accent_brt) → numbers/figures, ALL-CAPS, 'Label:' prefixes — pop
+        HOT  (glow_hot)     → quoted text (bold/headings get HOT via the <style>)
+
+    Every pass touches VISIBLE TEXT ONLY (tag-aware) and code/pre/style is left
+    untouched, so tags are never corrupted."""
     if not html:
         return html
     p = PALETTE
     hot = p.get("glow_hot", p.get("accent_bright", "#aeffff"))
-    label_c = p.get("accent_bright", hot)
+    bright = p.get("accent_bright", hot)
+    dim = p.get("muted_text", p.get("accent_muted", "#888888"))
+    label_c = bright
 
     # Split out protected (code) regions so we never touch their contents.
     parts = _PROTECT_RE.split(html)
@@ -297,14 +380,31 @@ def _emphasize_html(html: str) -> str:
         # A protected code block is the next captured group (parts[i+1]); the
         # split interleaves text, full-match, inner-group. Detect & pass through.
         if i + 1 < len(parts) and parts[i + 1] is not None and parts[i + 1].startswith("<") \
-                and (parts[i + 1].lower().startswith("<code") or parts[i + 1].lower().startswith("<pre")):
-            out.append(seg)                 # plain text before the code block
-            out.append(parts[i + 1])        # the code block verbatim
-            i += 3                          # skip text + full-match + lang group
+                and (parts[i + 1].lower().startswith("<code")
+                     or parts[i + 1].lower().startswith("<pre")
+                     or parts[i + 1].lower().startswith("<style")):
+            out.append(seg)                 # plain text before the protected block
+            out.append(parts[i + 1])        # the protected block verbatim
+            i += 3                          # skip text + full-match + tag-name group
             continue
-        # Plain text segment → apply emphasis.
-        seg = _QUOTE_RE.sub(
-            lambda m: f'<span style="color:{hot};">{m.group(0)}</span>', seg)
+        # Decorate visible text only. Each pass is tag-aware (re-splits on tags),
+        # so a span added by an earlier pass is never re-matched/corrupted. Order
+        # is outer→inner so nesting reads correctly (e.g. a number inside a
+        # dimmed aside still pops bright).
+        seg = _sub_text_runs(
+            seg, _PAREN_RE,
+            lambda m: f'<span style="color:{dim};">{m.group(0)}</span>')
+        seg = _sub_text_runs(
+            seg, _NUM_RE,
+            lambda m: f'<span style="color:{bright};">{m.group(0)}</span>')
+        seg = _sub_text_runs(
+            seg, _CAPS_RE,
+            lambda m: f'<span style="color:{bright};">{m.group(0)}</span>')
+        seg = _sub_text_runs(
+            seg, _QUOTE_RE,
+            lambda m: f'<span style="color:{hot};">{m.group(0)}</span>')
+        # _LABEL_RE keeps its leading tag (group 1) and only wraps the label
+        # text, so it never corrupts a tag — safe on the whole segment.
         seg = _LABEL_RE.sub(
             lambda m: (f'{m.group(1)}{m.group(2)}'
                        f'<span style="color:{label_c};">{m.group(3)}{m.group(4)}</span>'
@@ -543,6 +643,31 @@ class ImageOverlay(QWidget):
 # label shown in the bubble header.
 AGENT_LABEL = "Familiar"
 
+
+def _meta_display_sender(meta: dict) -> str | None:
+    """Bubble header label for a user/assistant meta row, or None for cards."""
+    role = meta.get("role", "")
+    if role == "user":
+        return "You"
+    if role == "assistant":
+        return AGENT_LABEL
+    return None
+
+
+def _show_sender_nametag(message_meta: list, idx: int) -> bool:
+    """True when this row should show the sender header (start of a speaker run)."""
+    if idx < 0 or idx >= len(message_meta):
+        return True
+    cur = _meta_display_sender(message_meta[idx])
+    if cur is None:
+        return True
+    for j in range(idx - 1, -1, -1):
+        prev = _meta_display_sender(message_meta[j])
+        if prev is not None:
+            return prev != cur
+    return True
+
+
 _SPARKLE_CACHE = {"key": None, "html": ""}
 
 # Cache of painted tool-pill PNGs, keyed by (label, fontsize, accent, color).
@@ -656,11 +781,14 @@ class ChatMessageWidget(QFrame):
                  show_timestamps: bool = True, show_usage: bool = False,
                  show_tool_chips: bool = True, chat_mode: str = "fancy",
                  tool_call_only: bool = False, continuation: bool = False,
-                 inline_timeline: bool = False, parent=None):
+                 inline_timeline: bool = False, pastes: list = None, parent=None):
         super().__init__(parent)
         self.setObjectName("ChatMsg")
         self.sender = sender
         self.content = content
+        # Large pasted blocks shown as collapsed PasteCardWidgets under the bubble
+        # (render-only; the full text lives in the message content for the LLM).
+        self.pastes = pastes or []
         self.tool_names = tool_names or []
         self.image_path = image_path
         self._cached_html = cached_html
@@ -680,6 +808,11 @@ class ChatMessageWidget(QFrame):
         # animator can safely drive plain-mode widgets too.
         self._visible_in_viewport = True
         self._current_html = ""
+        # Wrap width last applied by the parent chat view (0 = not yet applied)
+        # and the body label's stylesheet padding as (horizontal, vertical)
+        # totals — both feed _sync_body_min_height().
+        self._wrap_width = 0
+        self._body_pads = (0, 0)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -785,11 +918,31 @@ class ChatMessageWidget(QFrame):
         body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
         self._body = body
+        self._body_pads = (10, 11)  # stylesheet padding: 5+5 horiz, 5+6 vert
         layout.addWidget(body)
+
+        # Pasted-text cards (collapsed/expandable) under the typed text.
+        self._add_paste_cards(layout)
 
         # Register for ellipsis animation if needed
         if self._has_ellipsis and self._ellipsis_groups:
             self._register_ellipsis_widget()
+
+    def _add_paste_cards(self, layout):
+        if not self.pastes:
+            return
+        from ui.paste_card import PasteCardWidget
+        for p in self.pastes:
+            try:
+                card = PasteCardWidget(
+                    p.get("text", ""),
+                    lines=p.get("lines", 0),
+                    chars=p.get("chars", 0),
+                    fs=max(self._font_size - 1, 8),
+                )
+                layout.addWidget(card)
+            except Exception:
+                pass
 
     def _apply_ellipsis_markup(self, combined_html: str) -> str:
         """Turn literal ... in HTML into animated dot spans (build + live updates)."""
@@ -977,14 +1130,19 @@ class ChatMessageWidget(QFrame):
 
         if getattr(self, "_inline_timeline", False):
             html_body = self._cached_html or ""
+            header = ""
+            if not getattr(self, "_continuation", False):
+                header = (
+                    f'<p style="margin-bottom:2px;">'
+                    f'<span style="color:{header_color};font-weight:bold;font-size:{max(fs - 1, 7)}pt;">{self.sender}</span>{sparkle}'
+                    f'{self._format_timestamp()}</p>'
+                )
             return (
                 f'<style>p {{ margin-top: 0; margin-bottom: 0; }} strong, b {{ color: {p["glow_hot"]}; }} '
                 f'h1, h2, h3, h4, h5, h6 {{ color: {p["glow_hot"]}; margin-top: 6px; margin-bottom: 2px; }} '
                 f'li {{ color: {p["glow_hot"]}; }}</style>'
                 f'<div style="font-family:Consolas; word-wrap:break-word;">'
-                f'<p style="margin-bottom:2px;">'
-                f'<span style="color:{header_color};font-weight:bold;font-size:{max(fs - 1, 7)}pt;">{self.sender}</span>{sparkle}'
-                f'{self._format_timestamp()}</p>'
+                f'{header}'
                 f'<div style="color:{text_color}; font-size:{fs}pt;">'
                 f'{html_body}</div>'
                 f'{self._format_usage()}'
@@ -997,15 +1155,20 @@ class ChatMessageWidget(QFrame):
         html_body = html_body.replace("<hr>", _hr).replace("<hr />", _hr)
         html_body = _emphasize_html(html_body)
 
+        header = ""
+        if not getattr(self, "_continuation", False):
+            header = (
+                f'<p style="margin-bottom:2px;">'
+                f'<span style="color:{header_color};font-weight:bold;font-size:{max(fs - 1, 7)}pt;">{self.sender}</span>{sparkle}'
+                f'{self._format_timestamp()}</p>'
+            )
         return (
             f'<style>p {{ margin-top: 0; margin-bottom: 0; }} strong, b {{ color: {p["glow_hot"]}; }} '
             f'h1, h2, h3, h4, h5, h6 {{ color: {p["glow_hot"]}; margin-top: 6px; margin-bottom: 2px; }} '
             f'li {{ color: {p["glow_hot"]}; }}</style>'
             f'<div style="font-family:Consolas; word-wrap:break-word;">'
             f'{tool_chips_html}'
-            f'<p style="margin-bottom:2px;">'
-            f'<span style="color:{header_color};font-weight:bold;font-size:{max(fs - 1, 7)}pt;">{self.sender}</span>{sparkle}'
-            f'{self._format_timestamp()}</p>'
+            f'{header}'
             f'<span style="color:{text_color}; font-size:{fs}pt;">'
             f'{html_body}</span>'
             f'{self._format_usage()}'
@@ -1031,6 +1194,7 @@ class ChatMessageWidget(QFrame):
                 self._base_html = plain_html
                 self._current_html = plain_html
                 self._body.setText(plain_html)
+                self._sync_body_min_height()
             return
         combined_html = self._make_combined_html()
         combined_html = self._apply_ellipsis_markup(combined_html)
@@ -1038,13 +1202,14 @@ class ChatMessageWidget(QFrame):
         self._current_html = combined_html
         if hasattr(self, "_body"):
             self._body.setText(combined_html)
+            self._sync_body_min_height()
 
     def reconfigure(self, *, sender: str, content: str, tool_names: list[str] | None = None,
                     image_path: str | None = None, cached_html: str | None = None,
                     timestamp: float | None = None, usage: dict | None = None,
                     show_timestamps: bool = True, show_usage: bool = False,
                     show_tool_chips: bool = True, chat_mode: str = "fancy",
-                    inline_timeline: bool = False):
+                    continuation: bool = False, inline_timeline: bool = False):
         """Reuse a pooled bubble — avoids QWidget churn when virtual-scrolling."""
         if image_path and image_path != self.image_path:
             return False
@@ -1057,13 +1222,18 @@ class ChatMessageWidget(QFrame):
         self._show_usage = show_usage
         self._show_tool_chips = show_tool_chips
         self._chat_mode = chat_mode
+        self._continuation = continuation
         self._inline_timeline = inline_timeline
         if cached_html is not None:
             self._cached_html = cached_html
         self.update_content(
             content, cached_html, tool_names, usage, inline_timeline)
         self._apply_base_style()
-        self.show()
+        # NOTE: do NOT show() here. A pooled bubble is parentless at this point
+        # (released widgets are setParent(None)+hide()), and show()-ing a
+        # parentless widget makes it a momentary top-level WINDOW — the "stray
+        # windows flashing on screen" bug. _insert_msg_widget show()s it AFTER it
+        # is reparented into the layout.
         return True
 
     @staticmethod
@@ -1087,22 +1257,13 @@ class ChatMessageWidget(QFrame):
                 if not groups:
                     continue
                 html = w._current_html
-                changed = False
-                for gid in groups:
-                    for d in (1, 2, 3):
-                        key = f'data-gd="{gid}-{d}" style="'
-                        pos = html.find(key)
-                        if pos < 0:
-                            continue
-                        s = pos + len(key)
-                        e = html.find('"', s)
-                        if e >= 0 and html[s:e] != "":
-                            html = html[:s] + html[e:]
-                            changed = True
+                # Single O(n) pass: blank every dot's style (all visible).
+                new_html, n = _ELLIPSIS_DOT_RE.subn(
+                    lambda m: m.group(1) + m.group(5), html)
                 w._ellipsis_states = [3 for _ in groups]
-                if changed:
-                    w._current_html = html
-                    w._body.setText(html)
+                if n and new_html != html:
+                    w._current_html = new_html
+                    w._body.setText(new_html)
             except (RuntimeError, AttributeError):
                 pass
 
@@ -1123,27 +1284,25 @@ class ChatMessageWidget(QFrame):
                     continue
 
                 html = w._current_html
-                changed = False
-                for i, gid in enumerate(w._ellipsis_groups):
-                    state = w._ellipsis_states[i]
-                    # state 0=all hidden, 1=dot1, 2=dot1+2, 3=all visible
-                    for d in (1, 2, 3):
-                        old_key = f'data-gd="{gid}-{d}" style="'
-                        new_style = vis if state >= d else hid
-                        # Find and replace the style value for this specific dot
-                        pos = html.find(old_key)
-                        if pos >= 0:
-                            style_start = pos + len(old_key)
-                            style_end = html.find('"', style_start)
-                            if style_end >= 0:
-                                old_style = html[style_start:style_end]
-                                if old_style != new_style:
-                                    html = html[:style_start] + new_style + html[style_end:]
-                                    changed = True
-                    # Advance this group's state
-                    w._ellipsis_states[i] = (state + 1) % 4
+                # gid -> current state (0=all hidden, 1=dot1, 2=dot1+2, 3=all)
+                states = dict(zip(w._ellipsis_groups, w._ellipsis_states))
+                changed = [False]
 
-                if changed:
+                def _dot(m, _states=states, _changed=changed):
+                    state = _states.get(int(m.group(2)))
+                    if state is None:
+                        return m.group(0)
+                    new_style = vis if state >= int(m.group(3)) else hid
+                    if new_style != m.group(4):
+                        _changed[0] = True
+                    return m.group(1) + new_style + m.group(5)
+
+                # One O(n) regex pass over the HTML instead of 3 scans per group.
+                html = _ELLIPSIS_DOT_RE.sub(_dot, html)
+                w._ellipsis_states = [
+                    (s + 1) % 4 for s in w._ellipsis_states]
+
+                if changed[0]:
                     w._current_html = html
                     w._body.setText(html)
                 alive.append(w)
@@ -1194,7 +1353,10 @@ class ChatMessageWidget(QFrame):
         self._current_html = plain_html
         body.setText(plain_html)
         self._body = body
+        self._body_pads = (0, 0)  # plain-mode stylesheet has padding: 0
         layout.addWidget(body)
+        # Pasted-text cards (collapsed/expandable) under the typed text.
+        self._add_paste_cards(layout)
         # Stay frameless so rows read as one continuous transcript.
         self.setFrameShape(QFrame.Shape.NoFrame)
 
@@ -1212,16 +1374,18 @@ class ChatMessageWidget(QFrame):
         else:
             header_color, text_color = p["glow_hot"], p["text"]
         sp = _sparkle_img_html() if self.sender == AGENT_LABEL else ""
-        ts_html = ""
-        if self._show_timestamps and self._timestamp:
-            import time as _t
-            ts = _t.strftime("%H:%M:%S", _t.localtime(self._timestamp))
-            ts_html = (f' <span style="color:{p["accent_muted"]};font-size:{small}pt;">'
-                       f'{ts}</span>')
-        parts = [
-            f'<span style="color:{header_color};font-weight:bold;font-size:{fs}pt;">'
-            f'{_html.escape(self.sender)}</span>{sp}{ts_html}<br>',
-        ]
+        parts: list[str] = []
+        if not getattr(self, "_continuation", False):
+            ts_html = ""
+            if self._show_timestamps and self._timestamp:
+                import time as _t
+                ts = _t.strftime("%H:%M:%S", _t.localtime(self._timestamp))
+                ts_html = (f' <span style="color:{p["accent_muted"]};font-size:{small}pt;">'
+                           f'{ts}</span>')
+            parts.append(
+                f'<span style="color:{header_color};font-weight:bold;font-size:{fs}pt;">'
+                f'{_html.escape(self.sender)}</span>{sp}{ts_html}<br>',
+            )
         if getattr(self, "_inline_timeline", False) and self._cached_html:
             parts.append(
                 f'<div style="color:{text_color};font-size:{fs}pt;">'
@@ -1255,7 +1419,37 @@ class ChatMessageWidget(QFrame):
     def apply_wrap_width(self, max_width: int):
         """Constrain label width so Qt doesn't recalc word-wrap on every resize."""
         if max_width > 0 and hasattr(self, '_body'):
+            self._wrap_width = max_width
             self._body.setMaximumWidth(max_width)
+            self._sync_body_min_height()
+
+    def _sync_body_min_height(self):
+        """Pin the body label's minimum height to an explicitly measured value.
+
+        QLabel's heightForWidth for word-wrapped rich text goes stale — its
+        internal size cache can survive width/content changes that land between
+        layout passes — so the scroll container ends up 1-2 lines shorter than
+        the real content: the "last lines clipped below the pane even at max
+        scroll" bug. Measuring the document ourselves and setting an explicit
+        minimum makes the layout minimum authoritative; the scroll area can then
+        never under-size the container, so the scrollbar range always covers the
+        full transcript regardless of what QLabel's cache claims."""
+        body = getattr(self, "_body", None)
+        if body is None or self._wrap_width <= 0:
+            return
+        pad_h, pad_v = self._body_pads
+        text_w = self._wrap_width - pad_h
+        if text_w <= 0:
+            return
+        try:
+            doc = QTextDocument()
+            doc.setDefaultFont(body.font())
+            doc.setDocumentMargin(0)
+            doc.setHtml(self._current_html or body.text())
+            doc.setTextWidth(text_w)
+            body.setMinimumHeight(math.ceil(doc.size().height()) + pad_v)
+        except Exception:
+            pass
 
     def _format_timestamp(self) -> str:
         if not self._show_timestamps or not self._timestamp:
@@ -1373,6 +1567,25 @@ class ChatMessageWidget(QFrame):
             return QPixmap.fromImage(out)
         except Exception:
             return pm
+
+    def recolor_in_place(self) -> None:
+        """Re-render this bubble's HTML with the CURRENT palette, without tearing
+        the widget down — used to recolor the transcript live during a streaming
+        turn (a full teardown/rebuild would collide with the stream-flush timer).
+        Re-reads PALETTE via _make_*_html, so a prior refresh_palette() applies."""
+        if self._chat_mode == "plain":
+            html = self._apply_ellipsis_markup(self._make_plain_html())
+        else:
+            html = self._apply_ellipsis_markup(self._make_combined_html())
+        self._base_html = html
+        self._current_html = html
+        if hasattr(self, "_body"):
+            self._body.setText(html)
+            self._sync_body_min_height()
+        if self._selected:
+            self._apply_selected_style()
+        else:
+            self._apply_base_style()
 
     def _apply_base_style(self):
         self.setStyleSheet(
@@ -1559,44 +1772,117 @@ class PlanWidget(QFrame):
         "blocked": "\u2716",      # ✖
     }
 
+    COLLAPSED_HEIGHT = 120
+    EXPANDED_HEIGHT = 440
+    _RADIUS = "8px"
+    _SIDE_PAD = 8
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("PlanCard")
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self._expanded = True       # plans default open — you want to read them
+        self._title = ""
+        self._steps: list[dict] = []
+        self._last_updated = -1
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._refresh)
-        self._last_updated = 0
         self._build_ui()
 
     def _build_ui(self):
         p = PALETTE
-        accent = QColor(p["accent"])
+        self.setStyleSheet(
+            f"QFrame#PlanCard {{ background:{p.get('panel_alt', '#101010')};"
+            f" border:1px solid {p.get('border', '#333')};"
+            f" border-radius:{self._RADIUS};"
+            f" margin-left:{self._SIDE_PAD}px; margin-right:{self._SIDE_PAD}px; }}")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(1, 1, 1, 1)
+        lay.setSpacing(0)
 
-        self.setStyleSheet(f"""
-            QFrame#PlanCard {{
-                background: {p['panel_alt']};
-                border: 1px solid {p['border']};
-                border-left: 3px solid {p['accent_muted']};
-                border-radius: 4px;
-                margin: 4px 20px;
-            }}
-        """)
+        self._header = QPushButton(self._header_text())
+        self._header.setObjectName("PlanHdr")
+        self._header.setFlat(True)
+        self._header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._header.setStyleSheet(
+            f"QPushButton#PlanHdr {{ color:{p.get('accent', '#33ff99')};"
+            f" background:{p.get('panel', '#0c0c0c')};"
+            f" border:none; border-bottom:1px solid {p.get('border', '#333')};"
+            f" border-top-left-radius:{self._RADIUS}; border-top-right-radius:{self._RADIUS};"
+            f" font:bold 9pt Consolas; text-align:left; padding:4px 8px; }}"
+            f"QPushButton#PlanHdr:hover {{ color:{p.get('glow_hot', p.get('accent', '#aef'))}; }}")
+        self._header.clicked.connect(self._toggle_expand)
+        lay.addWidget(self._header)
 
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(10, 6, 10, 6)
-        self._layout.setSpacing(2)
+        ed = QPlainTextEdit()
+        ed.setObjectName("PlanBody")
+        ed.setReadOnly(True)
+        ed.setFont(QFont("Consolas", max(ChatMessageWidget._font_size - 1, 8)))
+        ed.setFrameShape(QFrame.Shape.NoFrame)
+        ed.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        ed.document().setDocumentMargin(6)
+        ed.setStyleSheet(self._body_stylesheet(p))
+        self._body = ed
+        lay.addWidget(ed)
+        self._apply_height()
 
-        self._title_label = QLabel("")
-        self._title_label.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        self._title_label.setStyleSheet(f"color:{p['accent']};border:none;")
-        self._layout.addWidget(self._title_label)
+    def _header_text(self) -> str:
+        n = len(self._steps)
+        title = self._title or "Plan"
+        done = sum(1 for s in self._steps if s.get("status") == "done")
+        prog = f" · {done}/{n} done" if n else ""
+        tip = "click to collapse" if self._expanded else "click to expand"
+        return f"{title} · {n} steps{prog}  —  {tip}"
 
-        self._steps_container = QWidget()
-        self._steps_layout = QVBoxLayout(self._steps_container)
-        self._steps_layout.setContentsMargins(0, 2, 0, 0)
-        self._steps_layout.setSpacing(1)
-        self._layout.addWidget(self._steps_container)
+    def _plan_text(self) -> str:
+        lines = []
+        for s in self._steps:
+            icon = self._STATUS_ICONS.get(s.get("status"), self._STATUS_ICONS["pending"])
+            lines.append(f"{icon}  {s.get('label', '')}")
+        return "\n".join(lines)
+
+    def _set_plan(self, title: str, steps: list):
+        self._title = title or self._title
+        self._steps = steps or []
+        self._header.setText(self._header_text())
+        sb = self._body.verticalScrollBar()
+        pos = sb.value()
+        self._body.setPlainText(self._plan_text())
+        sb.setValue(pos)
+        self._apply_height()
+
+    def _toggle_expand(self):
+        self._expanded = not self._expanded
+        self._header.setText(self._header_text())
+        self._apply_height()
+
+    def _apply_height(self):
+        from PyQt6.QtGui import QFontMetricsF
+        cap = self.EXPANDED_HEIGHT if self._expanded else self.COLLAPSED_HEIGHT
+        line_h = QFontMetricsF(self._body.font()).height()
+        wanted = int(line_h * max(1, len(self._steps)) + 16)
+        h = min(max(wanted, 36), cap)
+        self._body.setMinimumHeight(h)
+        self._body.setMaximumHeight(h)
+
+    @staticmethod
+    def _body_stylesheet(p: dict) -> str:
+        bg = p.get("panel_alt", "#101010")
+        fg = p.get("text", "#ddd")
+        thumb = p.get("accent_muted", p.get("border", "#444"))
+        track = p.get("panel", "#0c0c0c")
+        border = p.get("border", "#333")
+        return (
+            f"QPlainTextEdit#PlanBody {{ background:{bg}; color:{fg}; border:none;"
+            f" border-bottom-left-radius:{PlanWidget._RADIUS};"
+            f" border-bottom-right-radius:{PlanWidget._RADIUS}; }}"
+            f"QScrollBar:vertical {{ background:{track}; width:9px; margin:0;"
+            f" border:1px solid {border}; }}"
+            f"QScrollBar::handle:vertical {{ background:{thumb}; border-radius:0;"
+            f" min-height:24px; }}"
+            f"QScrollBar::add-line, QScrollBar::sub-line {{ width:0; height:0; }}"
+            f"QScrollBar::add-page, QScrollBar::sub-page {{ background:transparent; }}"
+        )
 
     def start_polling(self):
         self._poll_timer.start(400)
@@ -1607,76 +1893,21 @@ class PlanWidget(QFrame):
     def _refresh(self):
         from tools.plan import get_current_plan
         plan = get_current_plan()
-
         if not plan:
-            if self._title_label.text():
-                # Plan was finished — keep showing final state but stop polling
-                self.stop_polling()
+            if self._steps:
+                self.stop_polling()  # plan finished — keep the final text shown
             return
-
-        # Only rebuild if updated
         if plan.get("updated_at", 0) == self._last_updated:
             return
-        self._last_updated = plan["updated_at"]
-
-        p = PALETTE
-        accent = QColor(p["accent"])
-
-        self._title_label.setText(plan["title"])
-
-        # Clear old step labels
-        while self._steps_layout.count():
-            item = self._steps_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        for i, step in enumerate(plan["steps"]):
-            status = step["status"]
-            icon = self._STATUS_ICONS.get(status, "\u2022")
-
-            if status == "done":
-                color = p["accent"]
-            elif status == "in_progress":
-                color = p["accent_bright"]
-            elif status == "blocked":
-                color = p["danger"]
-            elif status == "skipped":
-                color = p["accent_muted"]
-            else:
-                color = p["muted_text"]
-
-            lbl = QLabel(f"  {icon}  {step['label']}")
-            lbl.setFont(QFont("Consolas", max(ChatMessageWidget._font_size - 2, 7)))
-            lbl.setStyleSheet(f"color:{color};border:none;")
-            self._steps_layout.addWidget(lbl)
+        self._last_updated = plan.get("updated_at", 0)
+        self._set_plan(plan.get("title", ""), plan.get("steps", []))
 
     def set_final_state(self, plan_data: dict):
-        """Set a static final state (for persistence after plan finishes)."""
+        """Static final state (persisted after the plan finishes)."""
         self.stop_polling()
         if not plan_data:
             return
-        p = PALETTE
-        accent = QColor(p["accent"])
-        self._title_label.setText(plan_data.get("title", ""))
-        while self._steps_layout.count():
-            item = self._steps_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        for step in plan_data.get("steps", []):
-            status = step["status"]
-            icon = self._STATUS_ICONS.get(status, "\u2022")
-            if status == "done":
-                color = p["accent"]
-            elif status == "in_progress":
-                color = p["accent_bright"]
-            elif status == "blocked":
-                color = p["danger"]
-            else:
-                color = p["muted_text"]
-            lbl = QLabel(f"  {icon}  {step['label']}")
-            lbl.setFont(QFont("Consolas", max(ChatMessageWidget._font_size - 2, 7)))
-            lbl.setStyleSheet(f"color:{color};border:none;")
-            self._steps_layout.addWidget(lbl)
+        self._set_plan(plan_data.get("title", ""), plan_data.get("steps", []))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2362,6 +2593,151 @@ class _TaskThread(QThread):
             mark_task_result(self._task["id"], False, str(e))
 
 
+class _NetworkReplyThread(QThread):
+    """Auto-respond to an inbound peer message: run the agent on it in the
+    peer's conversation, save the reply, and send it back over the network.
+    The triggering peer message is already saved as the conversation's last
+    user message, so it becomes the chat prompt rather than duplicated context."""
+    completed = pyqtSignal(str, str, str)  # conv_id, node, reply
+
+    def __init__(self, agent, conv_id: str, node: str, reply_url: str):
+        super().__init__()
+        self._agent = agent
+        self._conv_id = conv_id
+        self._node = node
+        self._reply_url = reply_url
+
+    def run(self):
+        import time as _time
+        from core.conversations import load_conversation, save_conversation
+        try:
+            data = load_conversation(self._conv_id) or {}
+            messages = data.get("messages", [])
+            if not messages or messages[-1].get("role") != "user":
+                return
+            prompt = messages[-1].get("content", "")
+            for msg in messages[:-1]:
+                if msg.get("role") in ("user", "assistant") and msg.get("content"):
+                    self._agent.context.append(
+                        {"role": msg["role"], "content": msg["content"]})
+            if data.get("system_prompt"):
+                self._agent.set_system_prompt_override(data["system_prompt"])
+            self._agent.set_conv_id(self._conv_id)
+
+            reply = self._agent.chat(prompt)
+
+            tool_names = [t["tool"] for t in self._agent.tool_call_log
+                          if t.get("success") is not False] if self._agent.tool_call_log else []
+            data = load_conversation(self._conv_id) or {}
+            messages = data.get("messages", [])
+            messages.append({"role": "assistant", "content": reply,
+                             "tool_names": tool_names, "_timestamp": _time.time()})
+            save_conversation(self._conv_id, data.get("name", f"Network: {self._node}"),
+                              messages)
+
+            # Answer the peer: configured address first, then the reply_url the
+            # (authenticated) sender embedded in its envelope.
+            try:
+                from core.network import resolve_peer, send_to_peer
+                p = resolve_peer(self._node)
+                url = (p or {}).get("url") or self._reply_url
+                if url and reply.strip():
+                    send_to_peer(url, {"type": "chat", "message": reply})
+            except Exception:
+                pass
+            self.completed.emit(self._conv_id, self._node, reply)
+        except Exception as e:
+            print(f"[network] auto-respond failed: {e}", flush=True)
+
+
+class _RemoteHostTurnThread(QThread):
+    """Runs a turn for a conversation a PEER is mirroring. The peer sent a user
+    message; THIS machine (the host) runs the inference and tools — committing
+    locally — and streams live events (user echo, round starts, throttled text
+    snapshots, tool chips, final reply) back to every subscriber via the network
+    event pump. Same isolated-Agent pattern as task/network reply threads."""
+    refreshed = pyqtSignal(str)    # conv_id — host UI refreshes after the reply
+    user_saved = pyqtSignal(str)   # conv_id — incoming message saved; refresh now
+
+    def __init__(self, agent, conv_id: str, text: str):
+        super().__init__()
+        self._agent = agent
+        self._conv_id = conv_id
+        self._text = text
+
+    def run(self):
+        import time as _time
+        from core.network import network_manager
+        from core.conversations import load_conversation, save_conversation
+        cid = self._conv_id
+
+        def emit(kind, **kw):
+            network_manager.publish_conv_event(cid, {"kind": kind, **kw})
+
+        try:
+            data = load_conversation(cid) or {}
+            name = data.get("name", "Conversation")
+            messages = data.get("messages", [])
+            umsg = {"role": "user", "content": self._text, "_timestamp": _time.time()}
+            messages.append(umsg)
+            save_conversation(cid, name, messages)
+            emit("user", message=umsg)
+            self.user_saved.emit(cid)   # host shows the incoming message immediately
+
+            # Hydrate context from prior turns (everything before the new user msg).
+            for m in messages[:-1]:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    self._agent.context.append({"role": m["role"], "content": m["content"]})
+            if data.get("system_prompt"):
+                self._agent.set_system_prompt_override(data["system_prompt"])
+            self._agent._system_prompt_replace = bool(data.get("prompt_replace", False))
+            self._agent._context_note = data.get("context_note", "") or ""
+            self._agent.set_conv_id(cid)
+            self._agent.set_conversation_cwd(data.get("conversation_cwd", ""), persist=False)
+
+            # Live streaming hooks → throttled snapshots over the network.
+            acc = {"text": ""}
+            last = {"ts": 0.0}
+
+            def on_round():
+                acc["text"] = ""
+                emit("round_start")
+
+            def on_delta(d):
+                acc["text"] += d
+                now = _time.monotonic()
+                if now - last["ts"] >= 0.2:
+                    last["ts"] = now
+                    emit("text", text=acc["text"])
+
+            self._agent._on_round_start = on_round
+            self._agent._stream_callback = on_delta
+            self._agent._tool_callback = lambda n, a: emit("tool", name=n)
+
+            reply = self._agent.chat(self._text)
+
+            tool_names = [t["tool"] for t in self._agent.tool_call_log
+                          if t.get("success") is not False] if self._agent.tool_call_log else []
+            data = load_conversation(cid) or {}
+            messages = data.get("messages", [])
+            amsg = {"role": "assistant", "content": reply, "tool_names": tool_names,
+                    "_timestamp": _time.time()}
+            messages.append(amsg)
+            save_conversation(cid, data.get("name", name), messages)
+            emit("final", message=amsg)
+            self.refreshed.emit(cid)
+        except Exception as e:
+            print(f"[network] remote-host turn failed: {e}", flush=True)
+            try:
+                network_manager.publish_conv_event(
+                    cid, {"kind": "final",
+                          "message": {"role": "assistant",
+                                      "content": f"[remote turn error: {e}]"}})
+            except Exception:
+                pass
+            self.refreshed.emit(cid)   # host still refreshes to show what was saved
+
+
 class ChatInput(QTextEdit):
     def __init__(self, chat_window, parent=None):
         super().__init__(parent)
@@ -2413,16 +2789,41 @@ class ChatInput(QTextEdit):
         image.save(tmp, "PNG")
         self.chat_window._show_pending_image(tmp, "Clipboard image")
 
+    def insertFromMimeData(self, source):
+        """Intercept large text pastes: instead of dumping a wall of text into
+        the composer (heavy to render, hard to scroll past), capture it as a
+        collapsed paste card. The full text still goes to the model on send."""
+        try:
+            if source is not None and source.hasText():
+                txt = source.text()
+                if txt and self.chat_window._should_capture_paste(txt):
+                    self.chat_window._capture_pasted_text(txt)
+                    return
+        except Exception:
+            pass
+        super().insertFromMimeData(source)
+
+    def set_focus_highlight(self, on: bool):
+        """Light the composer border (accent) when the chat input is the user's
+        single active target, dim it otherwise — mirrors the terminal grid's
+        selected-cell highlight so only one of {chat, terminal} reads as focused."""
+        on = bool(on)
+        if getattr(self, "_focus_highlight", False) == on:
+            return
+        self._focus_highlight = on
+        self._apply_styles()
+
     def _apply_styles(self):
         p = PALETTE
         fs = self.chat_window.agent.config.get("chat_font_size", 10)
         self.setFont(QFont("Consolas", fs))
+        border_c = p['accent_bright'] if getattr(self, "_focus_highlight", False) else p['accent_muted']
         # stylesheet 'color' controls the cursor; QTextCharFormat controls typed text
         self.setStyleSheet(f"""
             QTextEdit {{
                 background: {p['panel']};
                 color: {p['text']};
-                border: 1px solid {p['accent_muted']};
+                border: 1px solid {border_c};
                 padding: 6px;
                 font-family: Consolas, monospace;
                 font-size: {fs}pt;
@@ -2458,6 +2859,17 @@ class ChatWindow(QWidget):
     # Fires once when the initial conversation finishes hydrating at startup —
     # the cue for main() to fade out the splash screen.
     initial_load_finished = pyqtSignal()
+    # Inbound peer event (already HMAC-verified) — raised from the network
+    # server's worker threads; Qt queues it onto the GUI thread.
+    network_event = pyqtSignal(object)
+    # A peer wants THIS host to run a turn in one of our conversations
+    # (conv_id, text, reply_url). Marshalled onto the GUI thread.
+    remote_input_received = pyqtSignal(str, str, str)
+    # A host we're mirroring pushed a live conversation event (dict).
+    conv_event_received = pyqtSignal(object)
+    # The network terminal bridge asks (from a server thread) for an attachment
+    # to a conversation's live shell; built on the GUI thread.
+    terminal_attach_requested = pyqtSignal(object)
 
     _PARALLEL_TOOL_UI_MS = 140
 
@@ -2622,13 +3034,78 @@ class ChatWindow(QWidget):
         self._task_timer.start(60000)
         # Startup tasks: fire once, shortly after the UI settles.
         QTimer.singleShot(2500, self._run_startup_tasks)
-        # Auto-start networking (inbound server + tunnel) if enabled in config.
+        # Networking: route inbound /sync events onto the GUI thread, then
+        # auto-start the inbound server + tunnel if enabled in config. on_sync
+        # is installed unconditionally so a later Settings → Start works too.
+        self._remote_mirror = None      # active remote-conversation mirror (viewer side)
+        self._remote_convs_by_peer = {}  # peer_name -> [conv dicts] for the dropdown
         try:
+            from core.network import network_manager
+            self.network_event.connect(self._on_network_event)
+            self.remote_input_received.connect(self._on_remote_input)
+            self.conv_event_received.connect(self._on_conv_event)
+            network_manager.on_sync = self.network_event.emit
+            network_manager.on_remote_input = (
+                lambda cid, text, reply_url: self.remote_input_received.emit(
+                    cid or "", text or "", reply_url or ""))
+            network_manager.on_conv_event = self.conv_event_received.emit
+            self.terminal_attach_requested.connect(self._on_terminal_attach_request)
+            network_manager.terminal_attach_request = self.terminal_attach_requested.emit
+            # Poll peers for their conversation lists. The timer ALWAYS runs and
+            # self-gates on network_manager.running, so enabling networking later
+            # via Settings (e.g. on a fresh install) starts the dropdown updating
+            # without an app restart.
+            self._remote_conv_timer = QTimer(self)
+            self._remote_conv_timer.timeout.connect(self._refresh_remote_convs)
+            self._remote_conv_timer.start(15000)
             if (self.agent.config.get("network") or {}).get("enabled"):
-                from core.network import network_manager
                 network_manager.start({"network": self.agent.config.get("network", {})})
+                QTimer.singleShot(4000, self._refresh_remote_convs)
         except Exception:
             pass
+
+    # ── Unified one-target focus (chat composer ↔ terminal grid) ───────────
+
+    def set_input_focus_highlight(self, on: bool):
+        """Light/dim the composer border. Named to match the coordinator's
+        per-column API so this works in single-pane AND multi-column."""
+        try:
+            self.input.set_focus_highlight(on)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _widget_within(widget, ancestor) -> bool:
+        """True if `widget` is `ancestor` or nested inside it (walks parents)."""
+        if ancestor is None or widget is None:
+            return False
+        w = widget
+        while w is not None:
+            if w is ancestor:
+                return True
+            try:
+                w = w.parentWidget()
+            except Exception:
+                return False
+        return False
+
+    def _on_app_focus_changed(self, _old, now):
+        """Route focus to a single selected target: composer or terminal."""
+        if now is None:
+            return
+        try:
+            if self._widget_within(now, self.input):
+                self.set_input_focus_highlight(True)
+                try:
+                    self._right_workspace.terminal_panel.clear_active_highlight()
+                except Exception:
+                    pass
+            elif self._widget_within(
+                    now, getattr(self._right_workspace, "terminal_panel", None)):
+                # Terminal took focus — it lights its own cell; just dim the composer.
+                self.set_input_focus_highlight(False)
+        except RuntimeError:
+            pass  # widget torn down mid-callback
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -2645,6 +3122,11 @@ class ChatWindow(QWidget):
         self._conv_bar.new_requested.connect(self._new_conversation)
         self._conv_bar.rename_requested.connect(self._rename_conversation)
         self._conv_bar.delete_requested.connect(self._delete_conversation)
+        # This bar's −/+ buttons are workspace-oriented (they emit ws_* signals).
+        # Single-pane has no workspaces, so map them to conversation new/delete —
+        # otherwise the − button is dead and conversations can't be deleted here.
+        self._conv_bar.ws_new_requested.connect(self._new_conversation)
+        self._conv_bar.ws_delete_requested.connect(self._delete_current_conversation)
         conv_row.addWidget(self._conv_bar, stretch=1)
 
         conv_btn = QPushButton("Conversation")
@@ -2819,10 +3301,31 @@ class ChatWindow(QWidget):
         # Keep legacy reference for compatibility
         self._image_label = self._image_preview
 
+        # Pasted-text pills: compact removable chips for large pastes so the
+        # composer stays clean text instead of a wall of pasted content.
+        self._pending_pastes: list[dict] = []
+        self._paste_bar = QWidget()
+        self._paste_bar.setObjectName("pasteBar")
+        self._paste_bar_layout = QHBoxLayout(self._paste_bar)
+        self._paste_bar_layout.setContentsMargins(8, 0, 8, 2)
+        self._paste_bar_layout.setSpacing(4)
+        self._paste_bar_layout.addStretch()  # pills pack left, before the stretch
+        self._paste_bar.hide()
+        chat_left_layout.addWidget(self._paste_bar)
+
         # Input field
         self.input = ChatInput(self)
         self.input.textChanged.connect(self._on_composer_draft_text_changed)
         chat_left_layout.addWidget(self.input)
+
+        # Unified one-target focus: when the composer (or anything inside it) is
+        # focused, light its border and clear the terminal grid's highlight; when
+        # a terminal takes focus, drop the composer highlight (the terminal lights
+        # its own cell). Only one of {chat, terminal} reads as "the user's focus".
+        from PyQt6.QtWidgets import QApplication as _QApp
+        _app = _QApp.instance()
+        if _app is not None:
+            _app.focusChanged.connect(self._on_app_focus_changed)
 
         # Bottom button row: CLEAR ... ← ✕ | ▣ →
         bottom = QHBoxLayout()
@@ -2848,7 +3351,9 @@ class ChatWindow(QWidget):
 
         # Typing indicator lives in the bottom bar, centered in the gap
         self._typing_label = QLabel("")
-        self._typing_label.setFont(QFont("Consolas", 9))
+        _typing_font = QFont("Consolas", 9)
+        _typing_font.setItalic(True)  # "Familiar is …" reads as a soft status cue
+        self._typing_label.setFont(_typing_font)
         p_t = PALETTE
         self._typing_label.setStyleSheet(f"color: transparent; background: transparent; border: none;")
         self._typing_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3292,7 +3797,7 @@ class ChatWindow(QWidget):
 
     def _persist_current_composer_draft(self):
         cid = self._current_conv_id
-        if not cid:
+        if not cid or self._is_remote_id(cid):
             return
         text = self._composer_draft_cache.get(cid, self.input.toPlainText())
         self._composer_draft_cache[cid] = text
@@ -3351,9 +3856,11 @@ class ChatWindow(QWidget):
         self._update_conv_hint()
 
     def _update_conv_hint(self):
-        """Subdued context line beside the conversation dropdown. Shows the
-        active conversation's workspace today; will show
-        '[Remote] <machine> · <workspace>' once networking lands."""
+        """Subdued context line beside the conversation dropdown — the active
+        conversation's workspace, or the mirror banner when remoting into a
+        peer's conversation."""
+        if self._remote_mirror is not None:
+            return  # keep the "🌐 mirroring" banner set by _enter_remote_mirror
         try:
             ws = getattr(self.agent, "workspace_path", "") or ""
             self._conv_bar.set_hint(f"⌂ {ws}" if ws else "")
@@ -3413,6 +3920,8 @@ class ChatWindow(QWidget):
 
     def _persist_active_conv(self):
         """Write the active conversation ID to config so it survives restart."""
+        if self._is_remote_id(self._current_conv_id):
+            return  # don't restore into a remote mirror on next launch
         from core.agent import save_config
         cfg = load_config()
         if cfg.get("last_conversation_id") != self._current_conv_id:
@@ -3422,8 +3931,21 @@ class ChatWindow(QWidget):
     def _switch_conversation(self, conv_id: str):
         if conv_id == self._current_conv_id:
             return
+        # Remote conversation chosen → open a live mirror, not a local load.
+        if self._is_remote_id(conv_id):
+            self._composer_draft_timer.stop()
+            self._persist_current_composer_draft()
+            self._clear_pending_pastes()
+            self._snapshot_current()
+            self._enter_remote_mirror(conv_id)
+            return
+        # Leaving a remote mirror for a local conversation.
+        if self._remote_mirror is not None:
+            self._exit_remote_mirror()
+            self._conv_bar.set_hint("")
         self._composer_draft_timer.stop()
         self._persist_current_composer_draft()
+        self._clear_pending_pastes()  # pending pills belong to this compose session
         self._snapshot_current()
         self._auto_save()
         self._current_conv_id = conv_id
@@ -3440,11 +3962,43 @@ class ChatWindow(QWidget):
             self._pending_input_blinks.discard(conv_id)
             self._start_input_blink()
 
+    def _capture_stream_state(self) -> dict:
+        """Snapshot the live-streaming pipeline (it's per-window shared state) so
+        a backgrounded turn keeps its own buffer instead of bleeding into the
+        conversation shown next."""
+        return {
+            "buffer": self._stream_buffer,
+            "active": self._stream_active,
+            "dirty": self._stream_dirty,
+            "live_meta_idx": self._stream_live_meta_idx,
+            "committed": self._stream_committed_text,
+            "did_split": self._stream_did_split,
+            "tool_verb": getattr(self, "_active_tool_verb", ""),
+        }
+
+    def _reset_stream_state(self):
+        self._stream_buffer = []
+        self._stream_active = False
+        self._stream_dirty = False
+        self._stream_live_meta_idx = None
+        self._stream_committed_text = ""
+        self._stream_did_split = False
+        self._active_tool_verb = ""
+
+    def _restore_stream_state(self, s: dict):
+        self._stream_buffer = s.get("buffer", []) or []
+        self._stream_active = bool(s.get("active", False))
+        self._stream_dirty = bool(s.get("dirty", False))
+        self._stream_live_meta_idx = s.get("live_meta_idx")
+        self._stream_committed_text = s.get("committed", "")
+        self._stream_did_split = bool(s.get("did_split", False))
+        self._active_tool_verb = s.get("tool_verb", "")
+
     def _snapshot_current(self):
         """Save current conversation's live state (thread, context, meta) so we can switch away."""
         cid = self._current_conv_id
-        if not cid:
-            return
+        if not cid or self._is_remote_id(cid):
+            return  # remote mirrors keep no local snapshot
         if self._thread is not None:
             # Give the running thread its OWN agent so it can't corrupt
             # the shared one when we load a different conversation.
@@ -3509,6 +4063,34 @@ class ChatWindow(QWidget):
             thread.errored.connect(_bg_error)
             thread.stopped.connect(_bg_stopped)
 
+            # ── Isolate the live STREAM + tool UI ──────────────────────────
+            # The streaming pipeline (chunk → _on_stream_chunk → shared buffer)
+            # and the tool-call callbacks are per-WINDOW. Left connected, this
+            # backgrounded turn renders its tokens + fires tool chips/sounds into
+            # whatever conversation is shown next — the cross-talk bug. Snapshot
+            # the stream state, detach chunk from the UI, and keep accumulating
+            # this turn's tokens into ITS OWN buffer so switching back shows the
+            # full text-so-far.
+            self._conv_threads[cid]["stream"] = self._capture_stream_state()
+            try:
+                thread.chunk.disconnect(self._on_stream_chunk)
+            except (TypeError, RuntimeError):
+                pass
+            _bg_buf = self._conv_threads[cid]["stream"]["buffer"]
+
+            def _bg_chunk(delta, _buf=_bg_buf):
+                if delta:
+                    _buf.append(delta)
+            self._conv_threads[cid]["_bg_chunk"] = _bg_chunk
+            try:
+                thread.chunk.connect(_bg_chunk)
+            except Exception:
+                pass
+            # The backgrounded agent must NOT drive the shared tool chips/sounds.
+            bg_agent._tool_callback = None
+            bg_agent._tool_batch_callback = None
+            self._reset_stream_state()
+
             self._thread = None
         self._hide_thinking()
 
@@ -3546,8 +4128,27 @@ class ChatWindow(QWidget):
             self.agent._tool_callback = lambda n, a: self.tool_activity.emit(n, a)
             self.agent._tool_batch_callback = lambda ns: self.tool_batch.emit(ns)
 
+            # Re-wire the live stream back to the UI and restore its state (incl.
+            # the tokens accumulated by the bg buffer while this conv was hidden).
+            try:
+                self._thread.chunk.disconnect()  # drop the background accumulator
+            except (TypeError, RuntimeError):
+                pass
+            self._restore_stream_state(snap.get("stream", {}))
+            try:
+                self._thread.chunk.connect(self._on_stream_chunk)
+            except Exception:
+                pass
+
             self._clear_message_widgets()
             self._recalc_and_sync(immediate=True)
+            # Paint the stream-so-far (including tokens streamed while away).
+            if self._stream_live_meta_idx is not None:
+                self._stream_dirty = True
+                try:
+                    self._flush_stream()
+                except Exception:
+                    pass
             self._show_thinking()
 
 
@@ -3563,6 +4164,7 @@ class ChatWindow(QWidget):
             # No active thread — load from disk normally
             self._conv_threads.pop(conv_id, None)
             self._thread = None
+            self._reset_stream_state()  # don't carry a live stream across the switch
             self._load_conv(conv_id)
 
     def _message_html_theme_key(self) -> tuple:
@@ -3572,6 +4174,7 @@ class ChatWindow(QWidget):
             p.get("accent"), p.get("text"), p.get("glow_hot"), p.get("muted_text"),
             p.get("accent_muted"), p.get("accent_soft"), p.get("panel"),
             p.get("panel_alt"), p.get("border"), p.get("danger"),
+            p.get("accent_bright"),  # used by the emphasis hierarchy (numbers/CAPS)
             ChatMessageWidget._font_size,
             ChatMessageWidget._tool_display_mode,
             bool(ChatMessageWidget._show_tools_hint),
@@ -3599,7 +4202,11 @@ class ChatWindow(QWidget):
             extras = ["fenced-code-blocks", "tables", "code-friendly"]
             if meta.get("role") == "user":
                 extras.append("break-on-newline")
-            html = markdown2.markdown(meta.get("content", ""), extras=extras)
+            # Paste messages render only the TYPED portion in the bubble; the big
+            # pasted blocks are shown as separate collapsed cards (their full text
+            # still lives in content for the LLM/transcript).
+            src = meta.get("_typed", "") if meta.get("_pastes") else meta.get("content", "")
+            html = markdown2.markdown(src, extras=extras)
         meta["_html"] = html
         meta["_html_theme_key"] = theme_key
         return html
@@ -3613,6 +4220,7 @@ class ChatWindow(QWidget):
             to_pool
             and isinstance(w, ChatMessageWidget)
             and not w.image_path
+            and not getattr(w, "pastes", None)   # paste-card bubbles can't be reused
             and w._chat_mode != "plain"
             and len(self._message_widget_pool) < self._MSG_WIDGET_POOL_MAX
         ):
@@ -3631,11 +4239,15 @@ class ChatWindow(QWidget):
     def _obtain_message_widget(self, **kwargs) -> ChatMessageWidget:
         chat_mode = kwargs.get("chat_mode", "fancy")
         image_path = kwargs.get("image_path")
-        if not image_path:
+        pastes = kwargs.get("pastes")
+        # Image AND paste messages must be built fresh: pooled reconfigure() only
+        # rebuilds the text body, not the image card or paste cards.
+        if not image_path and not pastes:
+            reuse_kwargs = {k: v for k, v in kwargs.items() if k != "pastes"}
             for idx, pooled in enumerate(self._message_widget_pool):
                 if pooled._chat_mode == chat_mode:
                     self._message_widget_pool.pop(idx)
-                    if pooled.reconfigure(**kwargs):
+                    if pooled.reconfigure(**reuse_kwargs):
                         return pooled
                     try:
                         pooled.deleteLater()
@@ -3743,19 +4355,14 @@ class ChatWindow(QWidget):
         self.agent._context_note = data.get("context_note", "") or ""
         self.agent._include_context_timestamps = data.get("include_timestamps", True)
 
-        self._load_hydrate_pending = list(data.get("messages") or [])
+        # Build the full message meta + LLM context in ONE synchronous pass.
+        # This is just dict appends — microseconds even for hundreds of messages
+        # — so the transcript paints its visible (newest) window immediately,
+        # instead of waiting ~21 event-loop ticks of 24-per-batch hydration only
+        # to render at the very end. (The DB load already runs off-thread.)
         self._load_hydrate_thumbs_dirty = False
         self._load_hydrate_pending_thumbs: list[dict] = []
-        QTimer.singleShot(0, self._hydrate_messages_batch)
-
-    def _hydrate_messages_batch(self):
-        """Append messages to meta/context in small batches so the UI stays responsive."""
-        chunk = 24
-        for _ in range(chunk):
-            if not self._load_hydrate_pending:
-                self._finish_conv_hydrate()
-                return
-            msg = self._load_hydrate_pending.pop(0)
+        for msg in (data.get("messages") or []):
             role = msg.get("role", "")
             if role in ("user", "assistant"):
                 self.agent.context.append({"role": role, "content": msg.get("content", "")})
@@ -3764,36 +4371,41 @@ class ChatWindow(QWidget):
                 self._message_meta.append(msg)
             elif role in ("terminal_card", "plan_card", "subagent_card", "chart_card", "diff_card"):
                 self._message_meta.append(msg)
-        QTimer.singleShot(0, self._hydrate_messages_batch)
+        self._finish_conv_hydrate()
 
     def _finish_conv_hydrate(self):
-        pending_thumbs = self._load_hydrate_pending_thumbs
+        # Paint the visible (newest) window NOW — the virtual scroll only renders
+        # what's on screen, so first paint is bounded regardless of conversation
+        # length. Thumbnail generation for OLD image messages happens afterward,
+        # in the background, so it never blocks the first paint.
+        self._recalc_and_sync(immediate=True)
+        QTimer.singleShot(50, lambda: self._scroll_to_bottom(force=True))
+        QTimer.singleShot(200, lambda: self._scroll_to_bottom(force=True))
+        QTimer.singleShot(100, self._restore_viewer_state)
+        # One-shot: tell main() the startup conversation has rendered so it can
+        # fade the splash. Emitted only on the first hydrate.
+        if not getattr(self, "_initial_load_emitted", False):
+            self._initial_load_emitted = True
+            try:
+                self.initial_load_finished.emit()
+            except Exception:
+                pass
+            # A question board open at last shutdown is restored now that the
+            # transcript (and its context) has rendered.
+            try:
+                self._maybe_restore_pending_question()
+            except Exception:
+                pass
 
-        def _finish_load_after_thumbs():
-            if self._load_hydrate_thumbs_dirty:
-                self._auto_save()
-            self._recalc_and_sync(immediate=True)
-            QTimer.singleShot(50, lambda: self._scroll_to_bottom(force=True))
-            QTimer.singleShot(200, lambda: self._scroll_to_bottom(force=True))
-            QTimer.singleShot(100, self._restore_viewer_state)
-            # One-shot: tell main() the startup conversation has rendered so it
-            # can fade the splash. Emitted only on the first hydrate.
-            if not getattr(self, "_initial_load_emitted", False):
-                self._initial_load_emitted = True
-                try:
-                    self.initial_load_finished.emit()
-                except Exception:
-                    pass
-                # A question board open at last shutdown is restored now that the
-                # transcript (and its context) has rendered.
-                try:
-                    self._maybe_restore_pending_question()
-                except Exception:
-                    pass
+        # Generate image thumbnails in the BACKGROUND; refresh once at the end so
+        # any visible image message picks up its thumbnail without blocking paint.
+        pending_thumbs = self._load_hydrate_pending_thumbs
 
         def _process_pending_thumbs():
             if not pending_thumbs:
-                _finish_load_after_thumbs()
+                if self._load_hydrate_thumbs_dirty:
+                    self._auto_save()
+                    self._recalc_and_sync(immediate=True)
                 return
             m = pending_thumbs.pop(0)
             _ensure_thumb(m)
@@ -3803,8 +4415,6 @@ class ChatWindow(QWidget):
 
         if pending_thumbs:
             QTimer.singleShot(0, _process_pending_thumbs)
-        else:
-            _finish_load_after_thumbs()
 
     def _load_conv_sync(self, conv_id: str):
         """Synchronous load — reserved for rare paths that already block."""
@@ -3814,8 +4424,31 @@ class ChatWindow(QWidget):
         self._apply_loaded_conv_data(conv_id, data)
 
     def _rename_conversation(self, conv_id: str, new_name: str):
+        if self._is_remote_id(conv_id):
+            return  # remote conversations are renamed on their host, not here
         rename_conversation(conv_id, new_name)
         self._refresh_conv_bar()
+
+    def _delete_current_conversation(self):
+        """− button: delete the conversation currently selected in the bar,
+        after a confirm. Single-pane mapping of the workspace − button."""
+        conv_id = self._current_conv_id
+        if not conv_id:
+            return
+        from ui.glass_dialog import GlassDialog
+        name = "this conversation"
+        try:
+            for c in list_conversations():
+                if c["id"] == conv_id:
+                    name = c.get("name") or name
+                    break
+        except Exception:
+            pass
+        if not GlassDialog.confirm(
+                self, "Delete conversation",
+                f'Delete "{name}" and all its messages? This cannot be undone.'):
+            return
+        self._delete_conversation(conv_id)
 
     def _delete_conversation(self, conv_id: str):
         delete_conversation(conv_id)
@@ -3856,8 +4489,8 @@ class ChatWindow(QWidget):
 
     def _auto_save(self, *, immediate: bool = False):
         """Save the current conversation to disk (background thread by default)."""
-        if not self._current_conv_id:
-            return
+        if not self._current_conv_id or self._is_remote_id(self._current_conv_id):
+            return  # a remote mirror has no local row to write
 
         model = self.agent._model_override or self.agent.model
         provider = self.agent._provider_override
@@ -3935,18 +4568,21 @@ class ChatWindow(QWidget):
 
     def _add_message(self, sender: str, content: str, tool_names: list[str] = None,
                      image_path: str = None, track: bool = True,
-                     precomputed_assistant_html: str = ""):
+                     precomputed_assistant_html: str = "",
+                     typed: str = "", pastes: list = None):
         if track:
             role = "user" if sender == "You" else "assistant" if sender == AGENT_LABEL else None
             if role:
-                # Pre-render markdown once and cache it
+                # Pre-render markdown once and cache it. For paste messages the
+                # bubble shows only the TYPED text — the pasted blocks render as
+                # separate cards — while `content` keeps the full text for the LLM.
                 extras = ["fenced-code-blocks", "tables", "code-friendly"]
                 if role == "user":
                     extras.append("break-on-newline")
                 if role == "assistant" and precomputed_assistant_html:
                     html = precomputed_assistant_html
                 else:
-                    html = markdown2.markdown(content, extras=extras)
+                    html = markdown2.markdown(typed if pastes else content, extras=extras)
                 import time as _time
                 theme_key = self._message_html_theme_key()
                 meta = {
@@ -3957,6 +4593,9 @@ class ChatWindow(QWidget):
                     "_html_theme_key": theme_key,
                     "_timestamp": _time.time(),
                 }
+                if pastes:
+                    meta["_pastes"] = pastes
+                    meta["_typed"] = typed
                 _ensure_thumb(meta)
                 self._message_meta.append(meta)
         # Recalculate visible range and sync widgets
@@ -4118,6 +4757,10 @@ class ChatWindow(QWidget):
                 if spi >= 0:
                     layout_pos = spi
         layout.insertWidget(layout_pos, widget)
+        # Show only AFTER reparenting into the layout — a widget shown while it
+        # has no parent flashes as a stray top-level window. Pooled bubbles are
+        # released hidden, so this is what actually reveals them.
+        widget.show()
         bisect.insort(ordered_indices, meta_idx)
 
     def _sync_widgets(self):
@@ -4236,7 +4879,9 @@ class ChatWindow(QWidget):
             _ensure_thumb(meta)
             w = self._obtain_message_widget(
                 sender=sender,
-                content=meta["content"],
+                # Paste bubbles display the typed text only; the full content
+                # (with pastes inlined) stays in meta for the LLM/transcript.
+                content=(meta.get("_typed", "") if meta.get("_pastes") else meta["content"]),
                 tool_names=meta.get("tool_names"),
                 image_path=meta.get("_thumb") or meta.get("image_path") or None,
                 cached_html=html,
@@ -4246,7 +4891,9 @@ class ChatWindow(QWidget):
                 show_usage=self.agent.config.get("show_usage", False),
                 show_tool_chips=self.agent.config.get("show_tools_called", True),
                 chat_mode=self.agent.config.get("chat_mode", "fancy"),
+                continuation=not _show_sender_nametag(self._message_meta, i),
                 inline_timeline=self._has_inline_timeline(meta),
+                pastes=meta.get("_pastes"),
             )
             if vp_w > 0:
                 w.apply_wrap_width(max(50, vp_w - 12))
@@ -4576,6 +5223,27 @@ class ChatWindow(QWidget):
         tl = meta.get("_stream_timeline")
         return isinstance(tl, list) and len(tl) > 0
 
+    def _timeline_md_cached(self, text: str) -> str:
+        """Markdown for a SEALED timeline segment, cached per content+theme.
+
+        The 100ms stream flush re-renders the whole timeline body; sealed
+        text segments are immutable, so re-running markdown2 on each of them
+        every tick is pure waste (it grows with turn length — long multi-tool
+        turns were the stutter). Keyed by the exact text + the theme signature
+        so palette/font changes naturally invalidate."""
+        cache = getattr(self, "_tl_md_cache", None)
+        if cache is None:
+            cache = self._tl_md_cache = {}
+        key = self._message_html_theme_key()
+        hit = cache.get(text)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        html = self._markdown_html(text)
+        if len(cache) > 256:
+            cache.clear()
+        cache[text] = (key, html)
+        return html
+
     def _render_stream_timeline_body_html(self, meta: dict,
                                           show_ellipsis: bool = False) -> str:
         """Body HTML: chronologically interleaved narration + inline tool/gadget rows."""
@@ -4615,7 +5283,7 @@ class ChatWindow(QWidget):
                         parts.append(
                             f'<div style="height:10px;"></div>'
                         )
-                    parts.append(self._markdown_html(text))
+                    parts.append(self._timeline_md_cached(text))
                     prev_type = "text"
             else:
                 block = self._timeline_item_body_html(item, fs)
@@ -4962,12 +5630,20 @@ class ChatWindow(QWidget):
                 return
             from PyQt6.QtCore import QRect
             vp_rect = vp.rect()
+            wrap_w = max(50, vp.width() - 12)
             for w in self._idx_to_widget.values():
                 try:
                     top = w.mapTo(vp, w.rect().topLeft())
                     bottom = w.mapTo(vp, w.rect().bottomRight())
                     visible = vp_rect.intersects(QRect(top, bottom))
                     w.set_visible_in_viewport(visible)
+                    # Offscreen widgets are skipped by the debounced-resize
+                    # rewrap for speed; refresh their wrap width (and pinned
+                    # body height) as they come into view so a width change
+                    # while they were offscreen can't leave them mis-sized.
+                    if (visible and getattr(w, "_wrap_width", wrap_w) != wrap_w
+                            and hasattr(w, "apply_wrap_width")):
+                        w.apply_wrap_width(wrap_w)
                 except RuntimeError:
                     pass
         except Exception:
@@ -5187,7 +5863,6 @@ class ChatWindow(QWidget):
         "git": "working with git",
         "lint": "linting code",
         "lsp": "looking up a symbol",
-        "notebook": "working in a notebook",
         "hot_reload": "hot-reloading",
         "db_query": "querying a database",
         "vector_search": "doing a vector search",
@@ -5303,8 +5978,12 @@ class ChatWindow(QWidget):
         if getattr(self, "_awaiting_user_answer", False):
             self._typing_label.setText("")
             return
-        # While real tokens are streaming, the dot animation is redundant noise.
-        if getattr(self, "_stream_active", False):
+        # Blank ONLY while text is actively streaming (the bubble's trailing
+        # ellipsis is the cue then). While a TOOL is running mid-turn — reading a
+        # file, querying a db, etc. — keep showing the status so the bottom bar
+        # never goes silent while the agent is clearly busy.
+        tool_busy = bool(getattr(self, "_active_tool_verb", ""))
+        if getattr(self, "_stream_active", False) and not tool_busy:
             self._typing_label.setText("")
             return
         p = PALETTE
@@ -5313,7 +5992,8 @@ class ChatWindow(QWidget):
         prefix = getattr(self, "_typing_prefix", f"{AGENT_LABEL} is typing")
         self._typing_label.setText(f"{prefix}{dots}{pad}")
         self._typing_label.setStyleSheet(
-            f"color: {p['accent_muted']}; background: transparent; border: none;")
+            f"color: {p['accent_muted']}; background: transparent; border: none;"
+            f" font-style: italic;")
         self._thinking_dots_state += 1
 
     def _set_typing_prefix(self, prefix: str):
@@ -5323,6 +6003,7 @@ class ChatWindow(QWidget):
             self._animate_typing()
 
     def _hide_thinking(self):
+        self._active_tool_verb = ""
         if self._thinking:
             self._thinking = False
             try:
@@ -5722,6 +6403,8 @@ class ChatWindow(QWidget):
 
     def _on_stream_round_start(self):
         """New model round — append prior narration or reset the preview panel."""
+        self._publish_host_turn_event("round_start")
+        self._mirror_text_last = 0.0
         if self._stream_in_chat():
             self._append_stream_round()
             return
@@ -5736,6 +6419,9 @@ class ChatWindow(QWidget):
             return
         self._stream_buffer.append(delta)
         self._stream_dirty = True
+        # Text is flowing again — the bubble's trailing ellipsis takes over the
+        # "busy" cue, so drop the tool status.
+        self._active_tool_verb = ""
         first_chunk = not self._stream_active
         self._stream_active = True
         if first_chunk:
@@ -5752,6 +6438,12 @@ class ChatWindow(QWidget):
         text = "".join(self._stream_buffer)
         if not text and not self._stream_committed_text:
             return
+        # Mirror this conversation's live text to any peer watching it, throttled.
+        import time as _t
+        now = _t.monotonic()
+        if now - getattr(self, "_mirror_text_last", 0.0) >= 0.2:
+            self._mirror_text_last = now
+            self._publish_host_turn_event("text", text=text)
         if self._stream_in_chat():
             self._ensure_live_stream_message()
             self._refresh_live_stream_display(show_ellipsis=True)
@@ -6258,8 +6950,9 @@ class ChatWindow(QWidget):
         if sizes[1] <= 10:
             # Viewer is collapsed — blink the handle to get attention
             self._blink_splitter_handle()
-        # If app isn't focused, blink the taskbar icon
-        if not QApplication.activeWindow():
+        # If app isn't focused, blink the taskbar icon — unless the user is
+        # away (the flash would dismiss a running screensaver for no one).
+        if not QApplication.activeWindow() and not _user_is_away():
             try:
                 QApplication.alert(self.window(), 3000)
             except Exception:
@@ -6299,7 +6992,9 @@ class ChatWindow(QWidget):
         except Exception:
             pass
 
-        if not QApplication.activeWindow():
+        # Taskbar blink only when someone is actually there to see it — an
+        # OS attention flash dismisses a running screensaver on Windows.
+        if not QApplication.activeWindow() and not _user_is_away():
             try:
                 QApplication.alert(self.window(), 3000)
             except Exception:
@@ -6477,26 +7172,162 @@ class ChatWindow(QWidget):
         except Exception:
             return path
 
+    # ── Large-paste capture (collapsed paste cards) ───────────────────────
+    _PASTE_MIN_CHARS = 1200      # below this it's small enough to show inline
+    _PASTE_MIN_LINES = 18
+
+    def _should_capture_paste(self, text: str) -> bool:
+        if not text:
+            return False
+        return (len(text) >= self._PASTE_MIN_CHARS
+                or text.count("\n") + 1 >= self._PASTE_MIN_LINES)
+
+    def _capture_pasted_text(self, text: str) -> None:
+        """Stash a big paste as a removable pill above the composer (keeping the
+        composer clean). On send the full text is appended to the message for the
+        model, while the bubble shows a collapsed card."""
+        lines = text.count("\n") + 1
+        entry = {"text": text, "lines": lines, "chars": len(text), "pill": None}
+        pill = self._make_paste_pill(entry)
+        entry["pill"] = pill
+        # Insert before the trailing stretch so pills stay left-packed.
+        self._paste_bar_layout.insertWidget(self._paste_bar_layout.count() - 1, pill)
+        self._pending_pastes.append(entry)
+        self._paste_bar.show()
+
+    def _make_paste_pill(self, entry: dict) -> QFrame:
+        p = PALETTE
+        accent = QColor(p["accent"])
+        pill = QFrame()
+        pill.setObjectName("pastePill")
+        pill.setStyleSheet(
+            f"QFrame#pastePill {{ background: rgba({accent.red()},{accent.green()},{accent.blue()},0.12);"
+            f" border: 1px solid {p['border']}; border-radius: 11px; }}")
+        lay = QHBoxLayout(pill)
+        lay.setContentsMargins(10, 2, 5, 2)
+        lay.setSpacing(5)
+        label = QLabel(f"Pasted text · {entry['lines']:,} lines")
+        label.setFont(QFont("Consolas", 8))
+        label.setStyleSheet(f"color: {p['accent']}; background: transparent; border: none;")
+        label.setToolTip(f"{entry['lines']:,} lines · {entry['chars']:,} chars")
+        lay.addWidget(label)
+        x = QPushButton("✕")
+        x.setFixedSize(16, 16)
+        x.setCursor(Qt.CursorShape.PointingHandCursor)
+        x.setFont(QFont("Consolas", 8))
+        x.setToolTip("Remove pasted text")
+        x.setStyleSheet(
+            f"QPushButton {{ color: {p['muted_text']}; background: transparent; border: none; }}"
+            f"QPushButton:hover {{ color: {p.get('accent_bright', p['accent'])}; }}")
+        x.clicked.connect(lambda _=False, e=entry: self._remove_paste(e))
+        lay.addWidget(x)
+        return pill
+
+    def _remove_paste(self, entry: dict) -> None:
+        pill = entry.get("pill")
+        if pill is not None:
+            try:
+                self._paste_bar_layout.removeWidget(pill)
+                pill.deleteLater()
+            except RuntimeError:
+                pass
+        if entry in self._pending_pastes:
+            self._pending_pastes.remove(entry)
+        if not self._pending_pastes:
+            self._paste_bar.hide()
+
+    def _clear_pending_pastes(self) -> None:
+        for e in list(getattr(self, "_pending_pastes", [])):
+            pill = e.get("pill")
+            if pill is not None:
+                try:
+                    self._paste_bar_layout.removeWidget(pill)
+                    pill.deleteLater()
+                except RuntimeError:
+                    pass
+        self._pending_pastes = []
+        if hasattr(self, "_paste_bar"):
+            self._paste_bar.hide()
+
+    def _extract_pastes(self, raw: str):
+        """Build (full_for_model, typed_for_display, pastes) from the composer
+        text + the pending paste pills. Pastes are appended after the typed text
+        for the model; the bubble shows the typed text + collapsed cards."""
+        pending = list(getattr(self, "_pending_pastes", None) or [])
+        typed = raw.strip()
+        pastes = [{"text": e["text"], "lines": e["lines"], "chars": e["chars"]}
+                  for e in pending]
+        if pastes:
+            blocks = "\n\n".join(p["text"] for p in pastes)
+            full = (typed + "\n\n" + blocks) if typed else blocks
+        else:
+            full = typed
+        # NOTE: does not clear the pending pastes — the caller clears them only
+        # once the message is actually committed (so a cancelled mid-job send
+        # doesn't silently drop them).
+        return full.strip(), typed, pastes
+
     def send_message(self):
-        text = self.input.toPlainText().strip()
+        # Expand any captured paste placeholders: the model sees the full text
+        # (`content`), the bubble shows the typed text + collapsed paste cards.
+        raw_input = self.input.toPlainText()
+        full_text, typed_text, sent_pastes = self._extract_pastes(raw_input)
+        self._sending_pastes = sent_pastes
+        self._sending_typed = typed_text
+        text = full_text.strip()
         if not text and not self._pending_image:
+            return
+        # Mirroring a peer's conversation → the HOST runs the turn (its agent,
+        # its tools). We just relay the message and render what streams back.
+        if self._remote_mirror is not None:
+            self._send_remote(text)
             return
         # Persist the attachment NOW (before any _clear_pending_image deletes the
         # clipboard temp) so the sent image stays visible in the chat.
         pending_img = self._persist_attachment(self._pending_image) if self._pending_image else None
         if self._thread is not None:
-            # Mid-job: don't block the user. QUEUE the message and auto-send it
-            # the moment the current turn finishes (or is stopped — Stop keeps
-            # whatever was produced, then this runs against that context).
-            self._queued_message = {"text": text, "image": pending_img}
-            self._clear_pending_image()
-            self.input.clear()
+            # Mid-job: ask whether to INTERRUPT the agent now or QUEUE the
+            # message to auto-send the moment the current turn finishes.
+            # Either way the queue drain in _finish_inference delivers it —
+            # interrupt just stops the turn first (Stop keeps whatever was
+            # produced, then the message runs against that context).
+            from ui.interrupt_queue_dialog import InterruptQueueDialog
+            dlg = InterruptQueueDialog(text, parent=self)
+            # Flag for _drain_queued_message: exec() spins an event loop, so
+            # the running turn can finish (and try to drain) underneath us.
+            self._midjob_dialog_open = True
             try:
-                self.input.setPlaceholderText(
-                    "Queued — sends when the current reply finishes…")
-            except Exception:
-                pass
-            return
+                dlg.exec()
+            finally:
+                self._midjob_dialog_open = False
+            choice = dlg.result_action()
+            if choice == "cancel":
+                return  # message stays in the composer untouched
+            if self._thread is not None:
+                # Merge with anything already queued so an earlier mid-job
+                # submit isn't silently clobbered.
+                prev = getattr(self, "_queued_message", None) or {}
+                if prev.get("text") and text:
+                    text = prev["text"] + "\n\n" + text
+                self._queued_message = {
+                    "text": text or prev.get("text", ""),
+                    "image": pending_img or prev.get("image"),
+                }
+                self._clear_pending_image()
+                self._clear_pending_pastes()  # pastes are folded into queued text
+                self.input.clear()
+                try:
+                    self.input.setPlaceholderText(
+                        "Interrupting — your message sends next…"
+                        if choice == "interrupt" else
+                        "Queued — sends when the current reply finishes…")
+                except Exception:
+                    pass
+                if choice == "interrupt":
+                    self._stop_inference()
+                return
+            # else: the turn finished while the dialog was open — fall
+            # through and send normally.
 
         # Interrupt any ongoing TTS playback — user is speaking now
         self._interrupt_voice()
@@ -6526,7 +7357,9 @@ class ChatWindow(QWidget):
             if pre_turn_summary_snapshot:
                 last_meta["_summary_snapshot"] = pre_turn_summary_snapshot
         else:
-            self._add_message("You", display_text, image_path=pending_img)
+            self._add_message("You", display_text, image_path=pending_img,
+                              typed=getattr(self, "_sending_typed", ""),
+                              pastes=getattr(self, "_sending_pastes", None))
             # Bake a persistent thumbnail now so the bubble keeps showing the
             # image even after the source temp is cleaned up.
             if self._message_meta and pending_img:
@@ -6537,6 +7370,10 @@ class ChatWindow(QWidget):
             if self._message_meta and pre_turn_summary_snapshot:
                 self._message_meta[-1]["_summary_snapshot"] = pre_turn_summary_snapshot
 
+        # Mirror this user turn to any peer watching this conversation.
+        self._publish_host_turn_event(
+            "user", message={"role": "user", "content": display_text})
+
         try:
             from core.sounds import play_ui
             play_ui("message.mp3")
@@ -6544,6 +7381,7 @@ class ChatWindow(QWidget):
             pass
 
         self.input.clear()
+        self._clear_pending_pastes()  # message committed — drop the pending pills
         self._set_inferring(True)
         self._show_thinking()
         self._stream_committed_text = ""
@@ -6580,7 +7418,13 @@ class ChatWindow(QWidget):
 
     def _apply_tool_chip_and_sound(self, name: str, args: dict):
         """One chip on the shared tool row + optional terminal sound."""
-        self._set_typing_prefix(f"{AGENT_LABEL} is {self._verb_for_tool(name, args)}")
+        verb = self._verb_for_tool(name, args)
+        # Mark a tool as in-flight so the status stays visible even mid-stream;
+        # cleared the moment text resumes (_on_stream_chunk) or the turn ends.
+        self._active_tool_verb = verb
+        self._set_typing_prefix(f"{AGENT_LABEL} is {verb}")
+        # Mirror tool activity to any peer watching this conversation.
+        self._publish_host_turn_event("tool", name=name)
         # ask_user_question: don't drop a chip while the question board is still
         # open — it's redundant next to the live widget. The chip is added later,
         # once answered, by _on_question_answered.
@@ -6681,6 +7525,21 @@ class ChatWindow(QWidget):
             def _show_screenshot_card():
                 if os.path.isfile(tmp):
                     import time as _time
+                    # Mirror the screenshot to any peer watching this
+                    # conversation, so a remote operator sees this machine's screen.
+                    try:
+                        from core.network import network_manager
+                        cid = self._current_conv_id
+                        if (not self._is_remote_id(cid)
+                                and network_manager.conv_has_subscribers(cid)):
+                            import base64 as _b64
+                            raw = open(tmp, "rb").read()
+                            if 0 < len(raw) <= 8 * 1024 * 1024:
+                                network_manager.publish_conv_event(cid, {
+                                    "kind": "image", "fmt": "jpeg",
+                                    "data": _b64.b64encode(raw).decode()})
+                    except Exception:
+                        pass
                     shot_meta = {
                         "type": "screenshot",
                         "image_path": tmp,
@@ -6964,6 +7823,11 @@ class ChatWindow(QWidget):
         tool_names = [t["tool"] for t in tool_log
                       if t.get("success") is not False] if tool_log else []
         display = reply or "(Agent returned empty response)"
+
+        # Mirror the finished reply to any peer watching this conversation.
+        self._publish_host_turn_event(
+            "final", message={"role": "assistant", "content": display,
+                              "tool_names": tool_names})
 
         extra_meta = {}
         thinking = getattr(self.agent, '_turn_thinking', None)
@@ -7299,8 +8163,18 @@ class ChatWindow(QWidget):
 
     def _drain_queued_message(self):
         """Auto-send a message the user submitted while a turn was in progress."""
+        if getattr(self, "_midjob_dialog_open", False):
+            # The interrupt/queue dialog is open and its exec() loop is
+            # processing this turn's finish — let it resolve first, then
+            # re-check (its outcome may queue a message or start a new turn).
+            QTimer.singleShot(100, self._drain_queued_message)
+            return
         q = getattr(self, "_queued_message", None)
         if not q:
+            return
+        if self._thread is not None:
+            # A new turn already started (e.g. the dialog closed into a
+            # normal send) — keep the message queued for the next finish.
             return
         self._queued_message = None
         try:
@@ -7551,6 +8425,487 @@ class ChatWindow(QWidget):
                 pass
         thread.deleteLater()
 
+    # ── Peer network intake ───────────────────────────────────────────
+
+    def _on_network_event(self, data):
+        """Authenticated /sync event from a peer (GUI thread, via network_event).
+
+        'chat' events land in a per-peer "Network: <node>" conversation as a
+        user message. With network.auto_respond enabled, the agent then answers
+        in that conversation and the reply is sent back to the peer — full
+        agent-to-agent messaging. Other event types are logged and ignored."""
+        if not isinstance(data, dict):
+            return
+        if data.get("type") != "chat":
+            print(f"[network] ignoring event type {data.get('type')!r}", flush=True)
+            return
+        node = str(data.get("from") or "peer").strip() or "peer"
+        text = str(data.get("message") or "").strip()
+        if not text:
+            return
+
+        import time as _time
+        from core.conversations import (list_conversations, load_conversation,
+                                        new_conversation_id, save_conversation)
+        conv_name = f"Network: {node}"
+        conv_id = next((c["id"] for c in list_conversations()
+                        if c.get("name") == conv_name), "")
+        if not conv_id:
+            conv_id = new_conversation_id()
+            save_conversation(conv_id, conv_name, [])
+            self._refresh_conv_bar()
+        conv = load_conversation(conv_id) or {}
+        messages = conv.get("messages", [])
+        messages.append({"role": "user", "content": f"[from {node} via network] {text}",
+                         "_timestamp": _time.time()})
+        save_conversation(conv_id, conv_name, messages)
+
+        if bool((self.agent.config.get("network") or {}).get("auto_respond")):
+            agent = Agent()
+            agent.config = self.agent.config
+            agent._provider_override = self.agent._provider_override or ""
+            agent._model_override = self.agent._model_override or ""
+            t = _NetworkReplyThread(agent, conv_id, node,
+                                    str(data.get("reply_url") or ""))
+            if not hasattr(self, '_task_threads'):
+                self._task_threads = []
+            self._task_threads.append(t)
+            t.completed.connect(self._on_task_completed)
+            t.finished.connect(lambda th=t: QTimer.singleShot(
+                100, lambda: self._task_thread_done(th)))
+            t.start()
+        else:
+            # No inference — just surface the message (refresh + sound).
+            self._on_task_completed(conv_id, conv_name, "")
+
+    # ── Remote conversations: HOST side ──────────────────────────────
+    # A peer is mirroring one of OUR conversations and sent input. We run the
+    # turn here (our agent, our tools, committed here) and stream it back.
+
+    def _on_remote_input(self, conv_id: str, text: str, reply_url: str):
+        from core.network import network_manager
+        if not conv_id or not text:
+            return
+        # Ensure the sender receives this conversation's events even if it drove
+        # us without an explicit /conv/subscribe first.
+        if reply_url:
+            network_manager._subscribe_conv(conv_id, reply_url)
+
+        # If the host has THIS conversation open and is idle (composer empty, no
+        # turn running, not itself mirroring), run the message through the normal
+        # local turn path. That gives the host the exact same streaming + typing
+        # indicator a local message would, and the host-turn publish hooks
+        # (_publish_host_turn_event) tee the same stream out to the viewer — so
+        # both ends mirror each other. Otherwise run it headless in the
+        # background and just refresh the view at the boundaries.
+        if (conv_id == self._current_conv_id and self._thread is None
+                and self._remote_mirror is None
+                and not self.input.toPlainText().strip()):
+            self.input.setPlainText(text)
+            self.send_message()
+            return
+
+        agent = Agent()
+        agent.config = self.agent.config
+        agent._provider_override = self.agent._provider_override or ""
+        agent._model_override = self.agent._model_override or ""
+        t = _RemoteHostTurnThread(agent, conv_id, text)
+        if not hasattr(self, '_task_threads'):
+            self._task_threads = []
+        self._task_threads.append(t)
+        t.user_saved.connect(self._on_remote_host_turn_done)   # live: show incoming msg
+        t.refreshed.connect(self._on_remote_host_turn_done)    # show the reply
+        t.finished.connect(lambda th=t: QTimer.singleShot(
+            100, lambda: self._task_thread_done(th)))
+        t.start()
+
+    def _on_remote_host_turn_done(self, conv_id: str):
+        """A peer-driven turn finished on this host. Refresh the local view if
+        that conversation happens to be open, and play the message cue."""
+        self._on_task_completed(conv_id, "", "")
+
+    def _on_terminal_attach_request(self, req):
+        """GUI thread: build a TerminalAttachment to the conversation's live
+        shell so a remote viewer mirrors the real session. Sets req['attachment']
+        (or leaves it None → the bridge spawns a fresh shell) and signals done."""
+        try:
+            from ui.terminal_workspace import TerminalAttachment
+            backend = self._right_workspace.terminal_panel.active_backend_for(
+                req.get("conv_id", ""))
+            if backend is not None and backend.is_alive():
+                req["attachment"] = TerminalAttachment(backend)
+        except Exception as e:
+            print(f"[network] terminal attach failed: {e}", flush=True)
+        finally:
+            try:
+                req["event"].set()
+            except Exception:
+                pass
+
+    def _publish_host_turn_event(self, kind: str, **kw):
+        """Best-effort: mirror the LOCALLY-driven turn of the current conversation
+        out to any peer watching it. No-op when nobody is subscribed (a cheap
+        lock check), and never for a conversation we ourselves are mirroring."""
+        cid = self._current_conv_id
+        if not cid or self._remote_mirror is not None or self._is_remote_id(cid):
+            return
+        try:
+            from core.network import network_manager
+            if network_manager.conv_has_subscribers(cid):
+                network_manager.publish_conv_event(cid, {"kind": kind, **kw})
+        except Exception:
+            pass
+
+    # ── Remote conversations: VIEWER side ────────────────────────────
+
+    def _is_remote_id(self, conv_id: str) -> bool:
+        return isinstance(conv_id, str) and conv_id.startswith("remote::")
+
+    def _refresh_remote_convs(self):
+        """Pull each peer's conversation list (off-thread) and merge into the
+        dropdown. Cheap, best-effort; failures just leave a peer's list stale."""
+        from core.network import network_manager, outbound_identity
+        if not network_manager.running:
+            return
+        _, _, peers = outbound_identity()
+        if not peers:
+            return
+        for p in peers:
+            threading.Thread(target=self._fetch_peer_convs, args=(dict(p),),
+                             daemon=True).start()
+
+    def _fetch_peer_convs(self, peer: dict):
+        from core.network import peer_conv_list
+        ok, convs, _detail = peer_conv_list(peer.get("url", ""))
+        if not ok:
+            return
+        name = peer.get("name") or peer.get("url", "")
+        # Marshal back to the GUI thread through the conv-event sink.
+        self.conv_event_received.emit(
+            {"kind": "_peer_conv_list", "peer": name, "url": peer.get("url", ""),
+             "convs": convs})
+
+    def _apply_peer_conv_list(self, peer: str, url: str, convs: list):
+        self._remote_convs_by_peer[peer] = [
+            {"id": f"remote::{peer}::{c.get('id')}", "name": c.get("name", ""),
+             "peer": peer, "peer_url": url, "remote_id": c.get("id")}
+            for c in convs if c.get("id")]
+        try:
+            self._conv_bar.set_remote_conversations(self._remote_convs_by_peer)
+        except Exception:
+            pass
+
+    def _enter_remote_mirror(self, combo_id: str):
+        """Open a live, read/write mirror of a peer's conversation. We render its
+        snapshot and stream its turns; messages we send run on the HOST."""
+        try:
+            _, peer, remote_id = combo_id.split("::", 2)
+        except ValueError:
+            return
+        entry = next((c for lst in self._remote_convs_by_peer.values() for c in lst
+                      if c["id"] == combo_id), None)
+        peer_url = entry["peer_url"] if entry else ""
+        if not peer_url:
+            return
+        self._exit_remote_mirror()      # leave any prior mirror cleanly
+        self._auto_save()               # persist the local conversation we're leaving
+        try:
+            self._save_viewer_state()   # remember the local conv's splitter/tools layout
+        except Exception:
+            pass
+        self._current_conv_id = combo_id
+        self._remote_mirror = {"combo_id": combo_id, "peer": peer,
+                               "peer_url": peer_url, "remote_id": remote_id,
+                               "live_idx": None}
+        self.agent.clear_context()
+        self._clear_message_widgets()
+        self._message_meta = []
+        self._conv_bar.highlight(combo_id)
+        self._conv_bar.set_hint(f"🌐 [{peer}] mirroring · host runs the work")
+        # Point the File viewer at the host's workspace (read+write over the
+        # net). Best-effort — chat mirroring still works if files don't.
+        try:
+            self._file_viewer.enter_remote_workspace(peer_url, remote_id, peer)
+        except Exception as e:
+            print(f"[network] remote workspace unavailable: {e}", flush=True)
+        # Mirror the host's Notes (edit), Calendar (read-only), and Browser
+        # (current URL) for this conversation. All best-effort.
+        try:
+            self._right_workspace.notes_panel.enter_remote(peer_url, remote_id)
+            self._right_workspace.calendar_panel.enter_remote(peer_url)
+            # Terminal → a live shell ON THE HOST (WebSocket), scoped to the
+            # conversation's workspace.
+            self._right_workspace.enter_remote_terminal(peer_url, remote_id, peer)
+        except Exception as e:
+            print(f"[network] remote tool mirror partial: {e}", flush=True)
+        threading.Thread(target=self._open_remote_browser_url,
+                         args=(peer_url, remote_id, combo_id), daemon=True).start()
+        threading.Thread(target=self._subscribe_remote,
+                         args=(peer_url, remote_id, combo_id), daemon=True).start()
+
+    def _subscribe_remote(self, peer_url: str, remote_id: str, combo_id: str):
+        from core.network import peer_conv_subscribe
+        ok, snap, _detail = peer_conv_subscribe(peer_url, remote_id)
+        self.conv_event_received.emit(
+            {"kind": "_remote_snapshot", "combo_id": combo_id, "ok": ok,
+             "snapshot": snap or {}})
+
+    def _open_remote_browser_url(self, peer_url: str, remote_id: str, combo_id: str):
+        """Fetch the host conversation's current browser URL (off-thread) and
+        open it in our browser panel for the mirror, matching what the host
+        sees."""
+        from core.network import peer_browser_url
+        ok, url = peer_browser_url(peer_url, remote_id)
+        if ok and url:
+            self.conv_event_received.emit(
+                {"kind": "_remote_browser", "combo_id": combo_id, "url": url})
+
+    def _exit_remote_mirror(self):
+        m = self._remote_mirror
+        if not m:
+            return
+        self._disarm_remote_watchdog()
+        self._hide_thinking()
+        self._remote_mirror = None
+        try:
+            self._file_viewer.exit_remote_workspace()
+        except Exception:
+            pass
+        try:
+            self._right_workspace.notes_panel.exit_remote()
+            self._right_workspace.calendar_panel.exit_remote()
+            self._right_workspace.exit_remote_terminal()
+        except Exception:
+            pass
+        try:
+            from core.network import peer_conv_unsubscribe
+            threading.Thread(
+                target=peer_conv_unsubscribe, args=(m["peer_url"], m["remote_id"]),
+                daemon=True).start()
+        except Exception:
+            pass
+
+    def _send_remote(self, text: str):
+        """Deliver a composer message to the host that owns the mirrored
+        conversation. The host echoes it back as a 'user' event, so we don't
+        render optimistically — the host stays the single source of truth."""
+        m = self._remote_mirror
+        if not m or not text.strip():
+            return
+        self.input.clear()
+        self._set_typing_prefix(f"{AGENT_LABEL} (remote) is thinking")
+        self._show_thinking()
+        self._arm_remote_watchdog()
+        combo = m["combo_id"]
+        peer_url, remote_id = m["peer_url"], m["remote_id"]
+
+        def _send():
+            from core.network import peer_conv_input
+            ok, detail = peer_conv_input(peer_url, remote_id, text)
+            # Report only a DELIVERY failure here; success is confirmed by the
+            # host echoing a 'user' event back. Marshalled to the GUI thread.
+            if not ok:
+                self.conv_event_received.emit(
+                    {"kind": "_send_result", "combo_id": combo, "detail": detail})
+        threading.Thread(target=_send, daemon=True).start()
+
+    def _remote_notice(self, text: str):
+        """Render a plain agent-bubble notice in the mirror (the 'Error' sender
+        doesn't map to a real role, so it would silently render nothing)."""
+        self._add_message(AGENT_LABEL, f"⚠ {text}")
+
+    def _arm_remote_watchdog(self, seconds: int = 90):
+        """Restart the 'host went silent' timer. Re-armed on every inbound event
+        so a long, actively-streaming turn never trips it — only true silence
+        (host offline, can't reach us back, or crashed) does."""
+        if not hasattr(self, "_remote_wait_timer"):
+            self._remote_wait_timer = QTimer(self)
+            self._remote_wait_timer.setSingleShot(True)
+            self._remote_wait_timer.timeout.connect(self._on_remote_timeout)
+        self._remote_wait_timer.start(seconds * 1000)
+
+    def _disarm_remote_watchdog(self):
+        t = getattr(self, "_remote_wait_timer", None)
+        if t is not None:
+            t.stop()
+
+    def _on_remote_timeout(self):
+        if self._remote_mirror is None:
+            return
+        self._hide_thinking()
+        self._remote_notice(
+            "No response from the host — it may be offline, busy, or unable to "
+            "reach this machine. Your message was delivered; the reply (if any) "
+            "will appear when it arrives. Tip: the host must be able to reach "
+            "THIS machine's public address too (check Settings → Network → "
+            "Check peers on the host).")
+
+    def _on_conv_event(self, data):
+        """GUI-thread sink for every conv_event_received emission: peer-list
+        results, mirror snapshots, send failures, and live events from a host."""
+        if not isinstance(data, dict):
+            return
+        kind = data.get("kind")
+
+        # Internal (locally-emitted) control messages.
+        if kind == "_peer_conv_list":
+            self._apply_peer_conv_list(data.get("peer", ""), data.get("url", ""),
+                                       data.get("convs", []))
+            return
+        if kind == "_remote_snapshot":
+            self._apply_remote_snapshot(data)
+            return
+        if kind == "_remote_browser":
+            m = self._remote_mirror
+            if m and data.get("combo_id") == m["combo_id"] and data.get("url"):
+                try:
+                    self._right_workspace.browser_panel.get_or_create_for_conv(
+                        m["combo_id"], m["peer"], data["url"])
+                except Exception:
+                    pass
+            return
+        if kind == "_send_result":
+            m = self._remote_mirror
+            if m and data.get("combo_id") == m["combo_id"]:
+                self._disarm_remote_watchdog()
+                self._hide_thinking()
+                self._remote_notice(f"Couldn't deliver your message to the host: "
+                                    f"{data.get('detail', 'unknown error')}")
+            return
+
+        # Live event from a host we're mirroring — ignore unless it matches the
+        # open mirror. Any matching event = the host is alive → re-arm watchdog.
+        m = self._remote_mirror
+        if not m or data.get("conv_id") != m["remote_id"]:
+            return
+        self._arm_remote_watchdog()
+        if kind == "user":
+            self._add_message("You", data.get("message", {}).get("content", ""))
+        elif kind == "round_start":
+            m["live_idx"] = None
+        elif kind == "text":
+            self._render_remote_live_text(data.get("text", ""))
+        elif kind == "tool":
+            self._set_typing_prefix(f"{AGENT_LABEL} (remote) · {data.get('name', 'tool')}")
+        elif kind == "image":
+            self._render_remote_image(data)
+        elif kind == "final":
+            self._disarm_remote_watchdog()
+            self._hide_thinking()
+            msg = data.get("message", {})
+            self._finalize_remote_text(msg.get("content", ""),
+                                       msg.get("tool_names", []))
+            m["live_idx"] = None
+
+    def _render_remote_image(self, data):
+        """Show a screenshot (or other image) the host shared into the mirrored
+        conversation — e.g. a screenshot of the host's screen."""
+        import base64 as _b64
+        import os as _os
+        import tempfile as _tf
+        import time as _t
+        try:
+            raw = _b64.b64decode(data.get("data", "") or "")
+        except Exception:
+            return
+        if not raw:
+            return
+        path = _os.path.join(_tf.gettempdir(), f"remote_shot_{int(_t.time() * 1000)}.jpg")
+        try:
+            with open(path, "wb") as f:
+                f.write(raw)
+        except Exception:
+            return
+        self._message_meta.append({
+            "role": "assistant", "content": "[remote screenshot]",
+            "tool_names": ["screenshot"], "image_path": path,
+            "_html": "<em>🌐 remote screenshot</em>", "_timestamp": _t.time(),
+        })
+        self._clear_message_widgets()
+        self._recalc_and_sync(immediate=True)
+        QTimer.singleShot(50, self._scroll_to_bottom)
+
+    def _apply_remote_snapshot(self, data):
+        m = self._remote_mirror
+        if not m or data.get("combo_id") != m["combo_id"]:
+            return
+        if not data.get("ok"):
+            self._remote_notice("Could not load this conversation from the host — "
+                                "it may be offline.")
+            return
+        snap = data.get("snapshot", {})
+        self._message_meta = []
+        for msg in snap.get("messages", []):
+            role = msg.get("role")
+            if role in ("user", "assistant") and msg.get("content"):
+                self._message_meta.append({
+                    "role": role, "content": msg["content"],
+                    "tool_names": msg.get("tool_names", []),
+                    "_timestamp": msg.get("_timestamp", 0),
+                })
+        self._clear_message_widgets()
+        self._recalc_and_sync(immediate=True)
+        QTimer.singleShot(50, self._scroll_to_bottom)
+        # Adopt the host conversation's tool/workspace pane state so the mirror
+        # matches what it looks like on the host: same open/closed splitter AND
+        # the same tool tab (Files/Terminal/Browser/…).
+        try:
+            if snap.get("workspace_collapsed", True):
+                self._collapse_workspace()
+            else:
+                self._expand_workspace()
+            page = snap.get("workspace_page")
+            if page is not None:
+                self._right_workspace.set_workspace_page(int(page))
+        except Exception:
+            pass
+
+    def _render_remote_live_text(self, text: str):
+        """Update (or create) the streaming assistant bubble for a remote turn."""
+        m = self._remote_mirror
+        if not m:
+            return
+        idx = m.get("live_idx")
+        if idx is None or idx >= len(self._message_meta):
+            self._add_message(AGENT_LABEL, text)
+            m["live_idx"] = len(self._message_meta) - 1
+        else:
+            meta = self._message_meta[idx]
+            meta["content"] = text
+            meta["_html"] = markdown2.markdown(
+                text, extras=["fenced-code-blocks", "tables", "code-friendly"])
+            meta.pop("_html_theme_key", None)
+            w = self._idx_to_widget.get(idx)
+            if isinstance(w, ChatMessageWidget):
+                w.update_content(text, meta["_html"])
+            if self._pinned_to_bottom:
+                QTimer.singleShot(0, lambda: self._scroll_to_bottom(force=True))
+
+    def _finalize_remote_text(self, text: str, tool_names: list):
+        m = self._remote_mirror
+        if not m:
+            return
+        idx = m.get("live_idx")
+        html = markdown2.markdown(
+            text, extras=["fenced-code-blocks", "tables", "code-friendly"])
+        if idx is not None and idx < len(self._message_meta):
+            meta = self._message_meta[idx]
+            meta["content"] = text
+            meta["tool_names"] = tool_names or []
+            meta["_html"] = html
+            meta.pop("_html_theme_key", None)
+            self._clear_message_widgets()
+            self._recalc_and_sync(immediate=True)
+        else:
+            self._add_message(AGENT_LABEL, text, tool_names=tool_names,
+                              precomputed_assistant_html=html)
+        try:
+            from core.sounds import play_ui
+            play_ui("message.mp3")
+        except Exception:
+            pass
+        QTimer.singleShot(50, self._scroll_to_bottom)
+
     # ── Tool-audit alert ──────────────────────────────────────────────
 
     def _on_audit_triggered(self, tool: str, conv_id: str):
@@ -7594,8 +8949,9 @@ class ChatWindow(QWidget):
         app_focused = win.isActiveWindow() if win else False
         viewing_source = (source_conv_id == self._current_conv_id) if source_conv_id else True
 
-        # 1) OS taskbar flash — only if app is NOT focused
-        if not app_focused and hasattr(win, 'winId'):
+        # 1) OS taskbar flash — only if app is NOT focused and the user is
+        # actually present (flashing dismisses a running screensaver).
+        if not app_focused and hasattr(win, 'winId') and not _user_is_away():
             try:
                 hwnd = int(win.winId())
 
@@ -7922,6 +9278,11 @@ class ChatWindow(QWidget):
                 on_accept()
 
         def _on_finished(_result):
+            try:
+                from ui.dialog_geometry import save_geometry
+                save_geometry("settings", dlg)
+            except Exception:
+                pass
             self._settings_dlg = None
 
         dlg.accepted.connect(_on_accepted)
@@ -7978,11 +9339,44 @@ class ChatWindow(QWidget):
             # new chrome is already visible, and the transcript recolors the
             # instant the turn ends.
             if self._thread is not None:
+                # Can't tear down/rebuild mid-stream (collides with the flush
+                # timer), but we CAN recolor the already-rendered widgets in
+                # place so the visible transcript repaints in the new palette
+                # immediately instead of staying the old color until the turn
+                # ends. A full rebuild still runs in _finish_inference.
                 self._theme_rebuild_deferred = True
+                self._recolor_transcript_in_place()
                 return
             self._rebuild_transcript_for_theme()
         finally:
             self._theme_applying = False
+
+    def _recolor_transcript_in_place(self) -> None:
+        """Repaint every already-rendered transcript widget with the current
+        palette WITHOUT removing/recreating it — safe during a streaming turn
+        (never touches _idx_to_widget membership or the layout, so it can't
+        collide with the live-stream flush timer). The actively-streaming bubble
+        is skipped; it repaints itself on its next flush."""
+        self._invalidate_message_html_cache()
+        live_idx = getattr(self, "_stream_live_meta_idx", None)
+        n = len(self._message_meta)
+        for idx, w in list(self._idx_to_widget.items()):
+            if idx == live_idx:
+                continue
+            try:
+                if isinstance(w, ChatMessageWidget):
+                    # Inline-timeline bodies bake palette colors into cached HTML,
+                    # so refresh that body from meta before re-wrapping. Plain
+                    # markdown bodies carry no color (the wrapper supplies it).
+                    if 0 <= idx < n and self._has_inline_timeline(self._message_meta[idx]):
+                        w._cached_html = self._ensure_meta_html(self._message_meta[idx])
+                    w.recolor_in_place()
+                    continue
+                recolor = getattr(w, "recolor_in_place", None)
+                if callable(recolor):
+                    recolor()
+            except RuntimeError:
+                pass  # C++ object already deleted
 
     def _rebuild_transcript_for_theme(self):
         """Repaint the visible transcript with the current palette, in batches.
@@ -8058,7 +9452,7 @@ class ChatWindow(QWidget):
             html = self._ensure_meta_html(meta)
             w = self._obtain_message_widget(
                 sender=sender,
-                content=meta.get("content", ""),
+                content=(meta.get("_typed", "") if meta.get("_pastes") else meta.get("content", "")),
                 tool_names=meta.get("tool_names"),
                 image_path=meta.get("_thumb") or meta.get("image_path") or None,
                 cached_html=html,
@@ -8068,7 +9462,9 @@ class ChatWindow(QWidget):
                 show_usage=self.agent.config.get("show_usage", False),
                 show_tool_chips=self.agent.config.get("show_tools_called", True),
                 chat_mode=self.agent.config.get("chat_mode", "fancy"),
+                continuation=not _show_sender_nametag(self._message_meta, i),
                 inline_timeline=self._has_inline_timeline(meta),
+                pastes=meta.get("_pastes"),
             )
             if vp_w > 0:
                 w.apply_wrap_width(max(50, vp_w - 12))

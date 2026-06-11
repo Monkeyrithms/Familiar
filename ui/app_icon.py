@@ -70,42 +70,90 @@ def _draw_sparkle(
     painter.restore()
 
 
-def build_app_icon(accent: str, hot: str | None = None) -> QIcon:
-    """Build a multi-size QIcon from theme accent colors."""
+def _build_pixmap(dim: int, accent_c: QColor, hot_c: QColor) -> QPixmap:
+    pm = QPixmap(dim, dim)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    scale = dim / 256.0
+    for cx, cy, radius, alpha in _SPARKLES:
+        ox = _DESIGN_CENTER + (cx - _DESIGN_CENTER) * _CLUSTER_POS_SCALE
+        oy = _DESIGN_CENTER + (cy - _DESIGN_CENTER) * _CLUSTER_POS_SCALE
+        big_r = radius * _CLUSTER_SIZE_SCALE
+        if dim <= 24 and big_r < 24:
+            continue
+        if dim <= 16 and big_r < 40:
+            continue
+        _draw_sparkle(painter, ox * scale, oy * scale, big_r * scale,
+                      accent_c, hot_c, alpha)
+    painter.end()
+    return pm
+
+
+def _accent_colors(accent: str, hot: str | None):
     accent_c = QColor(accent)
     if not accent_c.isValid():
         accent_c = QColor("#4ECDC4")
     hot_c = QColor(hot) if hot else accent_c.lighter(135)
+    return accent_c, hot_c
 
+
+def build_app_icon(accent: str, hot: str | None = None) -> QIcon:
+    """Build a multi-size QIcon from theme accent colors."""
+    accent_c, hot_c = _accent_colors(accent, hot)
     icon = QIcon()
     for dim in _ICON_SIZES:
-        pm = QPixmap(dim, dim)
-        pm.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pm)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        scale = dim / 256.0
-
-        for cx, cy, radius, alpha in _SPARKLES:
-            ox = _DESIGN_CENTER + (cx - _DESIGN_CENTER) * _CLUSTER_POS_SCALE
-            oy = _DESIGN_CENTER + (cy - _DESIGN_CENTER) * _CLUSTER_POS_SCALE
-            big_r = radius * _CLUSTER_SIZE_SCALE
-            if dim <= 24 and big_r < 24:
-                continue
-            if dim <= 16 and big_r < 40:
-                continue
-            _draw_sparkle(
-                painter,
-                ox * scale,
-                oy * scale,
-                big_r * scale,
-                accent_c,
-                hot_c,
-                alpha,
-            )
-
-        painter.end()
-        icon.addPixmap(pm)
+        icon.addPixmap(_build_pixmap(dim, accent_c, hot_c))
     return icon
+
+
+def write_app_ico(path, accent: str | None = None, hot: str | None = None) -> bool:
+    """Write a multi-size .ico (accent-colored sparkle) for the launcher
+    shortcut, so the Explorer/pinned icon matches the live app. PNG-compressed
+    ICO entries (Vista+). Best-effort and atomic — never corrupts an existing
+    icon on failure."""
+    import os
+    import struct
+    from pathlib import Path
+    from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
+    from ui.theme import PALETTE
+    a = accent or PALETTE.get("accent", "#4ECDC4")
+    h = hot or PALETTE.get("glow_hot") or PALETTE.get("accent_bright")
+    accent_c, hot_c = _accent_colors(a, h)
+
+    pngs: list[tuple[int, bytes]] = []
+    for dim in _ICON_SIZES:
+        pm = _build_pixmap(dim, accent_c, hot_c)
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        ok = pm.save(buf, "PNG")
+        buf.close()
+        if ok and ba.size() > 0:
+            pngs.append((dim, bytes(ba.data())))
+    if not pngs:
+        return False
+
+    header = struct.pack("<HHH", 0, 1, len(pngs))   # reserved, type=icon, count
+    offset = 6 + len(pngs) * 16
+    entries = b""
+    images = b""
+    for dim, png in pngs:
+        bw = 0 if dim >= 256 else dim     # 0 means 256 in the ICO directory
+        bh = 0 if dim >= 256 else dim
+        entries += struct.pack("<BBBBHHII", bw, bh, 0, 0, 1, 32, len(png), offset)
+        images += png
+        offset += len(png)
+    blob = header + entries + images
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".ico.tmp")
+        tmp.write_bytes(blob)
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
 
 
 def apply_app_icon(window=None) -> QIcon:

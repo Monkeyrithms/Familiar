@@ -67,14 +67,25 @@ class _ToolNameItem(QTableWidgetItem):
 
 class SettingsDialog(GlassDialog):
     def __init__(self, agent: Agent, parent=None):
-        super().__init__(title="Settings", parent=parent, width=680, height=720)
+        super().__init__(
+            title="Settings", parent=parent, width=680, height=720,
+            geometry_key="settings",
+        )
         # Non-modal: GlassDialog defaults to modal, but Settings is opened with
         # show() (not exec()) so the main window's title-bar controls
         # (always-on-top, screenshot) and chat stay usable while it's open.
         self.setModal(False)
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.agent = agent
+        self._dirty = False
         self._build_ui()
+        self._wire_dirty_tracking()
+        # Authoritative change detection: snapshot every input's value now, and
+        # on cancel compare against it. A bare _dirty flag was tripped by things
+        # that aren't edits — switching tabs, or browsing the notes/workspace/
+        # stream sub-editors (which populate line-edits via signals) — so Cancel
+        # nagged even when nothing was actually changed.
+        self._initial_signature = self._settings_signature()
 
     def _build_ui(self):
         layout = self.content_layout()
@@ -97,11 +108,235 @@ class SettingsDialog(GlassDialog):
         save_btn.clicked.connect(self._save_and_close)
         btn_row.addWidget(save_btn)
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
+        cancel_btn.clicked.connect(self._cancel_clicked)
         btn_row.addWidget(cancel_btn)
         layout.addLayout(btn_row)
 
         self.tabs = tabs
+        self._apply_default_styles()
+
+    def _apply_default_styles(self) -> None:
+        """Apply consistent dark-theme styling to all input widgets in Settings."""
+        p = PALETTE
+        
+        # QSpinBox (Chat Font Size, Display Char Limit, CRT Speed, Tool Audit Threshold, etc.)
+        spinbox_style = f"""
+            QSpinBox {{
+                background-color: {p['panel_alt']};
+                color: {p['text']};
+                border: 1px solid {p['border']};
+                border-radius: 3px;
+                padding: 2px 4px;
+                font-size: 9pt;
+            }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                background-color: {p['panel']};
+                border: none;
+                width: 16px;
+                padding: 0;
+            }}
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+                background-color: {p['accent_muted']};
+            }}
+        """
+        
+        # QComboBox (Chat Role Contrast, Stream Display, Chat Output Mode, Workspace Side, etc.)
+        combo_style = f"""
+            QComboBox {{
+                background-color: {p['panel_alt']};
+                color: {p['text']};
+                border: 1px solid {p['border']};
+                border-radius: 3px;
+                padding: 3px 6px;
+                font-size: 9pt;
+            }}
+            QComboBox::drop-down {{
+                background-color: {p['panel']};
+                border-left: 1px solid {p['border']};
+                width: 20px;
+            }}
+            QComboBox:hover {{
+                border-color: {p['accent_muted']};
+            }}
+            QComboBox QListView {{
+                background-color: {p['panel']};
+                color: {p['text']};
+                border: 1px solid {p['border']};
+                padding: 2px;
+            }}
+            QComboBox QListView::item {{
+                padding: 3px 6px;
+            }}
+            QComboBox QListView::item:selected {{
+                background-color: {p['accent_muted']};
+            }}
+        """
+        
+        # QLineEdit (Color hex, Model, Temperature, API keys, etc.)
+        lineedit_style = f"""
+            QLineEdit {{
+                background-color: {p['panel_alt']};
+                color: {p['text']};
+                border: 1px solid {p['border']};
+                border-radius: 3px;
+                padding: 3px 6px;
+                font-size: 9pt;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {p['accent']};
+            }}
+        """
+        
+        # QTextEdit & QPlainTextEdit (System Prompt, Code snippets, etc.)
+        textedit_style = f"""
+            QTextEdit, QPlainTextEdit {{
+                background-color: {p['panel_alt']};
+                color: {p['text']};
+                border: 1px solid {p['border']};
+                border-radius: 3px;
+                padding: 4px;
+                font-size: 9pt;
+            }}
+            QTextEdit:focus, QPlainTextEdit:focus {{
+                border: 1px solid {p['accent']};
+            }}
+        """
+        
+        # QCheckBox (Animate Ellipsis, Show Tools Called, Show Timestamps, etc.)
+        checkbox_style = f"""
+            QCheckBox {{
+                color: {p['text']};
+                spacing: 6px;
+            }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid {p['border']};
+                border-radius: 2px;
+                background-color: {p['panel_alt']};
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: {p['accent']};
+                background-color: {p['panel']};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {p['accent']};
+                border-color: {p['accent']};
+            }}
+        """
+        
+        # QSlider (Brightness, TTS Speed, CRT Speed, etc.)
+        slider_style = f"""
+            QSlider::groove:horizontal {{
+                background-color: {p['panel_alt']};
+                height: 6px;
+                border: 1px solid {p['border']};
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background-color: {p['accent_muted']};
+                width: 12px;
+                margin: -3px 0;
+                border: 1px solid {p['border']};
+                border-radius: 6px;
+            }}
+            QSlider::handle:horizontal:hover {{
+                background-color: {p['accent']};
+            }}
+        """
+        
+        # Apply to all instances
+        for widget in self.findChildren(QSpinBox):
+            widget.setStyleSheet(spinbox_style)
+        for widget in self.findChildren(QComboBox):
+            widget.setStyleSheet(combo_style)
+        for widget in self.findChildren(QLineEdit):
+            widget.setStyleSheet(lineedit_style)
+        for widget in self.findChildren(QTextEdit):
+            widget.setStyleSheet(textedit_style)
+        for widget in self.findChildren(QPlainTextEdit):
+            widget.setStyleSheet(textedit_style)
+        for widget in self.findChildren(QCheckBox):
+            widget.setStyleSheet(checkbox_style)
+        for widget in self.findChildren(QSlider):
+            widget.setStyleSheet(slider_style)
+    def _mark_dirty(self, *_args) -> None:
+        self._dirty = True
+
+    def _wire_dirty_tracking(self) -> None:
+        # NOTE: kept as a coarse hint only. The discard prompt is gated on an
+        # actual value comparison (_settings_signature), so a stray signal here
+        # — or a tab switch — never falsely nags. Tab changes are deliberately
+        # NOT tracked (navigation isn't an edit).
+        for w in self.findChildren(QLineEdit):
+            w.textChanged.connect(self._mark_dirty)
+        for w in self.findChildren(QTextEdit):
+            w.textChanged.connect(self._mark_dirty)
+        for w in self.findChildren(QPlainTextEdit):
+            w.textChanged.connect(self._mark_dirty)
+        for w in self.findChildren(QComboBox):
+            w.currentIndexChanged.connect(self._mark_dirty)
+        for w in self.findChildren(QCheckBox):
+            w.toggled.connect(self._mark_dirty)
+        for w in self.findChildren(QSpinBox):
+            w.valueChanged.connect(self._mark_dirty)
+        for w in self.findChildren(QSlider):
+            w.valueChanged.connect(self._mark_dirty)
+
+    def _settings_signature(self) -> tuple:
+        """An order-independent snapshot of every input's value. Two equal
+        signatures mean nothing the user can edit has actually changed.
+
+        Compared as a SORTED multiset because Qt's findChildren() returns
+        widgets in an unstable order across calls (showing a tab relays its
+        children), which made a positional snapshot report phantom changes. A
+        sorted multiset is invariant to that reordering yet still flips the
+        moment any single value differs. Each entry is (tag, value) as STRINGS
+        so the mixed value types sort cleanly."""
+        sig: list = []
+        for w in self.findChildren(QLineEdit):
+            sig.append(("le", w.text()))
+        for w in self.findChildren(QTextEdit):
+            sig.append(("te", w.toPlainText()))
+        for w in self.findChildren(QPlainTextEdit):
+            sig.append(("pte", w.toPlainText()))
+        for w in self.findChildren(QComboBox):
+            sig.append(("cb", str(w.currentIndex())))
+        for w in self.findChildren(QCheckBox):
+            sig.append(("ck", str(w.isChecked())))
+        for w in self.findChildren(QSpinBox):
+            sig.append(("sp", str(w.value())))
+        for w in self.findChildren(QSlider):
+            sig.append(("sl", str(w.value())))
+        return tuple(sorted(sig))
+
+    def _cancel_clicked(self) -> None:
+        self.reject()
+
+    def _confirm_discard(self) -> bool:
+        # Only prompt when an input's value genuinely differs from when the
+        # dialog opened — not merely because some signal flipped _dirty.
+        if self._settings_signature() == getattr(self, "_initial_signature", None):
+            return True
+        return GlassDialog.confirm(
+            self,
+            "Discard changes?",
+            "Settings have unsaved changes. Close without saving?",
+        )
+
+    def reject(self) -> None:
+        if not self._confirm_discard():
+            return
+        self._persist_geometry()
+        self._dirty = False
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self._dirty and not self._confirm_discard():
+            event.ignore()
+            return
+        self._dirty = False
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # UI tab
@@ -185,6 +420,20 @@ class SettingsDialog(GlassDialog):
         self._font_size_spin.setValue(cfg.get("chat_font_size", 10))
         self._font_size_spin.setSuffix(" pt")
         layout.addRow(QLabel("Chat Font Size"), self._font_size_spin)
+
+        from ui.theme import CHAT_CONTRAST_AGENT_BRIGHT, CHAT_CONTRAST_USER_BRIGHT
+        self._chat_role_contrast_combo = QComboBox()
+        self._chat_role_contrast_combo.addItem(
+            "User bright / Agent dim (default)", CHAT_CONTRAST_USER_BRIGHT)
+        self._chat_role_contrast_combo.addItem(
+            "Agent bright / User dim", CHAT_CONTRAST_AGENT_BRIGHT)
+        contrast = cfg.get("chat_role_contrast", CHAT_CONTRAST_USER_BRIGHT)
+        self._chat_role_contrast_combo.setCurrentIndex(
+            0 if contrast != CHAT_CONTRAST_AGENT_BRIGHT else 1)
+        self._chat_role_contrast_combo.setToolTip(
+            "Alternating brightness between your messages and the agent's "
+            "replies in the chat transcript.")
+        layout.addRow(QLabel("Chat Role Contrast"), self._chat_role_contrast_combo)
 
         # Display char limit (controls how many messages render at once)
         self._char_limit_spin = QSpinBox()
@@ -856,6 +1105,7 @@ class SettingsDialog(GlassDialog):
         self._ws_data[name] = {"path": to_config_workspace_path(folder), "venv": ""}
         self._active_ws = name
         self._refresh_ws_list()
+        self._mark_dirty()
 
     def _create_new_folder(self):
         parent = QFileDialog.getExistingDirectory(self, "Choose Parent Directory")
@@ -867,6 +1117,7 @@ class SettingsDialog(GlassDialog):
         self._ws_data[name] = {"path": to_config_workspace_path(full_path), "venv": ""}
         self._active_ws = name
         self._refresh_ws_list()
+        self._mark_dirty()
 
     def _create_folder_with_venv(self):
         parent = QFileDialog.getExistingDirectory(self, "Choose Parent Directory")
@@ -885,6 +1136,7 @@ class SettingsDialog(GlassDialog):
         }
         self._active_ws = name
         self._refresh_ws_list()
+        self._mark_dirty()
 
     def _remove_workspace(self):
         row = self._ws_list.currentRow()
@@ -896,6 +1148,7 @@ class SettingsDialog(GlassDialog):
         if self._active_ws == name:
             self._active_ws = next(iter(self._ws_data), "")
         self._refresh_ws_list()
+        self._mark_dirty()
 
     def _browse_ws_path(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
@@ -2427,8 +2680,10 @@ class SettingsDialog(GlassDialog):
             # Direct chat-completion users
             "vision":        ("vision_model", "vision_provider", "", "llm"),
             "subagent":      ("subagent_model", "subagent_provider", "", "llm"),
+            # Read-only in the table — edited via Models → Explore Model (avoids
+            # a second QLineEdit that overwrote the saved value on dialog close).
             "explore_files": ("subagent_explore_model", "subagent_explore_provider",
-                              "claude-haiku-4-5", "llm"),
+                              "claude-haiku-4-5", "shared"),
             "memory":        ("memory_model", "memory_provider", "", "llm"),
             # Embeddings (no provider — auto-routed to OpenRouter or OpenAI by core/embeddings.py)
             "vector_search": ("embedding_model", None, "openai/text-embedding-3-small", "embedding"),
@@ -2437,6 +2692,7 @@ class SettingsDialog(GlassDialog):
             "ocr":           ("vision_model", "vision_provider", "", "shared"),
         }
         cfg = load_config()
+        disabled_set = set(cfg.get("disabled_tools", []))
 
         # Header row
         header_row = QHBoxLayout()
@@ -2455,7 +2711,7 @@ class SettingsDialog(GlassDialog):
         header_row.addWidget(reset_btn)
         layout.addLayout(header_row)
 
-        cols = ["Tool", "Calls", "Tokens In", "Tokens Out", "Errors", "Model", "Provider"]
+        cols = ["Tool", "Calls", "Tokens In", "Tokens Out", "Errors", "Model", "Provider", "On"]
         table = QTableWidget(len(tools) if tools else 1, len(cols))
         table.setHorizontalHeaderLabels(cols)
         table.setFont(QFont("Consolas", 9))
@@ -2491,10 +2747,13 @@ class SettingsDialog(GlassDialog):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
 
         # Track edit widgets so _save_and_close can persist any changes
         self._tool_model_edits: dict[str, QLineEdit] = {}
         self._tool_provider_combos: dict[str, QComboBox] = {}
+        # name -> QCheckBox for the per-tool enable toggle ("On" column).
+        self._tool_enable_checks: dict[str, QCheckBox] = {}
 
         if not tools:
             table.setItem(0, 0, QTableWidgetItem("No tools registered yet."))
@@ -2512,6 +2771,26 @@ class SettingsDialog(GlassDialog):
                 table.setItem(row, 2, _NumItem(s.get("tokens_in", 0)))
                 table.setItem(row, 3, _NumItem(s.get("tokens_out", 0)))
                 table.setItem(row, 4, _NumItem(s.get("errors", 0)))
+
+                # "On" column — per-tool enable toggle. ALWAYS_ON tools are
+                # shown checked + disabled so the agent can't be bricked.
+                from tools.registry import ALWAYS_ON
+                chk = QCheckBox()
+                chk.setChecked(name not in disabled_set)
+                if name in ALWAYS_ON:
+                    chk.setChecked(True)
+                    chk.setEnabled(False)
+                    chk.setToolTip("Core tool — always on.")
+                else:
+                    chk.setToolTip("Uncheck to hide this tool from the model "
+                                   "(saves schema tokens).")
+                cell = QWidget()
+                cell_lay = QHBoxLayout(cell)
+                cell_lay.setContentsMargins(0, 0, 0, 0)
+                cell_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell_lay.addWidget(chk)
+                table.setCellWidget(row, 7, cell)
+                self._tool_enable_checks[name] = chk
 
                 # Model + Provider — depends on the tool's kind
                 cfg_entry = self._tool_llm_config_map.get(name)
@@ -2806,6 +3085,10 @@ class SettingsDialog(GlassDialog):
         self._net_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self._net_secret_edit.setPlaceholderText("Shared secret — must match on every peer")
         form.addRow(QLabel("Shared secret"), self._net_secret_edit)
+        self._net_autorespond_check = QCheckBox(
+            "Auto-respond — let this Familiar's agent answer inbound peer messages")
+        self._net_autorespond_check.setChecked(bool(net.get("auto_respond", False)))
+        form.addRow(self._net_autorespond_check)
         outer.addLayout(form)
 
         # ── Inbound ──
@@ -2834,6 +3117,21 @@ class SettingsDialog(GlassDialog):
         in_form.addRow("", cf_row)
         self._cf_worker = None
         self._refresh_cf_status()
+
+        # Use an EXISTING tunnel (ngrok / named tunnel / reverse proxy) instead of
+        # cloudflared: paste its https URL here, or click Detect ngrok. When set,
+        # this overrides the auto-tunnel above.
+        ov_row = QHBoxLayout()
+        self._net_override_edit = QLineEdit(net.get("public_url_override", ""))
+        self._net_override_edit.setPlaceholderText(
+            "https://your-tunnel…  (any service: ngrok, named tunnel, proxy. "
+            "Blank = use cloudflared)")
+        ov_row.addWidget(self._net_override_edit, 1)
+        self._net_detect_ngrok_btn = QPushButton("Detect ngrok")
+        self._net_detect_ngrok_btn.clicked.connect(self._net_detect_ngrok_clicked)
+        ov_row.addWidget(self._net_detect_ngrok_btn)
+        in_form.addRow(QLabel("Use existing tunnel"), ov_row)
+
         self._net_public_edit = QLineEdit(net.get("public_url", ""))
         self._net_public_edit.setReadOnly(True)
         self._net_public_edit.setPlaceholderText("(populated once networking starts)")
@@ -2846,8 +3144,11 @@ class SettingsDialog(GlassDialog):
         self._net_start_btn.clicked.connect(self._net_start_clicked)
         self._net_stop_btn = QPushButton("Stop")
         self._net_stop_btn.clicked.connect(self._net_stop_clicked)
+        self._net_check_btn = QPushButton("Check peers")
+        self._net_check_btn.clicked.connect(self._net_check_peers_clicked)
         ctl.addWidget(self._net_start_btn)
         ctl.addWidget(self._net_stop_btn)
+        ctl.addWidget(self._net_check_btn)
         ctl.addStretch(1)
         self._net_status = QLabel("")
         self._net_status.setStyleSheet(f"color:{PALETTE['muted_text']};")
@@ -2905,9 +3206,12 @@ class SettingsDialog(GlassDialog):
         outer.addWidget(peers_box)
 
         note = QLabel(
-            "Only peers in this list are contacted and accepted. The shared secret "
-            "authenticates every message (HMAC). Whether a memory stream syncs over "
-            "the network is set per-stream in the Memory dialog.")
+            "The shared secret authenticates every message (HMAC, 30s replay window) — "
+            "it is the gate for inbound traffic; keep it strong and private. The peers "
+            "list is the outbound address book: it's who 'Check peers', broadcasts, and "
+            "the agent's peer_network tool talk to. Inbound messages appear in a "
+            "“Network: <node>” conversation; enable Auto-respond above to let "
+            "the agent answer them (and reply to the sender) automatically.")
         note.setWordWrap(True)
         note.setStyleSheet(f"color:{PALETTE['muted_text']}; font-size:8pt;")
         outer.addWidget(note)
@@ -2924,9 +3228,11 @@ class SettingsDialog(GlassDialog):
             "enabled": self._net_enabled_check.isChecked(),
             "node_name": self._net_name_edit.text().strip(),
             "secret": self._net_secret_edit.text(),
+            "auto_respond": self._net_autorespond_check.isChecked(),
             "inbound_enabled": self._net_inbound_check.isChecked(),
             "port": self._net_port_spin.value(),
             "auto_tunnel": self._net_tunnel_check.isChecked(),
+            "public_url_override": self._net_override_edit.text().strip(),
             "peers": peers,
         }}
 
@@ -2998,6 +3304,112 @@ class SettingsDialog(GlassDialog):
         network_manager.stop()
         self._net_public_edit.setText("")
         self._net_status.setText("stopped")
+
+    def _net_check_peers_clicked(self):
+        """Probe each peer off-thread on BOTH levels: an unauthenticated /ping
+        (reachable?) AND a signed /conv/list (does the shared secret match and
+        are clocks in sync?). Reporting only reachability hid secret/clock
+        mismatches — the actual cause of 'reachable but nothing syncs'."""
+        import threading
+        from PyQt6.QtCore import QTimer
+        cfg = self._gather_network_cfg()["network"]
+        peers = cfg["peers"]
+        secret = cfg["secret"]
+        node = cfg["node_name"] or "familiar"
+        if not peers:
+            self._net_status.setText("no peers configured")
+            return
+        self._net_check_btn.setEnabled(False)
+        self._net_status.setText("checking peers…")
+        self._net_peer_check_result = None
+
+        def _probe():
+            import json as _json, time as _time, urllib.request, urllib.error
+            from core.network import sign
+            total = len(peers)
+            reachable = authed = 0
+            for p in peers:
+                url = p["url"].rstrip("/")
+                try:
+                    with urllib.request.urlopen(url + "/ping", timeout=4) as r:
+                        if r.status == 200:
+                            reachable += 1
+                except Exception:
+                    continue  # unreachable → can't be authed either
+                # Signed probe of an authenticated endpoint.
+                try:
+                    body = _json.dumps({"from": node, "sent_at": _time.time()}).encode()
+                    ts = str(_time.time())
+                    req = urllib.request.Request(
+                        url + "/conv/list", data=body, method="POST",
+                        headers={"Content-Type": "application/json", "X-Timestamp": ts,
+                                 "X-Signature": sign(secret, body, ts)})
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        if r.status == 200:
+                            authed += 1
+                except Exception:
+                    pass
+            self._net_peer_check_result = (reachable, authed, total)
+
+        threading.Thread(target=_probe, daemon=True, name="net-peer-check").start()
+
+        def _poll():
+            res = getattr(self, "_net_peer_check_result", None)
+            if res is None:
+                QTimer.singleShot(200, _poll)
+                return
+            self._net_check_btn.setEnabled(True)
+            reachable, authed, total = res
+            if authed == total:
+                msg = f"✓ {authed}/{total} connected & authenticated"
+            elif reachable and not authed:
+                msg = (f"reachable {reachable}/{total} but AUTH FAILED — shared "
+                       f"secret must match exactly on both machines, and clocks "
+                       f"within 30s")
+            elif reachable:
+                msg = f"reachable {reachable}/{total}, authenticated {authed}/{total}"
+            else:
+                msg = f"unreachable 0/{total} — check the peer URL / tunnel"
+            self._net_status.setText(msg)
+        QTimer.singleShot(200, _poll)
+
+    def _net_detect_ngrok_clicked(self):
+        """Read the local ngrok API and fill in its https tunnel as our public
+        address. If ngrok forwards to a different local port than the inbound
+        server, sync the port spin so they match (ngrok must point at Familiar)."""
+        import threading
+        from PyQt6.QtCore import QTimer
+        from core.network import detect_ngrok
+        want_port = self._net_port_spin.value()
+        self._net_detect_ngrok_btn.setEnabled(False)
+        self._net_status.setText("detecting ngrok…")
+        self._net_ngrok_result = None
+
+        def _probe():
+            self._net_ngrok_result = detect_ngrok(prefer_port=want_port)
+
+        threading.Thread(target=_probe, daemon=True, name="ngrok-detect").start()
+
+        def _poll():
+            res = getattr(self, "_net_ngrok_result", None)
+            if res is None:
+                QTimer.singleShot(200, _poll)
+                return
+            self._net_detect_ngrok_btn.setEnabled(True)
+            url, local_port = res
+            if not url:
+                self._net_status.setText(
+                    "no ngrok tunnel found — is ngrok running? (ngrok http "
+                    f"{want_port})")
+                return
+            self._net_override_edit.setText(url)
+            if local_port and local_port != want_port:
+                self._net_port_spin.setValue(local_port)
+                self._net_status.setText(
+                    f"found ngrok → {url}  (port set to {local_port} to match)")
+            else:
+                self._net_status.setText(f"found ngrok → {url}")
+        QTimer.singleShot(200, _poll)
 
     def _save_and_close(self):
         # Save keys
@@ -3096,7 +3508,10 @@ class SettingsDialog(GlassDialog):
             save_keys(keys)
         except Exception:
             pass
+        from ui.theme import CHAT_CONTRAST_USER_BRIGHT as _CHAT_USER_BRIGHT
         cfg["chat_font_size"] = self._font_size_spin.value()
+        cfg["chat_role_contrast"] = (
+            self._chat_role_contrast_combo.currentData() or _CHAT_USER_BRIGHT)
         cfg["display_char_limit"] = self._char_limit_spin.value()
 
         # Memory settings are now in the Memory dialog — not touched here
@@ -3153,14 +3568,6 @@ class SettingsDialog(GlassDialog):
         cfg["vision_provider"] = self._vision_provider_combo.currentData() or "openrouter"
         cfg["vision_model"] = self._vision_model_edit.text().strip()
 
-        # Explore-files model (cheap parallel summarizer)
-        cfg["subagent_explore_provider"] = (
-            self._explore_provider_combo.currentData() or "anthropic"
-        )
-        cfg["subagent_explore_model"] = (
-            self._explore_model_edit.text().strip() or "claude-haiku-4-5"
-        )
-
         # Per-tool model/provider overrides edited inline in the Tools tab.
         # These mirror the canonical config keys (vision_*, subagent_*,
         # memory_*, embedding_model, etc.) so other code paths pick them up
@@ -3184,6 +3591,27 @@ class SettingsDialog(GlassDialog):
             _mkey, pkey, _default, _kind = entry
             if pkey:
                 cfg[pkey] = combo.currentData() or self.agent.provider
+
+        # Per-tool enable toggles ("On" column). Persist the disabled set and
+        # sync the live registry so the change takes effect without a restart.
+        disabled = sorted(
+            name for name, chk in getattr(self, "_tool_enable_checks", {}).items()
+            if not chk.isChecked()
+        )
+        cfg["disabled_tools"] = disabled
+        try:
+            from tools.registry import registry as _reg
+            _reg.set_disabled(set(disabled))
+        except Exception:
+            pass
+
+        # Explore-files model — after the tool loop so nothing overwrites it.
+        cfg["subagent_explore_provider"] = (
+            self._explore_provider_combo.currentData() or "anthropic"
+        )
+        cfg["subagent_explore_model"] = (
+            self._explore_model_edit.text().strip() or "claude-haiku-4-5"
+        )
 
         # Fallback models (per-slot provider + model)
         for i, edit in enumerate(self._fallback_edits, 1):
@@ -3240,6 +3668,14 @@ class SettingsDialog(GlassDialog):
         invalidate_ui_sounds_cache()
         invalidate_settings_cache()
 
+        self._dirty = False
+        self._persist_geometry()
+        win = self.window()
+        if win is not None and hasattr(win, "_refresh_setup_banner"):
+            try:
+                win._refresh_setup_banner()
+            except Exception:
+                pass
         self.accept()
 
     # Styles are inherited from GlassDialog's container stylesheet

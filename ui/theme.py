@@ -143,6 +143,32 @@ def load_color_overrides() -> dict:
 _color, _bright = load_theme_config()
 PALETTE = build_palette(_color, _bright, load_color_overrides())
 
+# Chat transcript body contrast: which speaker gets the brighter body text.
+CHAT_CONTRAST_USER_BRIGHT = "user_bright"
+CHAT_CONTRAST_AGENT_BRIGHT = "agent_bright"
+DEFAULT_CHAT_ROLE_CONTRAST = CHAT_CONTRAST_USER_BRIGHT
+
+
+def chat_message_colors(sender: str, contrast: str | None = None,
+                        palette: dict | None = None) -> tuple[str, str]:
+    """Return (header_color, body_text_color) for a chat bubble.
+
+    contrast:
+      user_bright  — user body uses palette text, agent uses muted_text
+      agent_bright — agent body uses text, user uses muted_text (legacy default)
+    """
+    p = palette if palette is not None else PALETTE
+    if sender == "Error":
+        return p["danger"], p["danger"]
+    mode = contrast or DEFAULT_CHAT_ROLE_CONTRAST
+    header = p["glow_hot"]
+    bright, dim = p["text"], p["muted_text"]
+    if mode == CHAT_CONTRAST_AGENT_BRIGHT:
+        body = dim if sender == "You" else bright
+    else:
+        body = bright if sender == "You" else dim
+    return header, body
+
 
 def _blend(fg_hex: str, bg_hex: str, t: float) -> QColor:
     """Mix fg over bg by fraction t (0..1). A solid stand-in for a translucent

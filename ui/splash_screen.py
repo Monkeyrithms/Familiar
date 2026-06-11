@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import random
 
-from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer, QPointF
+from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer, QPointF, QRect
 from PyQt6.QtGui import (
     QFont, QPainter, QColor, QBrush, QLinearGradient, QRadialGradient, QPen,
 )
@@ -147,25 +147,44 @@ class SplashScreen(QWidget):
         lay.addWidget(self._status)
 
     # ── geometry ──────────────────────────────────────────────────────
+    @staticmethod
+    def _screen_for_rect(rect: QRect):
+        """Pick the monitor that last held the main window (not primaryScreen)."""
+        try:
+            scr = QApplication.screenAt(rect.center())
+            if scr is not None:
+                return scr
+            best, best_area = None, 0
+            for scr in QApplication.screens():
+                overlap = scr.availableGeometry().intersected(rect)
+                area = overlap.width() * overlap.height()
+                if area > best_area:
+                    best_area = area
+                    best = scr
+            if best is not None:
+                return best
+        except Exception:
+            pass
+        return QApplication.primaryScreen()
+
     def _match_window_geometry(self) -> None:
         """Size + position the splash to match the last-known main-window
         geometry (data/window_state.json). Falls back to a small centered
         plaque if state is missing, off-screen, or unreadable."""
         from pathlib import Path
         import json
-        from PyQt6.QtCore import QRect
         try:
             state_path = Path(__file__).resolve().parent.parent / "data" / "window_state.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            if state.get("maximized"):
-                scr = QApplication.primaryScreen()
-                if scr is not None:
-                    self.setGeometry(scr.availableGeometry())
-                    return
             rect = QRect(
                 int(state.get("x", 100)), int(state.get("y", 100)),
                 int(state.get("w", self._W)), int(state.get("h", self._H)),
             )
+            if state.get("maximized"):
+                scr = self._screen_for_rect(rect)
+                if scr is not None:
+                    self.setGeometry(scr.availableGeometry())
+                    return
             if rect.width() >= 200 and rect.height() >= 150 and self._on_any_screen(rect):
                 self.setGeometry(rect)
                 return

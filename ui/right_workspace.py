@@ -1061,11 +1061,18 @@ class RightWorkspacePanel(QFrame):
             _w.setMinimumWidth(0)
             _w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
 
-        self._stack.addWidget(self.notes_panel)
-        self._stack.addWidget(self.calendar_panel)
-        self._stack.addWidget(self.browser_panel)
-        self._stack.addWidget(self.file_viewer)
-        self._stack.addWidget(self.terminal_panel)
+        self._stack.addWidget(self.notes_panel)       # 0
+        self._stack.addWidget(self.calendar_panel)     # 1
+        self._stack.addWidget(self.browser_panel)      # 2
+        self._stack.addWidget(self.file_viewer)        # 3
+        self._stack.addWidget(self.terminal_panel)     # 4
+        # 5 — remote shell shown in place of the local terminal while mirroring.
+        from ui.remote_terminal_view import RemoteTerminalWidget
+        self.remote_terminal = RemoteTerminalWidget()
+        self.remote_terminal.setMinimumWidth(0)
+        self.remote_terminal.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self._stack.addWidget(self.remote_terminal)
+        self._remote_term_active = False
         root.addWidget(self._stack, stretch=1)
 
         self._collapse = lambda: None
@@ -1082,7 +1089,14 @@ class RightWorkspacePanel(QFrame):
     def _set_page(self, index: int, from_user: bool = False):
         p = PALETTE
         index = max(0, min(4, int(index)))
-        self._stack.setCurrentIndex(index)
+        # While mirroring, the Terminal button shows the REMOTE shell (page 5),
+        # not the local terminal — the local one runs on this machine.
+        if index == 4 and getattr(self, "_remote_term_active", False):
+            self._stack.setCurrentWidget(self.remote_terminal)
+            if from_user:
+                QTimer.singleShot(0, self.remote_terminal.focus_active_input)
+        else:
+            self._stack.setCurrentIndex(index)
         self._btn_notes.setStyleSheet(_page_toolbar_btn_stylesheet(p, index == 0))
         self._btn_calendar.setStyleSheet(_page_toolbar_btn_stylesheet(p, index == 1))
         self._btn_browser.setStyleSheet(_page_toolbar_btn_stylesheet(p, index == 2))
@@ -1102,6 +1116,36 @@ class RightWorkspacePanel(QFrame):
             QTimer.singleShot(0, self._maybe_focus_browser_url)
         elif from_user and index == 4:
             QTimer.singleShot(0, self.terminal_panel.focus_active_input)
+
+    def set_terminal_available(self, available: bool) -> None:
+        """Show/hide the Terminal tool button."""
+        try:
+            self._btn_terminal.setVisible(available)
+            if not available and self._stack.currentIndex() in (4, 5):
+                self._set_page(3)
+        except Exception:
+            pass
+
+    def enter_remote_terminal(self, peer_url: str, conv_id: str, peer_name: str) -> None:
+        """Point the Terminal tool at a live shell on the host. The button stays
+        visible and now opens the remote shell instead of the local one."""
+        try:
+            self._remote_term_active = True
+            self.remote_terminal.connect_to(peer_url, conv_id, peer_name)
+            self._btn_terminal.setVisible(True)
+            if self._stack.currentIndex() in (4, 5):
+                self._set_page(4)   # re-render as the remote page
+        except Exception as e:
+            print(f"[network] remote terminal unavailable: {e}", flush=True)
+
+    def exit_remote_terminal(self) -> None:
+        try:
+            self._remote_term_active = False
+            self.remote_terminal.disconnect_now()
+            if self._stack.currentWidget() is self.remote_terminal:
+                self._set_page(4)   # back to the local terminal
+        except Exception:
+            pass
 
     def _maybe_focus_browser_url(self):
         self.browser_panel._url_edit.setFocus()

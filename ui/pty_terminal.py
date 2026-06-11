@@ -137,6 +137,11 @@ class PtyBackend(QObject):
         self._ready = False
         self._lock = threading.Lock()
         self._pending: list[str] = []
+        # Bounded raw-output ring so a remote viewer attaching mid-session can
+        # replay recent scrollback (with ANSI intact) and see the live state —
+        # e.g. an agent already running in this shell.
+        self._raw_history = ""
+        self._raw_cap = 256 * 1024
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> bool:
@@ -227,6 +232,8 @@ class PtyBackend(QObject):
             # never write from this reader thread; it stalls pywinpty.
             if self._stop:
                 break
+            with self._lock:
+                self._raw_history = (self._raw_history + data)[-self._raw_cap:]
             try:
                 self.data_received.emit(data)
             except RuntimeError:
@@ -271,6 +278,14 @@ class PtyBackend(QObject):
             proc.setwinsize(self._rows, self._cols)
         except Exception:
             pass
+
+    def raw_history(self) -> str:
+        """Recent raw output (with ANSI) for replaying to an attaching viewer."""
+        with self._lock:
+            return self._raw_history
+
+    def dimensions(self) -> tuple[int, int]:
+        return (self._rows, self._cols)
 
     def is_alive(self) -> bool:
         proc = self._proc
@@ -348,7 +363,11 @@ class PtyTerminalView(QWidget):
         self._screen = pyte.HistoryScreen(self._cols, self._rows, history=5000, ratio=0.5)
         self._stream = pyte.Stream(self._screen)
 
-        # Selection (cell coords): (row, col) inclusive-exclusive in reading order.
+        # Selection in ABSOLUTE scrollback coords: (hist_top + row, col),
+        # inclusive in reading order. Absolute rows stay glued to their text
+        # while the view pages through history (wheel) or new output scrolls
+        # lines into history.top, so a drag can wheel past one screenful and
+        # the selection survives for copy.
         self._sel_anchor: tuple[int, int] | None = None
         self._sel_head: tuple[int, int] | None = None
 
@@ -421,8 +440,19 @@ class PtyTerminalView(QWidget):
         # next feed reports just its own delta (the set accumulates otherwise,
         # which would re-dirty the whole grid and defeat the optimization).
         try:
-            self._dirty_content_rows |= set(self._screen.dirty)
+            dirty_rows = set(self._screen.dirty)
             self._screen.dirty.clear()
+            self._dirty_content_rows |= dirty_rows
+            # Scrolling (many blank lines / prompts) moves content between rows but
+            # pyte often marks only a subset dirty — partial repaints then leave
+            # stale pixels (WA_OpaquePaintEvent) and the feed looks blank.
+            if (
+                len(dirty_rows) > 1
+                or "\n" in blob
+                or "\r" in blob
+                or len(dirty_rows) >= max(3, self._rows // 4)
+            ):
+                self._color_cache_dirty = True
         except Exception:
             self._color_cache_dirty = True  # fall back to a full rebuild
         self._schedule_paint()
@@ -646,6 +676,7 @@ class PtyTerminalView(QWidget):
         cursor_hidden = bool(getattr(self._screen.cursor, "hidden", False))
 
         sel = self._normalized_selection()
+        hist_top = self._hist_top()  # selection rows are scrollback-absolute
 
         # Restrict the cell loop to the rows/cols intersecting the damage rect.
         r = ev.rect()
@@ -671,7 +702,7 @@ class PtyTerminalView(QWidget):
                 if plain and y in themed and x in themed[y] and c.fg == "default":
                     fg = QColor(themed[y][x])
 
-                selected = sel is not None and self._cell_in_selection(y, x, sel)
+                selected = sel is not None and self._cell_in_selection(hist_top + y, x, sel)
                 if selected:
                     bg = QColor(PALETTE.get("border", "#444444"))
                     fg = QColor(PALETTE.get("text", "#ffffff"))
@@ -706,10 +737,39 @@ class PtyTerminalView(QWidget):
         p.end()
 
     # ── Selection ───────────────────────────────────────────────────
+    def _hist_top(self) -> int:
+        """Lines of scrollback above the visible grid — the absolute row of
+        visible row 0. Stable across prev_page/next_page AND as new output
+        pushes lines into history (both just move lines between the deques
+        and the grid, so absolute row == text identity)."""
+        try:
+            return len(self._screen.history.top)
+        except Exception:
+            return 0
+
     def _cell_at(self, pos) -> tuple[int, int]:
         col = max(0, min(self._cols - 1, int(pos.x() / self._cw)))
         row = max(0, min(self._rows - 1, int(pos.y() / self._ch)))
         return row, col
+
+    def _abs_cell_at(self, pos) -> tuple[int, int]:
+        """Cell under `pos` in absolute scrollback coordinates."""
+        row, col = self._cell_at(pos)
+        return self._hist_top() + row, col
+
+    def _row_cells(self, abs_row: int):
+        """Char cells for an absolute row — from history.top, the visible
+        grid, or history.bottom — or None when out of range."""
+        top = self._hist_top()
+        if abs_row < 0:
+            return None
+        if abs_row < top:
+            return self._screen.history.top[abs_row]
+        if abs_row < top + self._rows:
+            return self._screen.buffer[abs_row - top]
+        i = abs_row - top - self._rows
+        bottom = self._screen.history.bottom
+        return bottom[i] if i < len(bottom) else None
 
     def _normalized_selection(self):
         if self._sel_anchor is None or self._sel_head is None:
@@ -737,12 +797,23 @@ class PtyTerminalView(QWidget):
         if sel is None:
             return ""
         (r0, c0), (r1, c1) = sel
-        buf = self._screen.buffer
         out: list[str] = []
         for y in range(r0, r1 + 1):
+            try:
+                row = self._row_cells(y)
+            except Exception:
+                row = None
+            if row is None:
+                continue
             xs = c0 if y == r0 else 0
             xe = c1 if y == r1 else self._cols - 1
-            line = "".join(buf[y][x].data for x in range(xs, xe + 1))
+            # `x in row` guard: history lines are plain dicts keyed by column,
+            # so direct indexing of an untouched cell would raise (and indexing
+            # the live buffer's defaultdict would mutate it).
+            line = "".join(
+                (row[x].data or " ") if x in row else " "
+                for x in range(xs, xe + 1)
+            )
             out.append(line.rstrip())
         return "\n".join(out)
 
@@ -752,14 +823,14 @@ class PtyTerminalView(QWidget):
             # head stays None until the mouse actually moves. A plain click that
             # set head == anchor used to paint a single highlighted cell that
             # lingered like a stray cursor block (the "phantom").
-            self._sel_anchor = self._cell_at(ev.position())
+            self._sel_anchor = self._abs_cell_at(ev.position())
             self._sel_head = None
             self.update()
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
         if ev.buttons() & Qt.MouseButton.LeftButton and self._sel_anchor is not None:
-            self._sel_head = self._cell_at(ev.position())
+            self._sel_head = self._abs_cell_at(ev.position())
             self.update()
         super().mouseMoveEvent(ev)
 
@@ -780,8 +851,9 @@ class PtyTerminalView(QWidget):
     def _select_all(self):
         """Visually select the whole screen grid (Copy-all uses the full
         scrollback via toPlainText, so this is just the on-screen cue)."""
-        self._sel_anchor = (0, 0)
-        self._sel_head = (self._rows - 1, self._cols - 1)
+        top = self._hist_top()
+        self._sel_anchor = (top, 0)
+        self._sel_head = (top + self._rows - 1, self._cols - 1)
         self.update()
 
     # ── Right-click menu ─────────────────────────────────────────────
@@ -816,9 +888,7 @@ class PtyTerminalView(QWidget):
         elif chosen == a_sel_all:
             self._select_all()
         elif chosen == a_paste:
-            t = clip.text()
-            if t:
-                self.key_input.emit(t.replace("\r\n", "\r").replace("\n", "\r"))
+            self._paste_clipboard()
         elif chosen == a_clear:
             try:
                 self._screen.reset()
@@ -828,12 +898,39 @@ class PtyTerminalView(QWidget):
                 pass
 
     # ── Input translation ───────────────────────────────────────────
-    def _app_cursor(self) -> bool:
-        # DECCKM (private mode 1): application cursor keys → send ESC O x.
+    def _private_mode(self, mode: int) -> bool:
+        """True when a DEC private mode is set. pyte stores private modes
+        SHIFTED (``mode << 5`` — see pyte.Screen.set_mode), so the raw number
+        never appears in ``screen.mode``; check both forms to be safe across
+        pyte versions."""
         try:
-            return 1 in self._screen.mode
+            m = self._screen.mode
+            return (mode << 5) in m or mode in m
         except Exception:
             return False
+
+    def _app_cursor(self) -> bool:
+        # DECCKM (private mode 1): application cursor keys → send ESC O x.
+        # (The old check `1 in mode` never matched — pyte stores 1 << 5.)
+        return self._private_mode(1)
+
+    def _paste_clipboard(self):
+        """Paste clipboard text into the terminal — the ONE paste path.
+
+        Line endings become CR (what terminals send for Enter). When the
+        foreground app enabled BRACKETED PASTE (DECSET 2004 — Claude Code and
+        most modern TUIs do), the payload is wrapped in ESC[200~ … ESC[201~ so
+        the app receives it as a single paste block. Without the wrapper a
+        multi-line paste was delivered as line+Enter, line+Enter… which a TUI
+        treats as submit-per-line — the "paste does nothing / fires my prompt
+        line by line" bug."""
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        payload = text.replace("\r\n", "\r").replace("\n", "\r")
+        if self._private_mode(2004):
+            payload = "\x1b[200~" + payload + "\x1b[201~"
+        self.key_input.emit(payload)
 
     def keyPressEvent(self, ev: QKeyEvent):
         key = ev.key()
@@ -847,9 +944,7 @@ class PtyTerminalView(QWidget):
             self._clear_selection()
             return
         if (ctrl and key == Qt.Key.Key_V) or (shift and key == Qt.Key.Key_Insert):
-            text = QApplication.clipboard().text()
-            if text:
-                self.key_input.emit(text.replace("\r\n", "\r").replace("\n", "\r"))
+            self._paste_clipboard()
             return
         if ctrl and shift and key == Qt.Key.Key_C and self._normalized_selection() is not None:
             QApplication.clipboard().setText(self._selected_text())
@@ -952,6 +1047,14 @@ class PtyTerminalView(QWidget):
             elif steps < 0:
                 for _ in range(-steps):
                     self._screen.next_page()
+            # Wheeling mid-drag: the cursor is stationary but the text under it
+            # paged, so extend the selection to the cell now under the cursor —
+            # drag + wheel selects past one screenful instead of losing the
+            # selection (coords are scrollback-absolute, so what was already
+            # highlighted stays highlighted on its text).
+            if (ev.buttons() & Qt.MouseButton.LeftButton
+                    and self._sel_anchor is not None):
+                self._sel_head = self._abs_cell_at(ev.position())
             self._color_cache_dirty = True  # scrollback shows different content
             self.update()
         except Exception:

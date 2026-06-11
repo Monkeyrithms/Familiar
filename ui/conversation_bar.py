@@ -303,13 +303,25 @@ class ConversationBar(QWidget):
     delete_requested = pyqtSignal(str)
     order_changed = pyqtSignal(list)
     streams_changed = pyqtSignal(str, list)  # conv_id, new stream list
+    # The dropdown lists WORKSPACES; its − / + add/remove a workspace. The
+    # coordinator (ui/chat_window.py) owns the prompt/confirm + the actual
+    # create/delete; the bar just signals intent. (Chat-column add/remove is a
+    # separate −/+ pair to the right of the Conversation button.)
+    ws_new_requested = pyqtSignal()
+    ws_delete_requested = pyqtSignal()
+    ws_cleanup_requested = pyqtSignal()  # remove empty workspaces (right-click menu)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._active_id: str = ""
         self._convs: list[dict] = []          # [{id, name}] in display order
+        self._remote_groups: dict[str, list[dict]] = {}  # peer -> [{id, name}]
         self._blink_ids: set[str] = set()
         self._loading = False
+        # The conversation whose name the user is actively editing in the combo.
+        # Captured on the first keystroke so a commit (Enter/focus-out) renames
+        # THAT conversation, even if the dropdown's current item changed since.
+        self._editing_cid: str | None = None
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 2, 0, 2)
@@ -339,25 +351,33 @@ class ConversationBar(QWidget):
         self._combo.setView(_view)
         self._combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._combo.activated.connect(self._on_activated)
+        # Commit an inline rename on Enter AND on focus-out (editingFinished
+        # covers both) — typing a new name and clicking away now actually saves,
+        # instead of silently dropping the edit.
         self._combo.lineEdit().returnPressed.connect(self._rename_from_edit)
+        self._combo.lineEdit().editingFinished.connect(self._rename_from_edit)
+        self._combo.lineEdit().textEdited.connect(self._note_editing_target)
         self._combo.lineEdit().setPlaceholderText("Conversation")
         lay.addWidget(self._combo)
 
         # − delete (left) and + add (right). The glyphs are painted as vector
         # strokes (see _ConvActionButton) so they're crisp and legible. Rename
         # lives on right-click of the dropdown (see _open_context_menu).
+        # − / + next to the dropdown add/remove WORKSPACES (the dropdown lists
+        # workspaces). Chat-COLUMN add/remove lives to the right of the
+        # "Conversation" button (see ui/chat_window.py).
         self._del_btn = _ConvActionButton("minus", self)
         self._del_btn.setFixedSize(24, 24)
         self._del_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._del_btn.setToolTip("Delete this conversation")
-        self._del_btn.clicked.connect(self._delete_current)
+        self._del_btn.setToolTip("Delete this workspace")
+        self._del_btn.clicked.connect(lambda: self.ws_delete_requested.emit())
         lay.addWidget(self._del_btn)
 
         self._new_btn = _ConvActionButton("plus", self)
         self._new_btn.setFixedSize(24, 24)
         self._new_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._new_btn.setToolTip("New conversation")
-        self._new_btn.clicked.connect(lambda: self.new_requested.emit())
+        self._new_btn.setToolTip("New workspace")
+        self._new_btn.clicked.connect(lambda: self.ws_new_requested.emit())
         lay.addWidget(self._new_btn)
 
         # Right-click the dropdown → rename / streams context menu.
@@ -403,16 +423,41 @@ class ConversationBar(QWidget):
                        for c in reversed(conversations)]
         self._rebuild_items()
 
+    def set_remote_conversations(self, groups: dict):
+        """Merge peer (networked) conversations into the dropdown, grouped by
+        peer. `groups` is {peer_name: [{'id': 'remote::peer::cid', 'name': …}]}.
+        Selecting one opens a live mirror (see ChatWindow._enter_remote_mirror)."""
+        self._remote_groups = dict(groups or {})
+        self._rebuild_items()
+
     def _rebuild_items(self):
         self._loading = True
         self._combo.clear()
         active_idx = 0
-        for i, c in enumerate(self._convs):
+        idx = 0
+        for c in self._convs:
             label = ("● " if c["id"] in self._blink_ids else "") + c["name"]
             self._combo.addItem(label, c["id"])
             if c["id"] == self._active_id:
-                active_idx = i
-        if self._convs:
+                active_idx = idx
+            idx += 1
+        # Remote conversations, grouped per peer under a non-selectable header.
+        for peer in sorted(self._remote_groups):
+            convs = self._remote_groups.get(peer) or []
+            if not convs:
+                continue
+            self._combo.insertSeparator(self._combo.count())
+            idx += 1
+            hdr = self._combo.count()
+            self._combo.addItem(f"🌐 {peer}", None)
+            self._combo.model().item(hdr).setEnabled(False)   # header, not selectable
+            idx += 1
+            for c in convs:
+                self._combo.addItem(f"    {c['name']}", c["id"])
+                if c["id"] == self._active_id:
+                    active_idx = idx
+                idx += 1
+        if self._combo.count():
             self._combo.setCurrentIndex(active_idx)
         self._loading = False
 
@@ -429,6 +474,7 @@ class ConversationBar(QWidget):
     def _on_activated(self, idx: int):
         if self._loading:
             return
+        self._editing_cid = None  # selecting an item ends any in-progress rename
         cid = self._combo.itemData(idx)
         if cid:
             self._active_id = cid
@@ -440,14 +486,25 @@ class ConversationBar(QWidget):
         dropdown doubles as an inline rename field)."""
         if self._loading:
             return
-        cid = self._combo.currentData()
+        # Rename the conversation that was actually being edited (captured on the
+        # first keystroke), so a focus-out after switching items can't rename the
+        # wrong one. Fall back to current/active if nothing was tracked.
+        cid = self._editing_cid or self._combo.currentData() or self._active_id
+        self._editing_cid = None
         if not cid:
             return
         new_name = self._combo.lineEdit().text().strip().lstrip("●").strip()
         cur = next((c["name"] for c in self._convs if c["id"] == cid), "")
         if new_name and new_name != cur:
             self.rename_requested.emit(cid, new_name)
-        self._combo.clearFocus()
+
+    def _note_editing_target(self, _text: str):
+        """First keystroke into the editable combo — remember which conversation
+        is being renamed (the current item) so a later commit targets it."""
+        if self._loading:
+            return
+        if self._editing_cid is None:
+            self._editing_cid = self._combo.currentData() or self._active_id
 
     # ── Rename / delete / streams menu (acts on the current conversation) ──
     def _current_id_name(self) -> tuple[str, str]:
@@ -486,6 +543,7 @@ class ConversationBar(QWidget):
             QCheckBox::indicator:unchecked {{ background: transparent; border: 1px solid {p['border']}; }}
         """)
         rename_action = menu.addAction("Rename")
+        cleanup_action = menu.addAction("Remove empty workspaces")
 
         cfg = load_config()
         all_streams = cfg.get("memory_streams", [{"name": "default"}])
@@ -494,8 +552,10 @@ class ConversationBar(QWidget):
             menu.addSeparator()
             streams_menu = menu.addMenu("Streams")
             streams_menu.setStyleSheet(menu.styleSheet())
-            from core.database import get_conversation_streams
-            current_streams = get_conversation_streams(cid)
+            # The dropdown lists WORKSPACES; streams are a workspace-level
+            # property shared by all of its columns.
+            from core.database import get_workspace_streams
+            current_streams = get_workspace_streams(cid)
             for s in all_streams:
                 sname = s.get("name", "")
                 cb = QCheckBox(sname)
@@ -507,8 +567,8 @@ class ConversationBar(QWidget):
 
             def _save_streams():
                 new_streams = [n for n, cb in stream_checks.items() if cb.isChecked()]
-                from core.conversations import set_conversation_streams
-                set_conversation_streams(cid, new_streams)
+                from core.conversations import set_workspace_streams
+                set_workspace_streams(cid, new_streams)
                 self.streams_changed.emit(cid, new_streams)
 
             for cb in stream_checks.values():
@@ -517,9 +577,11 @@ class ConversationBar(QWidget):
         chosen = menu.exec(self._combo.mapToGlobal(pos))
         if chosen == rename_action:
             new_name, ok = QInputDialog.getText(
-                self, "Rename Conversation", "Name:", text=name)
+                self, "Rename Workspace", "Name:", text=name)
             if ok and new_name.strip():
                 self.rename_requested.emit(cid, new_name.strip())
+        elif chosen == cleanup_action:
+            self.ws_cleanup_requested.emit()
 
     # ── Blink (unread activity in a non-active conversation) ───────────
     def start_blink(self, conv_id: str, interval_ms: int = 600):

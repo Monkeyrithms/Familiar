@@ -60,8 +60,11 @@ class ConversationDialog(GlassDialog):
         mono9 = QFont("Consolas", 9)
         small = QFont("Consolas", 8)
 
-        if self._conv_id:
-            debug_recorder.load_conversation_from_db(self._conv_id)
+        # NOTE: do NOT pre-load debug turns here. This dialog never displays
+        # them, and debug_turns_json can be multiple MB (full-context snapshot
+        # per turn) — reading + json.loads + deepcopy on the UI thread froze the
+        # GUI (worse when a background save held the DB lock, up to the 30s
+        # busy_timeout). The debug panel lazy-loads its own data on open.
 
         tabs = QTabWidget()
 
@@ -111,6 +114,18 @@ class ConversationDialog(GlassDialog):
         self._main_model_completer.setModel(self._main_model_suggest_model)
         self._model_edit.setCompleter(self._main_model_completer)
         self._refresh_main_model_suggestions()
+
+        # Reasoning effort — choices reflect what the active provider+model
+        # actually offers (see core.providers.reasoning_levels). When a model has
+        # no reasoning knob the combo shows a single locked "None".
+        self._reasoning_combo = QComboBox()
+        self._reasoning_combo.setFont(mono9)
+        self._reasoning_combo.setToolTip(
+            "Thinking / reasoning effort for this conversation.\n"
+            "Options change with the selected provider and model.")
+        ml.addRow(QLabel("Reasoning"), self._reasoning_combo)
+        self._refresh_reasoning_levels()
+        self._model_edit.textChanged.connect(lambda _t: self._refresh_reasoning_levels())
 
         self._ws_combo = QComboBox()
         self._ws_combo.setFont(mono9)
@@ -191,6 +206,11 @@ class ConversationDialog(GlassDialog):
         pl.addWidget(self._stream_live_check)
 
         tabs.addTab(prompt_tab, "Prompt")
+
+        # ═══════════════════════════════════════════════════════════
+        # Tab: Network — what this conversation exposes over Familiar-Net
+        # ═══════════════════════════════════════════════════════════
+        tabs.addTab(self._build_network_tab(small), "Network")
 
         # ═══════════════════════════════════════════════════════════
         # Tab 3: Memory Streams — subscribe with read/write permissions
@@ -416,6 +436,32 @@ class ConversationDialog(GlassDialog):
         models = list(self._provider_model_history.get(pid) or [])
         self._main_model_suggest_model.setStringList(models)
 
+    def _refresh_reasoning_levels(self):
+        """Repopulate the reasoning combo for the current provider+model, keeping
+        the selected level when the new model still supports it."""
+        from core.providers import reasoning_levels, REASONING_LEVEL_LABELS
+        pid = self._provider_combo.currentData()
+        model = self._model_edit.text().strip()
+        levels = reasoning_levels(pid, model) or ["off"]
+        # Preserve the on-screen selection across model edits; on first build fall
+        # back to the conversation's stored level.
+        if self._reasoning_combo.count():
+            prev = self._reasoning_combo.currentData() or "off"
+        else:
+            prev = (getattr(self.agent, "_reasoning_effort", "") or "off") or "off"
+        target = prev if prev in levels else ("off" if "off" in levels else levels[0])
+        self._reasoning_combo.blockSignals(True)
+        self._reasoning_combo.clear()
+        for lv in levels:
+            self._reasoning_combo.addItem(REASONING_LEVEL_LABELS.get(lv, lv.title()), lv)
+        for i in range(self._reasoning_combo.count()):
+            if self._reasoning_combo.itemData(i) == target:
+                self._reasoning_combo.setCurrentIndex(i)
+                break
+        # Single "None" choice → lock it (nothing to pick).
+        self._reasoning_combo.setEnabled(len(levels) > 1)
+        self._reasoning_combo.blockSignals(False)
+
     def _on_provider_changed(self, idx):
         from core.providers import PROVIDER_INFO
         old_pid = self._last_model_provider_pid
@@ -433,6 +479,92 @@ class ConversationDialog(GlassDialog):
         self._model_edit.setText(remembered or info.get("default_model", ""))
         self._last_model_provider_pid = pid
         self._refresh_main_model_suggestions()
+        self._refresh_reasoning_levels()
+
+    def _build_network_tab(self, small) -> QWidget:
+        """Everything about what this conversation exposes over Familiar-Net."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        intro = QLabel(
+            "Controls what networked peers can do with this conversation. These "
+            "apply only when networking is on (Settings → Network) and a peer has "
+            "your shared secret.")
+        intro.setWordWrap(True)
+        intro.setFont(small)
+        intro.setStyleSheet(f"color:{PALETTE['muted_text']};")
+        lay.addWidget(intro)
+
+        # ── The catch-all: shared vs private ──
+        self._private_check = QCheckBox(
+            "Private — keep this conversation off Familiar-Net entirely")
+        self._private_check.setFont(small)
+        self._private_check.setToolTip(
+            "On: local-only. It won't appear in any peer's conversation dropdown, "
+            "and peers cannot mirror it, send to it, or read its workspace files.\n"
+            "Off: peers can remote into it (subject to the options below).")
+        try:
+            from core.conversations import (is_conversation_private,
+                                            conversation_allows_terminal)
+            self._private_check.setChecked(
+                bool(self._conv_id) and is_conversation_private(self._conv_id))
+        except Exception:
+            self._private_check.setChecked(False)
+        lay.addWidget(self._private_check)
+
+        # ── Per-conversation: remote terminal (RCE — opt-in) ──
+        self._allow_term_check = QCheckBox(
+            "Allow remote terminal — a viewer can open a shell on THIS machine")
+        self._allow_term_check.setFont(small)
+        self._allow_term_check.setToolTip(
+            "⚠ Grants a remote viewer a real command shell on this machine, in "
+            "this conversation's workspace folder. That is code execution — only "
+            "enable it for conversations you intend to operate remotely, and only "
+            "with peers you fully trust. Off by default.")
+        try:
+            self._allow_term_check.setChecked(
+                bool(self._conv_id) and conversation_allows_terminal(self._conv_id))
+        except Exception:
+            self._allow_term_check.setChecked(False)
+        lay.addWidget(self._allow_term_check)
+        warn = QLabel("⚠ The remote terminal is full command execution as your "
+                      "user — treat enabling it like granting SSH access.")
+        warn.setWordWrap(True)
+        warn.setFont(small)
+        warn.setStyleSheet(f"color:{PALETTE.get('danger', '#cd3131')};")
+        lay.addWidget(warn)
+
+        # Terminal access is meaningless on a private conversation — reflect that.
+        def _sync_term_enabled():
+            self._allow_term_check.setEnabled(not self._private_check.isChecked())
+        self._private_check.toggled.connect(lambda *_: _sync_term_enabled())
+        _sync_term_enabled()
+
+        # ── Machine-wide: Notes & Calendar sharing ──
+        sep = QLabel("Machine-wide (applies to every conversation on this machine):")
+        sep.setFont(small)
+        sep.setStyleSheet(f"color:{PALETTE['muted_text']}; margin-top:6px;")
+        lay.addWidget(sep)
+        self._share_notes_check = QCheckBox(
+            "Share Notes & Calendar with peers")
+        self._share_notes_check.setFont(small)
+        self._share_notes_check.setToolTip(
+            "Notes and the task Calendar are global (not tied to one conversation), "
+            "so this is a single switch for the whole machine.\n"
+            "On: peers can read/edit your Notes and read your Calendar.\n"
+            "Off: they stay local — even for shared conversations.")
+        try:
+            from core.agent import load_config
+            net = (load_config().get("network") or {})
+            self._share_notes_check.setChecked(bool(net.get("share_notes", True)))
+        except Exception:
+            self._share_notes_check.setChecked(True)
+        lay.addWidget(self._share_notes_check)
+
+        lay.addStretch(1)
+        return w
 
     def _save_and_close(self):
         from core.providers import PROVIDER_INFO
@@ -457,6 +589,10 @@ class ConversationDialog(GlassDialog):
             self.agent.set_provider(pid)
         if model:
             self.agent.set_model(model)
+        # Per-conversation reasoning level ("off" → cleared). Persists to the
+        # conversation row so it survives reloads and column switches.
+        level = self._reasoning_combo.currentData() or "off"
+        self.agent.set_reasoning_effort("" if level == "off" else level)
         ws = self._ws_combo.currentText()
         if ws:
             self.agent.set_workspace(ws)
@@ -475,6 +611,24 @@ class ConversationDialog(GlassDialog):
                 set_conversation_stream_live(self._conv_id, self.agent._stream_live)
             except Exception:
                 pass
+            try:
+                from core.database import (set_conversation_private,
+                                           set_conversation_allow_terminal)
+                set_conversation_private(self._conv_id, self._private_check.isChecked())
+                set_conversation_allow_terminal(
+                    self._conv_id, self._allow_term_check.isChecked())
+            except Exception:
+                pass
+        # Machine-wide Notes/Calendar sharing → config.json (network section).
+        try:
+            from core.agent import load_config, save_config
+            cfg = load_config()
+            net = cfg.setdefault("network", {})
+            if isinstance(net, dict):
+                net["share_notes"] = self._share_notes_check.isChecked()
+                save_config(cfg)
+        except Exception:
+            pass
 
         # Streams tab — save summaries
         for name, se in self._summary_edits.items():

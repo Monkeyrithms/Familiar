@@ -15,8 +15,10 @@ class GlassDialog(QDialog):
     """Frameless, translucent dialog with custom titlebar and dragging."""
 
     def __init__(self, title: str = "Dialog", parent=None,
-                 width: int = 520, height: int = 480):
+                 width: int = 520, height: int = 480,
+                 geometry_key: str | None = None):
         super().__init__(parent)
+        self._geometry_key = geometry_key
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -278,8 +280,10 @@ class GlassDialog(QDialog):
 
         outer.addWidget(self._container)
 
-        # Center on parent
-        if parent:
+        if geometry_key:
+            from ui.dialog_geometry import apply_saved_geometry
+            apply_saved_geometry(self, geometry_key, width, height)
+        elif parent:
             win = parent.window()
             geo = win.geometry()
             self.move(
@@ -369,6 +373,17 @@ class GlassDialog(QDialog):
         self._resize_start_pos = None
         self.unsetCursor()
         super().mouseReleaseEvent(event)
+
+    def closeEvent(self, event):
+        if self._geometry_key:
+            from ui.dialog_geometry import save_geometry
+            save_geometry(self._geometry_key, self)
+        super().closeEvent(event)
+
+    def _persist_geometry(self) -> None:
+        if self._geometry_key:
+            from ui.dialog_geometry import save_geometry
+            save_geometry(self._geometry_key, self)
 
     # ── Convenience: themed confirm dialog ───────────────────────────
 

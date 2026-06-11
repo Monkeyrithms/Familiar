@@ -13,6 +13,7 @@ import signal
 import subprocess
 import traceback
 import ctypes
+import time
 from collections.abc import Callable
 
 from PyQt6.QtWidgets import (
@@ -30,10 +31,12 @@ from PyQt6.QtWidgets import (
     QApplication,
     QStackedWidget,
     QMenu,
+    QInputDialog,
 )
 import re
 
-from PyQt6.QtCore import Qt, QProcess, QTimer
+import queue
+from PyQt6.QtCore import Qt, QProcess, QTimer, QEvent, QObject, pyqtSignal
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QTextCursor, QColor, QKeyEvent, QTextOption,
     QKeySequence, QTextCharFormat,
@@ -476,6 +479,7 @@ class IntegratedTerminalSession(QWidget):
     def __init__(self, cwd: str, parent=None):
         super().__init__(parent)
         self._cwd = cwd or os.getcwd()
+        self._spawn_cwd = os.path.abspath(self._cwd)
         self._pty = PTY_AVAILABLE
         self._proc = None          # legacy QProcess (None on the PTY path)
         self._backend = None       # PtyBackend  (None on the legacy path)
@@ -483,6 +487,9 @@ class IntegratedTerminalSession(QWidget):
         # (psutil gives the live cwd; these are the fallback / command source).
         self._last_command = ""
         self._last_prompt_cwd = ""
+        self.user_tab_title: str | None = None
+        self.default_tab_title: str = "Terminal"
+        self._on_title_refresh: Callable[[], None] | None = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -492,6 +499,18 @@ class IntegratedTerminalSession(QWidget):
             self._init_pty(lay)
         else:
             self._init_legacy(lay)
+        self._on_activate: Callable[[], None] | None = None
+        self._term.installEventFilter(self)
+
+    def set_activate_callback(self, cb: Callable[[], None] | None) -> None:
+        """Panel wires this so focus/click in this feed updates the active highlight."""
+        self._on_activate = cb
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self._term and event.type() == QEvent.Type.FocusIn:
+            if self._on_activate:
+                self._on_activate()
+        return super().eventFilter(watched, event)
 
     # ── PTY backend (ConPTY / real TTY — runs claude, vim, htop, …) ───
     def _init_pty(self, lay):
@@ -539,6 +558,28 @@ class IntegratedTerminalSession(QWidget):
             return self._backend.pid() if self._backend is not None else 0
         return int(self._proc.processId() or 0) if self._proc is not None else 0
 
+    def set_user_tab_title(self, name: str | None) -> None:
+        self.user_tab_title = (name or "").strip() or None
+
+    def display_title(self) -> str:
+        if self.user_tab_title:
+            return self.user_tab_title
+        from core.terminal_tab_title import auto_tab_title
+        auto = auto_tab_title(
+            self._shell_pid(), self._spawn_cwd,
+            self._last_command, self._last_prompt_cwd,
+        )
+        if auto:
+            return auto
+        return self.default_tab_title
+
+    def _notify_title_refresh(self) -> None:
+        if callable(self._on_title_refresh):
+            try:
+                self._on_title_refresh()
+            except Exception:
+                pass
+
     def _on_command_submitted(self, cmd: str, cwd_hint: str):
         """Remember the last command the user ran (for restart prefill) and the
         cwd shown at its prompt (psutil fallback when it's unavailable)."""
@@ -546,6 +587,7 @@ class IntegratedTerminalSession(QWidget):
             self._last_command = cmd
         if cwd_hint:
             self._last_prompt_cwd = cwd_hint
+        self._notify_title_refresh()
 
     def persistence_info(self, deep: bool = True) -> dict:
         """For restart persistence: the shell's cwd, the last command the user
@@ -837,7 +879,10 @@ class TerminalWorkspacePanel(QFrame):
                  cwd_resolver: Callable[[], str] | None = None,
                  collapse_cb=None,
                  auto_initial_tab: bool = True,
-                 view_change_cb=None):
+                 view_change_cb=None,
+                 changed_cb=None,
+                 initial_view_mode: str | None = None,
+                 initial_grid_columns: int | None = None):
         super().__init__(parent)
         self.setObjectName("TerminalWorkspacePanel")
         self._sessions: list[IntegratedTerminalSession] = []
@@ -847,20 +892,31 @@ class TerminalWorkspacePanel(QFrame):
         self._collapse_cb = collapse_cb
         self._tab_seq = 0
         self._auto_initial_tab = auto_initial_tab
+        # Called on any structural change (add/close/rename/view) so the host can
+        # persist this conversation's terminal layout — the fix for deletions
+        # that "kept coming back" because the layout was never saved.
+        self._changed_cb = changed_cb
         # View mode: "tabbed" (one terminal, tabs on top — the original), "column"
         # (all terminals side-by-side in one row), or "grid" (wrapped N-per-row).
         # _grid_columns == 0 means Auto (derive column count from the panel width).
         self._view_change_cb = view_change_cb
         self._active_index = -1            # canonical "active" terminal in multi views
+        self._focus_highlight = False      # accent cell border only while a terminal has UI focus
         self._cells: list[QFrame] = []     # cell frames in the current multi view
         self._last_built_ncols = 0         # so resize only rebuilds when it matters
-        try:
-            from core.agent import load_config
-            _cfg = load_config()
-            self._view_mode = str(_cfg.get("terminal_view_mode", "tabbed") or "tabbed").lower()
-            self._grid_columns = int(_cfg.get("terminal_grid_columns", 0) or 0)
-        except Exception:
-            self._view_mode, self._grid_columns = "tabbed", 0
+        # Prefer the PER-CONVERSATION saved view mode; fall back to the global
+        # default only when this conversation has no saved layout.
+        if initial_view_mode in ("tabbed", "column", "grid"):
+            self._view_mode = initial_view_mode
+            self._grid_columns = int(initial_grid_columns or 0)
+        else:
+            try:
+                from core.agent import load_config
+                _cfg = load_config()
+                self._view_mode = str(_cfg.get("terminal_view_mode", "tabbed") or "tabbed").lower()
+                self._grid_columns = int(_cfg.get("terminal_grid_columns", 0) or 0)
+            except Exception:
+                self._view_mode, self._grid_columns = "tabbed", 0
         if self._view_mode not in ("tabbed", "column", "grid"):
             self._view_mode = "tabbed"
 
@@ -958,6 +1014,11 @@ class TerminalWorkspacePanel(QFrame):
         self._tab_widget.setTabsClosable(True)
         self._tab_widget.tabCloseRequested.connect(self._close_tab)
         self._tab_widget.currentChanged.connect(self._on_tab_changed)
+        bar = self._tab_widget.tabBar()
+        bar.tabBarDoubleClicked.connect(self._on_tab_bar_double_clicked)
+        bar.tabBarClicked.connect(self._on_tab_bar_clicked)
+        self._tab_click_index = -1
+        self._tab_click_time = 0.0
         self._tab_widget.setStyleSheet(workspace_tab_bar_stylesheet_terminal(p))
         self._tab_widget.set_close_palette(p)
         self._view_stack.addWidget(self._tab_widget)
@@ -976,8 +1037,22 @@ class TerminalWorkspacePanel(QFrame):
         if self._auto_initial_tab:
             self.add_terminal_tab()
 
+        self._title_timer = QTimer(self)
+        self._title_timer.setInterval(2000)
+        self._title_timer.timeout.connect(self._tick_auto_titles)
+        self._title_timer.start()
+
         # Reflect the saved view mode (also positions the stack + nav controls).
         self._apply_view_mode(self._view_mode, persist=False)
+
+    def _notify_changed(self):
+        """Tell the host the terminal layout changed so it can persist it."""
+        cb = getattr(self, "_changed_cb", None)
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
 
     def set_collapse_callback(self, cb):
         self._collapse_cb = cb
@@ -1008,21 +1083,34 @@ class TerminalWorkspacePanel(QFrame):
                 pass
         return os.getcwd()
 
-    def _attach_new_session(self, session: "IntegratedTerminalSession", title: str):
+    def _attach_new_session(
+        self,
+        session: "IntegratedTerminalSession",
+        title: str,
+        *,
+        user_title: str | None = None,
+    ):
         """Register a freshly-built session and place it in the current view
         (a new tab, or a new cell in the column/grid surface). Keeps _sessions /
         _titles / the active index in lockstep so every view mode agrees."""
+        session.default_tab_title = title
+        session.set_activate_callback(lambda s=session: self._on_session_focused(s))
+        session._on_title_refresh = lambda s=session: self._sync_title_for_session(s)
+        if user_title is not None:
+            session.set_user_tab_title(user_title)
+        display = session.display_title()
         self._sessions.append(session)
-        self._titles.append(title)
+        self._titles.append(display)
         new_idx = len(self._sessions) - 1
         if self._view_mode == "tabbed":
-            self._tab_widget.addTab(session, title)
+            self._tab_widget.addTab(session, display)
             self._tab_widget.setCurrentIndex(new_idx)
         else:
             self._active_index = new_idx
             self._rebuild_multi()
         self._active_index = new_idx
         QTimer.singleShot(50, session.focus_terminal)
+        self._notify_changed()
 
     def add_terminal_tab(self):
         self._tab_seq += 1
@@ -1040,8 +1128,10 @@ class TerminalWorkspacePanel(QFrame):
                 info = session.persistence_info(deep=deep)
             except Exception:
                 info = {"cwd": "", "resume": None, "command": ""}
+            sess = self._sessions[i]
             out.append({
-                "title": self._titles[i] if i < len(self._titles) else "",
+                "title": sess.user_tab_title or self._titles[i] if i < len(self._titles) else "",
+                "user_title": bool(sess.user_tab_title),
                 "cwd": info.get("cwd") or "",
                 "resume": info.get("resume"),
                 "command": info.get("command") or "",
@@ -1049,7 +1139,7 @@ class TerminalWorkspacePanel(QFrame):
         return out
 
     def restore_tab(self, cwd: str, title: str = "", resume: str | None = None,
-                    command: str = ""):
+                    command: str = "", *, user_title: bool = False):
         """Recreate a tab in *cwd* (the shell spawns there, so it's already in
         the right place) and PREFILL the last command so the user just hits
         Enter. A known resumable tool (claude → ``claude --continue``) is
@@ -1058,7 +1148,11 @@ class TerminalWorkspacePanel(QFrame):
         self._tab_seq += 1
         target_cwd = cwd if (cwd and os.path.isdir(cwd)) else self._resolve_cwd()
         session = IntegratedTerminalSession(cwd=target_cwd, parent=self)
-        self._attach_new_session(session, title or f"Terminal {self._tab_seq}")
+        label = title or f"Terminal {self._tab_seq}"
+        self._attach_new_session(
+            session, label,
+            user_title=label if user_title else None,
+        )
         prefill = resume or command
         if prefill:
             session.prefill(prefill)
@@ -1070,7 +1164,8 @@ class TerminalWorkspacePanel(QFrame):
         default if empty)."""
         target_cwd = cwd if (cwd and os.path.isdir(cwd)) else self._resolve_cwd()
         session = IntegratedTerminalSession(cwd=target_cwd, parent=self)
-        self._attach_new_session(session, title or "Agent")
+        name = title or "Agent"
+        self._attach_new_session(session, name, user_title=name)
         return session
 
     def close_session(self, session) -> bool:
@@ -1096,11 +1191,40 @@ class TerminalWorkspacePanel(QFrame):
         if not (0 <= index < len(self._sessions)):
             return
         self._active_index = index
+        self._focus_highlight = True
         if self._view_mode == "tabbed":
             self._tab_widget.setCurrentIndex(index)
         else:
             self._highlight_active_cell()
         QTimer.singleShot(0, self._sessions[index].focus_terminal)
+
+    def clear_active_highlight(self) -> None:
+        """Drop bright borders on all terminal cells (chat composer took focus)."""
+        if not self._focus_highlight:
+            return
+        self._focus_highlight = False
+        if self._view_mode != "tabbed":
+            self._highlight_active_cell()
+
+    def _on_session_focused(self, session: "IntegratedTerminalSession") -> None:
+        """User clicked or tabbed into this feed — sync highlight to focus, not
+        whichever terminal was created most recently."""
+        try:
+            idx = self._sessions.index(session)
+        except ValueError:
+            return
+        self._focus_highlight = True
+        if self._view_mode == "tabbed":
+            if self._tab_widget.currentIndex() != idx:
+                self._tab_widget.setCurrentIndex(idx)
+            elif self._active_index != idx:
+                self._active_index = idx
+            return
+        if idx == self._active_index:
+            self._highlight_active_cell()
+            return
+        self._active_index = idx
+        self._highlight_active_cell()
 
     def _on_tab_changed(self, index: int):
         if index < 0 or index >= len(self._sessions):
@@ -1134,6 +1258,7 @@ class TerminalWorkspacePanel(QFrame):
             self.add_terminal_tab()
         elif self._view_mode != "tabbed":
             self._rebuild_multi()
+        self._notify_changed()  # persist the deletion so it doesn't come back
 
     def get_or_create_for_conv(self, conv_id: str, conv_name: str) -> "IntegratedTerminalSession":
         """Return the terminal session for this conversation, creating a new tab if needed."""
@@ -1143,9 +1268,68 @@ class TerminalWorkspacePanel(QFrame):
         cwd = self._resolve_cwd()
         session = IntegratedTerminalSession(cwd=cwd, parent=self)
         label = (conv_name or conv_id or "Agent")[:28]
-        self._attach_new_session(session, label)
+        self._attach_new_session(session, label, user_title=label)
         self._conv_sessions[conv_id] = session
         return session
+
+    def _sync_title_index(self, index: int) -> None:
+        if not (0 <= index < len(self._sessions)):
+            return
+        title = self._sessions[index].display_title()
+        if index < len(self._titles):
+            self._titles[index] = title
+        if self._view_mode == "tabbed":
+            self._tab_widget.setTabText(index, title)
+            self._tab_widget.setTabToolTip(
+                index, "Double-click tab, or click twice when selected, to rename")
+        elif index < len(self._cells):
+            cell = self._cells[index]
+            try:
+                cell._title_label.setText(title)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    def _sync_title_for_session(self, session: "IntegratedTerminalSession") -> None:
+        try:
+            self._sync_title_index(self._sessions.index(session))
+        except ValueError:
+            pass
+
+    def _tick_auto_titles(self) -> None:
+        for i, sess in enumerate(self._sessions):
+            if sess.user_tab_title:
+                continue
+            new = sess.display_title()
+            old = self._titles[i] if i < len(self._titles) else ""
+            if new != old:
+                self._sync_title_index(i)
+
+    def _rename_tab_at(self, index: int) -> None:
+        if not (0 <= index < len(self._sessions)):
+            return
+        sess = self._sessions[index]
+        new, ok = QInputDialog.getText(
+            self, "Rename terminal", "Name:", text=sess.display_title(),
+        )
+        if ok and new.strip():
+            sess.set_user_tab_title(new.strip())
+            self._sync_title_index(index)
+            self._notify_changed()  # persist the custom name
+
+    def _on_tab_bar_double_clicked(self, index: int) -> None:
+        self._rename_tab_at(index)
+
+    def _on_tab_bar_clicked(self, index: int) -> None:
+        """Second click on the already-selected tab opens rename."""
+        if index < 0:
+            return
+        now = time.monotonic()
+        if (index == self._tab_widget.currentIndex()
+                and index == self._tab_click_index
+                and (now - self._tab_click_time) < 0.55):
+            self._rename_tab_at(index)
+        self._tab_click_index = index
+        self._tab_click_time = now
 
     def close_conv(self, conv_id: str):
         """Close the terminal tab for a conversation (used by sub-agent cleanup)."""
@@ -1240,7 +1424,11 @@ class TerminalWorkspacePanel(QFrame):
                 pass
 
     def _persist_view_config(self):
+        # Persist this conversation's view mode (per-conversation, via the host).
+        self._notify_changed()
         try:
+            # Also record it as the GLOBAL default so brand-new conversations
+            # open in the same view the user last chose.
             from core.agent import load_config, save_config
             cfg = load_config()
             cfg["terminal_view_mode"] = self._view_mode
@@ -1326,6 +1514,10 @@ class TerminalWorkspacePanel(QFrame):
         """(Re)build the column/grid surface from _sessions/_titles."""
         if self._view_mode == "tabbed":
             return
+        if not hasattr(self, "_multi_grid"):
+            # A resize/layout event can arrive mid-construction (the panel has a
+            # parent before the grid surface is built) — no-op until it exists.
+            return
         self._clear_multi_container()
         # Reset any stale row/column stretch factors from a previous layout.
         # QGridLayout keeps them after widgets are removed, so switching e.g.
@@ -1363,7 +1555,14 @@ class TerminalWorkspacePanel(QFrame):
         Clicking anywhere in the cell makes it the active terminal."""
         cell = QFrame()
         cell.setObjectName("TermCell")
-        cell.setMinimumSize(280, 180)
+        # Column mode divides ONE row evenly across however many feeds there are,
+        # so each cell must be free to shrink to its share of the width. A fat
+        # 280px floor forced the row to overflow and scroll horizontally instead
+        # of splitting the available space — the "not evenly split" report. A
+        # slim floor lets them divide evenly and only scroll once they'd get
+        # genuinely unusable. Grid mode keeps the roomier floor (it wraps rows).
+        min_w = 150 if self._view_mode == "column" else 280
+        cell.setMinimumSize(min_w, 180)
         cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         v = QVBoxLayout(cell)
         v.setContentsMargins(1, 1, 1, 1)
@@ -1376,15 +1575,43 @@ class TerminalWorkspacePanel(QFrame):
         h.setSpacing(4)
         title = QLabel(self._titles[index] if index < len(self._titles) else f"Terminal {index+1}")
         title.setFont(QFont("Consolas", 8))
+        title.setCursor(Qt.CursorShape.IBeamCursor)
+        title.setToolTip("Double-click to rename")
+        def _title_dblclick(e, i=index):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self._rename_tab_at(i)
+                e.accept()
+
+        title.mouseDoubleClickEvent = _title_dblclick  # type: ignore[assignment]
         h.addWidget(title)
         h.addStretch(1)
-        close = QPushButton("✕")
-        close.setFont(QFont("Consolas", 9))
+        p = PALETTE
+        left = QPushButton("\u2190")
+        left.setToolTip("Move this terminal left")
+        left.setCursor(Qt.CursorShape.PointingHandCursor)
+        left.setFixedSize(18, 18)
+        left.setFlat(True)
+        left.clicked.connect(lambda _c=False, i=index: self._move_session(i, -1))
+        h.addWidget(left)
+        right = QPushButton("\u2192")
+        right.setToolTip("Move this terminal right")
+        right.setCursor(Qt.CursorShape.PointingHandCursor)
+        right.setFixedSize(18, 18)
+        right.setFlat(True)
+        right.clicked.connect(lambda _c=False, i=index: self._move_session(i, 1))
+        h.addWidget(right)
+        close = QPushButton("\u00d7")
+        close.setToolTip("Close terminal")
         close.setCursor(Qt.CursorShape.PointingHandCursor)
         close.setFixedSize(18, 18)
         close.setFlat(True)
         close.clicked.connect(lambda _checked, s=session: self.close_session(s))
         h.addWidget(close)
+        left.setStyleSheet(self._header_control_btn_stylesheet(p, enabled=index > 0))
+        right.setStyleSheet(
+            self._header_control_btn_stylesheet(
+                p, enabled=index < len(self._sessions) - 1))
+        close.setStyleSheet(self._header_control_btn_stylesheet(p))
         v.addWidget(header)
         v.addWidget(session, stretch=1)
         # _detach_all_sessions() reparents via setParent(None), which HIDES the
@@ -1393,17 +1620,32 @@ class TerminalWorkspacePanel(QFrame):
         # until the session is rebuilt.
         session.show()
 
-        # Click-to-activate (header click + a press filter on the cell).
-        def _activate(_e=None, s=session):
+        # Click-to-activate: header, cell chrome, or focus in the terminal feed.
+        def _activate_cell(e, s=session):
+            if e.button() == Qt.MouseButton.LeftButton:
+                try:
+                    self._set_active(self._sessions.index(s))
+                except ValueError:
+                    pass
+            QFrame.mousePressEvent(cell, e)
+
+        cell.mousePressEvent = _activate_cell  # type: ignore[assignment]
+
+        def _header_press(_e, s=session):
             try:
                 self._set_active(self._sessions.index(s))
             except ValueError:
                 pass
-        header.mousePressEvent = lambda e, f=_activate: f()  # type: ignore[assignment]
+
+        header.mousePressEvent = _header_press  # type: ignore[assignment]
 
         cell._title_label = title  # for theming/highlight  # type: ignore[attr-defined]
         cell._header = header      # type: ignore[attr-defined]
         cell._session = session    # type: ignore[attr-defined]
+        cell._left_btn = left      # type: ignore[attr-defined]
+        cell._right_btn = right    # type: ignore[attr-defined]
+        cell._close_btn = close    # type: ignore[attr-defined]
+        cell._cell_index = index   # type: ignore[attr-defined]
         self._style_cell(cell, active=False)
         return cell
 
@@ -1421,9 +1663,60 @@ class TerminalWorkspacePanel(QFrame):
         except Exception:
             pass
 
+    def _header_control_btn_stylesheet(self, p: dict, *, enabled: bool = True) -> str:
+        """Shared style for cell-header × / arrow controls (Consolas lacks ✕)."""
+        color = p["muted_text"] if enabled else p.get("border", "#444")
+        hover = p.get("accent_bright", p["accent"])
+        c = QColor(p["accent"])
+        r, g, b = c.red(), c.green(), c.blue()
+        return (
+            f"QPushButton {{ color:{color}; background:transparent; border:none;"
+            f" font:bold 10pt Consolas; padding:0; min-width:18px; max-width:18px;"
+            f" min-height:18px; max-height:18px; }}"
+            f"QPushButton:hover {{ color:{hover};"
+            f" background:rgba({r},{g},{b},0.25); border-radius:3px; }}"
+            f"QPushButton:disabled {{ color:{p.get('border', '#444')}; }}"
+        )
+
+    def _style_cell_header_controls(self, cell: QFrame, index: int) -> None:
+        p = PALETTE
+        n = len(self._sessions)
+        for attr, pos in (("_left_btn", 0), ("_right_btn", n - 1)):
+            btn = getattr(cell, attr, None)
+            if btn is not None:
+                btn.setEnabled(index > pos if attr == "_left_btn" else index < pos)
+                btn.setStyleSheet(
+                    self._header_control_btn_stylesheet(p, enabled=btn.isEnabled()))
+        close = getattr(cell, "_close_btn", None)
+        if close is not None:
+            close.setStyleSheet(self._header_control_btn_stylesheet(p))
+
+    def _move_session(self, index: int, delta: int) -> None:
+        """Swap this terminal with its neighbor (Cols / Grid ordering)."""
+        if self._view_mode == "tabbed":
+            return
+        j = index + delta
+        if not (0 <= index < len(self._sessions) and 0 <= j < len(self._sessions)):
+            return
+        self._sessions[index], self._sessions[j] = self._sessions[j], self._sessions[index]
+        if index < len(self._titles) and j < len(self._titles):
+            self._titles[index], self._titles[j] = self._titles[j], self._titles[index]
+        if self._active_index == index:
+            self._active_index = j
+        elif self._active_index == j:
+            self._active_index = index
+        self._rebuild_multi()
+
     def _highlight_active_cell(self):
+        active_idx = -1
+        if self._focus_highlight and self._sessions:
+            idx = self._current_index()
+            if 0 <= idx < len(self._sessions):
+                active_idx = idx
         for i, cell in enumerate(self._cells):
-            self._style_cell(cell, active=(i == self._current_index()))
+            cell._cell_index = i  # type: ignore[attr-defined]
+            self._style_cell(cell, active=(i == active_idx))
+            self._style_cell_header_controls(cell, i)
 
     def _update_view_buttons(self):
         """Reflect the active mode on the segmented buttons + show the grid
@@ -1494,6 +1787,79 @@ class TerminalWorkspacePanel(QFrame):
 # ──────────────────────────────────────────────────────────────────────
 
 
+class TerminalAttachment(QObject):
+    """Bridges a live PtyBackend (UI thread) to a remote-terminal WebSocket
+    (a server thread). Output is buffered into a thread-safe queue the socket
+    sender drains; input/resize cross back via queued signals so they run on the
+    UI thread (ConPTY requires writes on the owning thread). Created on the UI
+    thread; its methods are safe to call from the socket threads."""
+
+    _write_req = pyqtSignal(str)
+    _resize_req = pyqtSignal(int, int)
+
+    def __init__(self, backend: PtyBackend):
+        super().__init__()
+        self._backend = backend
+        self._q: "queue.Queue" = queue.Queue()
+        self._alive = True
+        backend.data_received.connect(self._on_output)
+        self._write_req.connect(self._do_write)
+        self._resize_req.connect(self._do_resize)
+
+    # UI thread (signal slot)
+    def _on_output(self, data: str):
+        if self._alive:
+            try:
+                self._q.put_nowait(data)
+            except Exception:
+                pass
+
+    # called from socket threads — all thread-safe
+    def history(self) -> str:
+        try:
+            return self._backend.raw_history()
+        except Exception:
+            return ""
+
+    def dims(self) -> tuple[int, int]:
+        try:
+            return self._backend.dimensions()
+        except Exception:
+            return (24, 80)
+
+    def next_output(self, timeout: float = 0.2):
+        try:
+            return self._q.get(timeout=timeout)
+        except Exception:
+            return None
+
+    def write(self, data: str):
+        self._write_req.emit(data)
+
+    def resize(self, rows: int, cols: int):
+        self._resize_req.emit(rows, cols)
+
+    def detach(self):
+        self._alive = False
+        try:
+            self._backend.data_received.disconnect(self._on_output)
+        except Exception:
+            pass
+
+    # UI thread (queued slots)
+    def _do_write(self, data: str):
+        try:
+            self._backend.write(data)
+        except Exception:
+            pass
+
+    def _do_resize(self, rows: int, cols: int):
+        try:
+            self._backend.resize(rows, cols)
+        except Exception:
+            pass
+
+
 class MultiConvTerminalPanel(QFrame):
     """Hosts one ``TerminalWorkspacePanel`` per conversation in a stack so
     each chat has an isolated set of terminal tabs (and processes) without
@@ -1539,16 +1905,23 @@ class MultiConvTerminalPanel(QFrame):
             p.set_collapse_callback(cb)
 
     def _on_panel_view_change(self, mode: str, columns: int, source):
-        """One conversation's panel changed view mode/columns — apply the same
-        to every other conversation's panel so the choice feels global (and is
-        already persisted to config by the source panel)."""
-        for p in self._panels.values():
-            if p is source:
-                continue
-            try:
-                p.apply_view_settings(mode, columns)
-            except Exception:
-                pass
+        """A conversation's panel changed its view mode/columns. This is now a
+        PER-CONVERSATION choice (no longer broadcast to other panels) — just
+        persist it so the layout is restored for this conversation next time."""
+        self._schedule_save()
+
+    # ── Per-conversation persistence (debounced) ───────────────────────
+    def _schedule_save(self):
+        """Coalesce rapid structural changes into one debounced save so every
+        add/close/rename/view-change is persisted without thrashing the disk."""
+        t = getattr(self, "_save_timer", None)
+        if t is None:
+            from PyQt6.QtCore import QTimer
+            t = self._save_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(800)
+            t.timeout.connect(lambda: self.save_all(deep=False))
+        t.start()
 
     # ── Per-conversation lifecycle ─────────────────────────────────
 
@@ -1558,7 +1931,8 @@ class MultiConvTerminalPanel(QFrame):
         panel = self._panels.get(conv_id)
         if panel is not None:
             return panel
-        saved_tabs = self._take_saved_tabs(conv_id)
+        entry = self._take_saved_entry(conv_id)
+        saved_tabs = entry.get("tabs") or []
         panel = TerminalWorkspacePanel(
             parent=self,
             cwd_resolver=self._cwd_resolver,
@@ -1566,23 +1940,30 @@ class MultiConvTerminalPanel(QFrame):
             # Skip the default empty tab when we're about to restore real ones.
             auto_initial_tab=not saved_tabs,
             view_change_cb=self._on_panel_view_change,
+            changed_cb=self._schedule_save,
+            initial_view_mode=entry.get("view_mode"),
+            initial_grid_columns=entry.get("grid_columns"),
         )
         panel.setMinimumWidth(0)
         panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._panels[conv_id] = panel
         self._stack.addWidget(panel)
-        for tab in (saved_tabs or []):
+        for tab in saved_tabs:
             try:
-                panel.restore_tab(tab.get("cwd", ""), tab.get("title", ""),
-                                  tab.get("resume"), tab.get("command", ""))
+                panel.restore_tab(
+                    tab.get("cwd", ""), tab.get("title", ""),
+                    tab.get("resume"), tab.get("command", ""),
+                    user_title=bool(tab.get("user_title")),
+                )
             except Exception:
                 pass
         return panel
 
-    def _take_saved_tabs(self, conv_id: str) -> list[dict]:
-        """Return (once) the saved tabs for *conv_id* from the previous run."""
+    def _take_saved_entry(self, conv_id: str) -> dict:
+        """Return (once) the saved layout entry for *conv_id* from the previous
+        run: {tabs, view_mode, grid_columns}."""
         if conv_id in self._restored:
-            return []
+            return {}
         self._restored.add(conv_id)
         if self._saved_conv_tabs is None:
             try:
@@ -1591,8 +1972,12 @@ class MultiConvTerminalPanel(QFrame):
             except Exception:
                 self._saved_conv_tabs = {}
         entry = (self._saved_conv_tabs or {}).get(conv_id) or {}
-        tabs = entry.get("tabs") or []
-        return [t for t in tabs if isinstance(t, dict)]
+        tabs = [t for t in (entry.get("tabs") or []) if isinstance(t, dict)]
+        return {
+            "tabs": tabs,
+            "view_mode": entry.get("view_mode"),
+            "grid_columns": entry.get("grid_columns"),
+        }
 
     def save_all(self, deep: bool = True):
         """Persist every live conversation's terminal tabs. Call BEFORE shells
@@ -1608,7 +1993,11 @@ class MultiConvTerminalPanel(QFrame):
         convs = state.setdefault("conversations", {})
         for conv_id, panel in self._panels.items():
             try:
-                convs[conv_id] = {"tabs": panel.persistence_tabs(deep=deep)}
+                convs[conv_id] = {
+                    "tabs": panel.persistence_tabs(deep=deep),
+                    "view_mode": getattr(panel, "_view_mode", "tabbed"),
+                    "grid_columns": getattr(panel, "_grid_columns", 0),
+                }
             except Exception:
                 pass
         save_state(state)
@@ -1619,6 +2008,21 @@ class MultiConvTerminalPanel(QFrame):
         panel = self.get_or_create_panel(conv_id)
         self._stack.setCurrentWidget(panel)
         self._current_conv_id = conv_id or "_default"
+
+    def active_backend_for(self, conv_id: str):
+        """The live PtyBackend of a conversation's ACTIVE terminal tab, or None
+        if it has no terminal panel / session yet. Used to attach a remote
+        viewer to the host's real shell (e.g. an agent running in it)."""
+        panel = self._panels.get(conv_id) or self._panels.get(conv_id or "_default")
+        if panel is None:
+            return None
+        try:
+            idx = panel._current_index()
+            if 0 <= idx < len(panel._sessions):
+                return panel._sessions[idx]._backend
+        except Exception:
+            pass
+        return None
 
     def remove_conv(self, conv_id: str):
         """Conversation deleted — kill all of its terminal sessions and drop
@@ -1692,6 +2096,14 @@ class MultiConvTerminalPanel(QFrame):
         p = self.active_panel()
         if p is not None:
             p.focus_active_input()
+
+    def clear_active_highlight(self):
+        """Clear accent borders on every conversation's terminal grid."""
+        for panel in self._panels.values():
+            try:
+                panel.clear_active_highlight()
+            except Exception:
+                pass
 
     def close_all_sessions(self):
         # Reset just the active conversation's panel — used by

@@ -684,7 +684,26 @@ class CodeEditor(QPlainTextEdit):
         try:
             content = open(self._file_path, "r", encoding="utf-8", errors="replace").read()
             self.blockSignals(True)
+            # Mirror load_file's large-file fast path: suppress the live
+            # pygments lexer during the bulk insert and rehighlight in
+            # background chunks. Without this, reloading a big file on a
+            # disk change (agent edits, file-watcher reloads) restyles
+            # synchronously on the UI thread and stutters.
+            large = (
+                len(content) >= self._PASTE_FAST_PATH_CHARS
+                or content.count("\n") >= self._PASTE_FAST_PATH_LINES
+            )
+            h = self._highlighter
+            saved_lexer = getattr(h, "_lexer", None)
+            if large:
+                h._lexer = None
+                self.setUpdatesEnabled(False)
             self.setPlainText(content)
+            if large:
+                self.setUpdatesEnabled(True)
+                h._lexer = saved_lexer
+                end_block = max(0, self.document().blockCount() - 1)
+                self._schedule_rehighlight_range(0, end_block)
             self.blockSignals(False)
             cursor.setPosition(min(pos, len(content)))
             self.setTextCursor(cursor)
@@ -1173,6 +1192,7 @@ class _FileViewerTerminalPanel(QFrame):
         self._list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._list.currentRowChanged.connect(self._on_list_row_changed)
         self._list.itemDoubleClicked.connect(self._rename_item)
+        self._list.setToolTip("Double-click a terminal name to rename")
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._on_list_context_menu)
         side_lay.addWidget(self._list, stretch=1)
@@ -1180,6 +1200,10 @@ class _FileViewerTerminalPanel(QFrame):
         root.addWidget(side)
 
         self._apply_palette(PALETTE)
+        self._title_timer = QTimer(self)
+        self._title_timer.setInterval(2000)
+        self._title_timer.timeout.connect(self._tick_auto_titles)
+        self._title_timer.start()
         self._restore_saved_or_default()
 
     def _request_collapse(self):
@@ -1199,10 +1223,15 @@ class _FileViewerTerminalPanel(QFrame):
 
     def add_terminal(self, label: str | None = None):
         self._tab_seq += 1
+        default = label or f"Terminal {self._tab_seq}"
         sess = self._SessionCls(cwd=self._resolve_cwd(), parent=self)
+        sess.default_tab_title = default
+        sess._on_title_refresh = lambda s=sess: self._sync_title_for_session(s)
+        if label:
+            sess.set_user_tab_title(label)
         self._sessions.append(sess)
         self._stack.addWidget(sess)
-        item = QListWidgetItem(label or f"Terminal {self._tab_seq}")
+        item = QListWidgetItem(sess.display_title())
         self._list.addItem(item)
         self._list.setCurrentRow(len(self._sessions) - 1)
         QTimer.singleShot(50, sess.focus_terminal)
@@ -1217,8 +1246,10 @@ class _FileViewerTerminalPanel(QFrame):
             except Exception:
                 info = {"cwd": "", "resume": None, "command": ""}
             item = self._list.item(i)
+            sess = self._sessions[i]
             out.append({
-                "title": item.text() if item else f"Terminal {i+1}",
+                "title": sess.user_tab_title or (item.text() if item else f"Terminal {i+1}"),
+                "user_title": bool(sess.user_tab_title),
                 "cwd": info.get("cwd") or "",
                 "resume": info.get("resume"),
                 "command": info.get("command") or "",
@@ -1241,21 +1272,51 @@ class _FileViewerTerminalPanel(QFrame):
         for t in tabs:
             self._restore_terminal(
                 t.get("cwd", ""), t.get("title", ""),
-                t.get("resume"), t.get("command", ""))
+                t.get("resume"), t.get("command", ""),
+                user_title=bool(t.get("user_title")),
+            )
         self._list.setCurrentRow(0)
 
     def _restore_terminal(self, cwd: str, title: str = "",
-                          resume: str | None = None, command: str = ""):
+                          resume: str | None = None, command: str = "",
+                          *, user_title: bool = False):
         self._tab_seq += 1
         target = cwd if (cwd and os.path.isdir(cwd)) else self._resolve_cwd()
+        label = title or f"Terminal {self._tab_seq}"
         sess = self._SessionCls(cwd=target, parent=self)
+        sess.default_tab_title = label
+        sess._on_title_refresh = lambda s=sess: self._sync_title_for_session(s)
+        if user_title and title:
+            sess.set_user_tab_title(title)
         self._sessions.append(sess)
         self._stack.addWidget(sess)
-        self._list.addItem(QListWidgetItem(title or f"Terminal {self._tab_seq}"))
+        self._list.addItem(QListWidgetItem(sess.display_title()))
         prefill = resume or command
         if prefill:
             sess.prefill(prefill)
         QTimer.singleShot(50, sess.focus_terminal)
+
+    def _sync_list_title(self, index: int) -> None:
+        if not (0 <= index < len(self._sessions)):
+            return
+        item = self._list.item(index)
+        if item is not None:
+            item.setText(self._sessions[index].display_title())
+
+    def _sync_title_for_session(self, session) -> None:
+        try:
+            self._sync_list_title(self._sessions.index(session))
+        except ValueError:
+            pass
+
+    def _tick_auto_titles(self) -> None:
+        for i, sess in enumerate(self._sessions):
+            if sess.user_tab_title:
+                continue
+            item = self._list.item(i)
+            new = sess.display_title()
+            if item is None or item.text() != new:
+                self._sync_list_title(i)
 
     def _on_list_row_changed(self, row: int):
         if 0 <= row < len(self._sessions):
@@ -1279,11 +1340,16 @@ class _FileViewerTerminalPanel(QFrame):
             self.add_terminal()
 
     def _rename_item(self, item: QListWidgetItem):
+        row = self._list.row(item)
+        if row < 0 or row >= len(self._sessions):
+            return
+        sess = self._sessions[row]
         new, ok = QInputDialog.getText(
-            self, "Rename terminal", "Name:", text=item.text()
+            self, "Rename terminal", "Name:", text=sess.display_title(),
         )
         if ok and new.strip():
-            item.setText(new.strip())
+            sess.set_user_tab_title(new.strip())
+            item.setText(sess.display_title())
 
     def _on_list_context_menu(self, pos):
         idx = self._list.indexAt(pos).row()
@@ -1884,6 +1950,188 @@ class FileViewer(QFrame):
         when switching conversations (each conv restores its own saved spot)."""
         self._explorer_user_pinned = False
 
+    # ── Remote workspace (mirror a peer conversation's files) ──────────────
+    # The explorer/editor are local-disk based, so we mirror the host's
+    # workspace into a local "shadow" folder of placeholder files. The tree is
+    # the host's structure; a file's real content is fetched on first open and
+    # edits are pushed back to the host on save. Everything else (tabs, editor,
+    # watcher, diff overlays) keeps working unchanged.
+
+    def _remote_cache_base(self) -> str:
+        base = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "remote_cache")
+        os.makedirs(base, exist_ok=True)
+        return base
+
+    def enter_remote_workspace(self, peer_url: str, conv_id: str,
+                               peer_name: str) -> None:
+        """Point the explorer at a PEER conversation's workspace (read+write)."""
+        import re as _re
+        import shutil
+        safe = lambda s: _re.sub(r"[^A-Za-z0-9_.-]", "_", s or "x")[:60]
+        root = os.path.join(self._remote_cache_base(), safe(peer_name), safe(conv_id))
+        try:
+            if os.path.isdir(root):
+                shutil.rmtree(root, ignore_errors=True)   # fresh shadow each time
+            os.makedirs(root, exist_ok=True)
+        except Exception:
+            pass
+        self._remote_ws = {"peer_url": peer_url, "conv_id": conv_id,
+                           "peer_name": peer_name, "root": os.path.abspath(root),
+                           "dirs": set(), "files": set()}
+        if not getattr(self, "_remote_expand_wired", False):
+            self._file_tree.expanded.connect(self._on_remote_expand)
+            self._remote_expand_wired = True
+        self._materialize_remote_dir("")            # top-level listing
+        self.set_explorer_root(root, pinned=True)
+
+    def exit_remote_workspace(self) -> None:
+        self._remote_ws = None
+
+    def _remote_rel(self, path: str) -> str | None:
+        """Path relative to the active shadow root (posix), or None if `path`
+        is not part of the remote workspace."""
+        rw = getattr(self, "_remote_ws", None)
+        if not rw:
+            return None
+        try:
+            rel = os.path.relpath(os.path.abspath(path), rw["root"])
+        except Exception:
+            return None
+        if rel.startswith("..") or os.path.isabs(rel):
+            return None
+        return "" if rel == "." else rel.replace("\\", "/")
+
+    def _materialize_remote_dir(self, rel: str) -> None:
+        """Fetch a remote directory listing and create local placeholder
+        dirs/empty-files so the QFileSystemModel tree shows the host structure."""
+        rw = getattr(self, "_remote_ws", None)
+        if not rw or rel in rw["dirs"]:
+            return
+        from core.network import peer_fs_list
+        from PyQt6.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ok, res, _ = peer_fs_list(rw["peer_url"], rw["conv_id"], rel)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok or not res:
+            return
+        rw["dirs"].add(rel)
+        base = os.path.join(rw["root"], rel) if rel else rw["root"]
+        for e in res.get("entries", []):
+            child = os.path.join(base, e["name"])
+            try:
+                if e.get("is_dir"):
+                    os.makedirs(child, exist_ok=True)
+                elif not os.path.exists(child):
+                    open(child, "a", encoding="utf-8").close()
+            except Exception:
+                pass
+
+    def _on_remote_expand(self, index) -> None:
+        rw = getattr(self, "_remote_ws", None)
+        if not rw:
+            return
+        try:
+            path = self._fs_model.filePath(index)
+        except Exception:
+            return
+        rel = self._remote_rel(path)
+        if rel is not None:
+            self._materialize_remote_dir(rel)
+
+    def _fetch_remote_file(self, path: str) -> None:
+        """Pull the host's current content into a shadow file before it's read."""
+        rw = getattr(self, "_remote_ws", None)
+        rel = self._remote_rel(path)
+        if not rw or rel is None or rel in rw["files"]:
+            return
+        from core.network import peer_fs_read
+        from PyQt6.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ok, text, _ = peer_fs_read(rw["peer_url"], rw["conv_id"], rel)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if ok:
+            try:
+                # newline="" → write the host's bytes verbatim (no \n→\r\n
+                # re-translation), so the shadow file is byte-identical to the
+                # host file and the editor renders it exactly as a local one.
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(text)
+                rw["files"].add(rel)
+            except Exception:
+                pass
+
+    def _on_remote_editor_saved(self, path: str) -> None:
+        """Push a saved shadow file back to the host (off the UI thread). The
+        host commits it in its workspace."""
+        rw = getattr(self, "_remote_ws", None)
+        rel = self._remote_rel(path)
+        if not rw or rel is None:
+            return
+        try:
+            content = open(path, "r", encoding="utf-8", errors="replace").read()
+        except Exception:
+            return
+        import threading
+        from core.network import peer_fs_write
+        peer_url, conv_id = rw["peer_url"], rw["conv_id"]
+        threading.Thread(
+            target=lambda: peer_fs_write(peer_url, conv_id, rel, content),
+            daemon=True, name="remote-fs-write").start()
+
+    def _remote_fs_call(self, kind: str, *args) -> None:
+        """Propagate an explorer mutation (rename/delete/mkdir/new file) to the
+        host, off the UI thread. No-op when not in a remote workspace."""
+        rw = getattr(self, "_remote_ws", None)
+        if not rw:
+            return
+        import threading
+        from core import network as _net
+        peer_url, conv_id = rw["peer_url"], rw["conv_id"]
+
+        def _do():
+            try:
+                if kind == "rename":
+                    _net.peer_fs_rename(peer_url, conv_id, args[0], args[1])
+                elif kind == "delete":
+                    _net.peer_fs_delete(peer_url, conv_id, args[0])
+                elif kind == "mkdir":
+                    _net.peer_fs_mkdir(peer_url, conv_id, args[0])
+                elif kind == "write":
+                    _net.peer_fs_write(peer_url, conv_id, args[0], args[1])
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True, name=f"remote-fs-{kind}").start()
+
+    def _remote_push_rename(self, old_path: str, new_path: str) -> None:
+        a, b = self._remote_rel(old_path), self._remote_rel(new_path)
+        if a is not None and b is not None:
+            self._remote_fs_call("rename", a, b)
+
+    def _remote_push_delete(self, path: str) -> None:
+        rel = self._remote_rel(path)
+        if rel is not None:
+            self._remote_fs_call("delete", rel)
+
+    def _remote_push_mkdir(self, path: str) -> None:
+        rel = self._remote_rel(path)
+        if rel is not None:
+            self._remote_fs_call("mkdir", rel)
+
+    def _remote_push_new_file(self, path: str) -> None:
+        rel = self._remote_rel(path)
+        if rel is None:
+            return
+        rw = getattr(self, "_remote_ws", None)
+        if rw is not None:
+            rw["files"].add(rel)   # treat as fetched so open() keeps the new empty file
+        self._remote_fs_call("write", rel, "")
+
     def get_explorer_root(self) -> str:
         """Current sidebar tree root — saved per conversation so the user's
         navigation spot survives restarts."""
@@ -2086,6 +2334,7 @@ class FileViewer(QFrame):
             QMessageBox.warning(self, "Rename", str(e))
             return
         self._relocate_tabs_after_rename(path, dest, is_dir)
+        self._remote_push_rename(path, dest)      # propagate to host if remote
         self._ping_explorer_fs_model()
         self._sync_file_tree_selection(self._current_path)
 
@@ -2176,6 +2425,7 @@ class FileViewer(QFrame):
                 err or "Could not move to the Recycle Bin.",
             )
             return
+        self._remote_push_delete(path)            # delete on host too if remote
         self._ping_explorer_fs_model()
         self._sync_file_tree_selection(self._current_path)
 
@@ -2201,6 +2451,7 @@ class FileViewer(QFrame):
         except OSError as e:
             QMessageBox.warning(self, "New file", str(e))
             return
+        self._remote_push_new_file(dest)          # create on host too if remote
         self._ping_explorer_fs_model()
         self.load_file(dest)
 
@@ -2225,6 +2476,7 @@ class FileViewer(QFrame):
         except OSError as e:
             QMessageBox.warning(self, "New folder", str(e))
             return
+        self._remote_push_mkdir(dest)             # create on host too if remote
         self._ping_explorer_fs_model()
         dest_abs = os.path.abspath(dest)
         nix = self._fs_model.index(dest_abs)
@@ -3153,6 +3405,9 @@ class FileViewer(QFrame):
         if not os.path.isfile(path):
             return
         abs_path = os.path.abspath(path)
+        # Remote workspace: pull the host's current content into the shadow file
+        # before anything reads it (no-op for local files).
+        self._fetch_remote_file(abs_path)
         # Check if already open (skip scratch tabs with no path)
         for i, tab in enumerate(self._tabs):
             tp = tab.get("path") or ""
@@ -3193,6 +3448,9 @@ class FileViewer(QFrame):
             widget = CodeEditor()
             widget.setStyleSheet(self._code_editor_stylesheet(p))
             editable = True
+            # Push edits back to the host when this is a remote-workspace file
+            # (the handler no-ops for local files).
+            widget.file_saved.connect(self._on_remote_editor_saved)
 
         # Apply saved wrap preference for this extension
         wrap = self._get_wrap_for_ext(ext)
