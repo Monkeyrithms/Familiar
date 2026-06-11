@@ -29,6 +29,7 @@
 <a href="#sub-agents">Sub-agents</a> &nbsp;·&nbsp;
 <a href="#scheduled-tasks">Scheduled Tasks</a> &nbsp;·&nbsp;
 <a href="#mcp-integration">MCP Integration</a> &nbsp;·&nbsp;
+<a href="#familiar-net-peer-networking">Familiar-Net</a> &nbsp;·&nbsp;
 <a href="#safety--defense-in-depth">Safety &amp; Defense-in-Depth</a> &nbsp;·&nbsp;
 <a href="#theming">Theming</a> &nbsp;·&nbsp;
 <a href="#data--file-layout">Data &amp; File Layout</a> &nbsp;·&nbsp;
@@ -50,6 +51,7 @@
 - **Sub-agent orchestration** — decompose a goal into a dependency-aware task graph and run sub-agents in parallel, each with its own context and filtered toolset.
 - **Scheduled tasks** — recurring or one-shot prompts on a cron/interval schedule, with sound/visual/delivery actions.
 - **MCP client** — connect Model Context Protocol servers over stdio / streamable-HTTP / SSE, with OAuth 2.0 (PKCE) for HTTP servers.
+- **Familiar-Net** — link two or more Familiar machines over an authenticated tunnel (Cloudflare quick-tunnel or your own ngrok/proxy). Sync a shared folder, and **remote into a peer's conversation** — mirror its chat live while the *host* runs the inference and tools, drive its terminal and files, and have it screenshot its own desktop for you.
 - **Safety built in** — prompt-injection scanning (zero-token local regex), command risk analysis, secret redaction, and untrusted-data fencing of all tool output.
 - **Themable UI** — one base color + brightness drives the entire palette (dark or light), with an optional retro CRT scanline overlay.
 
@@ -130,7 +132,7 @@ Keys live in `keys.json` (one entry per provider). Recognized keys:
 
 You can edit `keys.json` directly or use **Settings → API Keys**. Anthropic and OpenAI can also authenticate via existing **OAuth** credentials (Claude Code / Codex) rather than a raw key.
 
-> ⚠️ **Do not commit `keys.json` (or `config.json`, which may hold a `google_api_key`) to source control.** Keep them local.
+> ⚠️ **`keys.json` and `config.json` hold secrets** — your API keys, and your Familiar-Net shared secret (effectively an SSH key to your other machines). Keep them private.
 
 ### Behavior — `config.json`
 
@@ -150,6 +152,7 @@ You can edit `keys.json` directly or use **Settings → API Keys**. Anthropic an
 | `workspaces` | Named workspace folders (path + optional venv) |
 | `base_color`, `brightness`, `crt_enabled`, `crt_speed` | Theme + CRT overlay |
 | `tts_backend`, `tts_voice`, `vision_model` | Audio / vision config |
+| `network` | Familiar-Net settings — node name, **shared secret**, port, tunnel/peers, notes-sharing toggle (Settings → Network) |
 | `tool_display_mode`, `show_usage`, `show_timestamps`, `ui_sounds` | UI preferences |
 
 ---
@@ -187,7 +190,7 @@ The window is split into the **chat** (left) and a tabbed **right workspace**.
 - **Settings** — UI/theme, API keys, model selection, workspaces, system prompt, audio, and a tools table (enable/disable, descriptions, invocation counts)
 - **Tasks** — the scheduler (conditions + actions pipeline with validity highlighting and countdowns)
 - **Memory** — manage memory streams, browse/edit notes, configure rolling-summary guidance
-- **Per-conversation settings** — override model, system prompt, and memory-stream read/write access, plus a **Debug panel** showing the exact full context sent to the model each turn
+- **Per-conversation settings** — override model, system prompt, and memory-stream read/write access; a **Network** tab controls what the conversation exposes over Familiar-Net (private, remote-terminal opt-in, notes/calendar sharing); plus a **Debug panel** showing the exact full context sent to the model each turn
 
 ---
 
@@ -298,7 +301,8 @@ Tools self-register on import (`tools/registry.py`, `tools/__init__.py`). Each d
 | `ssh_tool` | Run commands on remote hosts (paramiko / system ssh) |
 | `clipboard` | Read/write the system clipboard |
 | `notify` | Send email (SMTP) or webhook notifications |
-| `screenshot` | Capture Familiar's own window |
+| `peer_network` | Check connected Familiar peers and message your other machines over Familiar-Net |
+| `screenshot` | Capture Familiar's window, the whole desktop, a monitor, or an external window — shared to a remote viewer when the conversation is mirrored |
 | `play_sound` | Queue a sound for playback |
 | `audit` | Token/cost auditor (per-turn counts, hotspots, per-tool stats) |
 
@@ -351,6 +355,28 @@ The scheduler (Tasks dialog + `tools/tasks.py`, stored in `tasks.json`) runs pro
 
 ---
 
+## Familiar-Net (peer networking)
+
+Run Familiar on two or more machines and let them reach each other over an authenticated tunnel — no port-forwarding, no static IPs. Set up in **Settings → Network** (`core/network.py`).
+
+- **Transport** — a small HTTP/WebSocket server bound to `127.0.0.1`, exposed publicly via a **Cloudflare quick-tunnel** (one-click `cloudflared` download) *or* any tunnel/reverse proxy you already run — paste its URL, or **auto-detect a running ngrok**. Every request is signed with a **shared secret** (HMAC-SHA256, 30-second replay window); the secret itself never crosses the wire. Connect machines by exchanging their public URLs as peers (the same secret on each).
+- **File share** — drop a file into the **`file_share/`** folder and it syncs to every connected peer (additive union, newest-wins on edits; local deletes don't cascade; very large files skipped).
+- **Remote conversations** — a peer's conversations appear in your dropdown under a `🌐 <machine>` group. Open one and you **mirror it live**: the message stream, the active tool tab, and the splitter layout all match the host. The **host does the heavy lifting** — *its* agent runs the inference and *its* tools execute and commit on *its* machine — while your window streams the I/O and drives it (type a message and the host runs the turn, streaming the reply back).
+- **Remote workspace tools** (while mirroring, the right-side panels operate on the **host**):
+  - **File viewer** → browse, open, edit, save, create, rename, and delete files in the host conversation's workspace (writes commit on the host; scoped to that workspace with path-traversal guards).
+  - **Terminal** → attaches to the host's **live shell** over a WebSocket — you see its scrollback (e.g. an agent already running inside it) and your keystrokes drive it, like a shared session.
+  - **Notes / Calendar / Browser** → mirror the host's notes, task calendar, and the conversation's current page.
+  - **Screenshots** → the `screenshot` tool can grab the host's whole **desktop**, a specific **monitor**, or an external **window**, and the image is shared into your mirror — so a remote operator can *see* the host's screen.
+- **Privacy & control** — per conversation, under **Conversation → Network**:
+  - **Private** — keep a conversation off the net entirely (invisible to peers; no mirror, files, or input).
+  - **Allow remote terminal** — opt-in per conversation; **off by default**, because it grants a real shell (code execution) on the machine.
+  - **Share Notes & Calendar** — a machine-wide switch (those stores are global, not per-conversation).
+- **Agent tool** — `peer_network` lets the agent check peer reachability and message your other machines.
+
+> **Trust model:** the shared secret is the gate — **treat it like an SSH key.** Anyone holding it can mirror your shared conversations and, where you've explicitly enabled it, open a shell. The peers list is an *outbound address book*, not an inbound allowlist; inbound is authenticated by the secret alone. Keep it strong and private, and use the **Private** flag and per-conversation **terminal opt-in** to bound what's exposed.
+
+---
+
 ## Safety & Defense-in-Depth
 
 - **Prompt-injection scanner** (`core/prompt_injection.py`) — zero-token local regex over external content (files, web pages, tool output): invisible/bidi codepoints, fake role markers, jailbreak phrasing, ChatML/HTML control tokens. Hostile content is blocked; suspicious content warns the model.
@@ -373,14 +399,15 @@ The entire palette is derived from a single **base color** + **brightness** valu
 ```
 Apps/Agent/
 ├── main.py                 # entry point: window, single-instance guard, lifecycle
-├── config.json             # behavior + UI config (KEEP LOCAL — may hold a key)
-├── keys.json               # API keys (KEEP LOCAL — never commit)
+├── config.json             # behavior + UI config (private — may hold keys/secret)
+├── keys.json               # API keys (private)
 ├── tasks.json              # scheduled tasks
 ├── requirements.txt        # Python deps (PyQt6 installed separately)
 ├── START.bat / Agent.lnk   # Windows launchers (no console)
-├── assets/                 # app icons
+├── assets/                 # app icons (neutral default agent.ico/png)
 ├── sounds/                 # UI sound effects
-├── core/                   # agent loop, providers, memory, safety, MCP, LSP, …
+├── file_share/             # Familiar-Net synced folder (drop files to share)
+├── core/                   # agent loop, providers, memory, safety, MCP, network, LSP, …
 ├── tools/                  # ~55 self-registering, hot-reloadable tools
 ├── ui/                     # PyQt6 widgets, dialogs, theme, terminal, browser
 └── data/                   # runtime state (created as needed):
@@ -389,7 +416,9 @@ Apps/Agent/
     ├── checkpoints/                # shadow-git filesystem snapshots
     ├── worktrees/                  # git worktrees
     ├── webengine_workspace/        # embedded browser profile
+    ├── remote_cache/               # mirrored peer workspaces (Familiar-Net)
     ├── image_cache / audio_cache / streams / summaries / voice_refs
+    ├── agent.ico                   # your accent-colored launcher icon (generated)
     ├── window_state.json           # window geometry
     ├── mcp_tokens.json             # MCP OAuth tokens
     └── error_log.txt               # tool failure log
