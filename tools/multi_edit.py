@@ -71,6 +71,11 @@ def multi_edit(path: str, edits: list) -> str:
     except Exception as e:
         return json.dumps({"error": f'Could not read "{path}": {e}'})
 
+    # Snapshot diagnostics before any edit so the post-edit report shows only
+    # the errors this sequence introduced, not the file's pre-existing pile.
+    from tools.lint import snapshot_diagnostics
+    baseline = snapshot_diagnostics(path)
+
     # Checkpoint before mutation
     from core.checkpoints import checkpoint_manager
     checkpoint_manager.ensure_checkpoint(str(p.parent), "before multi_edit")
@@ -101,7 +106,7 @@ def multi_edit(path: str, edits: list) -> str:
     if uses_crlf:
         working = working.replace("\n", "\r\n")
 
-    from tools.lint import safe_write_text, validate_file
+    from tools.lint import safe_write_text, build_validation_result
     write_err = safe_write_text(path, working)
     if write_err:
         return json.dumps({"error": write_err})
@@ -113,29 +118,11 @@ def multi_edit(path: str, edits: list) -> str:
     from core.sounds import play_edit_sound
     play_edit_sound(path)
 
-    # Combined lint + LSP. Surface errors as a top-level `error`/`diagnostics`
-    # field so the model can't gloss past them buried in a status string.
-    validation = validate_file(path)
-    result: dict = {
-        "status": f'Applied {len(applied)} edit(s) to "{path}".',
-        "edits": applied,
-    }
-    diags = validation.get("diagnostics", [])
-    errors = [d for d in diags if d.get("severity") == "error"]
-    warnings = [d for d in diags if d.get("severity") == "warning"]
-    if errors:
-        result["error"] = (
-            f"Validation failed: {len(errors)} error(s) in the edited file. "
-            "Re-read the file, fix the issues below, and edit again."
-        )
-        result["diagnostics"] = errors
-    elif warnings:
-        result["warnings"] = warnings
-    if validation.get("semantic_check_ran") is False and p.suffix.lower() in {".py", ".pyi"}:
-        result["note"] = (
-            "Python semantic check skipped (install `ruff` or `pyflakes` to "
-            "catch missing imports / undefined names)."
-        )
+    # Combined lint + LSP via the shared shaper — only NEW errors surface as a
+    # top-level `error`/`diagnostics` field; pre-existing noise is suppressed.
+    status = f'Applied {len(applied)} edit(s) to "{path}".'
+    result = build_validation_result(path, status, baseline=baseline)
+    result["edits"] = applied
     return json.dumps(result)
 
 

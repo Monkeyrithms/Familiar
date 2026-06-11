@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from core.agent import load_config, save_config
+from core.proc import NO_WINDOW
 from core.workspace_paths import resolve_workspace_entry_path, to_config_workspace_path
 from tools.registry import registry
 
@@ -16,6 +16,7 @@ from tools.registry import registry
 def workspace(action: str, name: str = None, path: str = None,
               create_venv: bool = False) -> str:
     """Manage workspaces."""
+    from core.agent import load_config, save_config  # lazy: avoid circular import
     cfg = load_config()
     workspaces = cfg.get("workspaces", {})
 
@@ -49,7 +50,8 @@ def workspace(action: str, name: str = None, path: str = None,
             venv_path = os.path.join(full_path, ".venv")
             result = subprocess.run(
                 [sys.executable, "-m", "venv", venv_path],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60,
+                creationflags=NO_WINDOW)  # no console flash on Windows
             if result.returncode == 0:
                 ws_entry["venv"] = to_config_workspace_path(venv_path)
             else:

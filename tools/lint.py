@@ -34,6 +34,10 @@ LINTERS = {
 
 TIMEOUT = 30  # seconds
 
+# Suppress the console window Windows otherwise allocates for console-subsystem
+# children (ruff.exe, etc.) when the parent is a GUI process with no console.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 # Cache which CLI tools are available (check once per session)
 _available: dict[str, bool] = {}
 
@@ -61,6 +65,38 @@ def _tool_argv(cmd: str) -> list[str]:
 
 # Pyflakes/ruff line-prefixed message regex: "path:line:col: code? message"
 _PY_DIAG_RE = re.compile(r"^[^:]+:(\d+):(?:\d+:)?\s*(\w+)?\s*(.+)$")
+
+
+# Ruff/pyflakes codes that signal a genuine RUNTIME failure (NameError, syntax,
+# etc.) — only these are "error". Everything else pyflakes/ruff emits (unused
+# import F401, unused var F841, redefinition F811, f-string nits, style) is
+# real-but-nonfatal and is classified "warning": it informs without blocking
+# an edit or masquerading as breakage. This is what kills the F401-on-a-
+# side-effect-import noise — an unused import never crashes a program, so it
+# was wrong to surface it as a top-level error.
+_PY_ERROR_PREFIXES = ("E9", "F82", "F70", "F831")
+_PY_NONFATAL_HINTS = (
+    "imported but unused",
+    "assigned to but never used",
+    "redefinition of unused",
+    "imported but unused",
+    "may be undefined, or defined from star imports",
+)
+
+
+def _py_severity(code: str | None, message: str) -> str:
+    """Classify a Python diagnostic as 'error' (runtime-breaking) or 'warning'
+    (real but nonfatal). Used for both ruff (has codes) and pyflakes (often
+    code-less, so we fall back to message text)."""
+    code = code or ""
+    if code.startswith(_PY_ERROR_PREFIXES):
+        return "error"
+    if code:
+        return "warning"
+    msg = (message or "").lower()
+    if any(hint in msg for hint in _PY_NONFATAL_HINTS):
+        return "warning"
+    return "error"
 
 
 def _check_python(path: str) -> dict:
@@ -199,6 +235,7 @@ def _run_ruff(path: str) -> list[dict]:
         result = subprocess.run(
             _tool_argv("ruff") + ["check", "--output-format=json", "--exit-zero", str(path)],
             capture_output=True, text=True, timeout=TIMEOUT,
+            creationflags=_NO_WINDOW,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
@@ -216,12 +253,9 @@ def _run_ruff(path: str) -> list[dict]:
     diags: list[dict] = []
     for it in items:
         code = it.get("code") or ""
-        # F-rules (pyflakes-equivalent) are real errors. E9xx are syntax.
-        # Other categories are stylistic — flag them as warnings, not errors.
-        is_error = code.startswith(("F", "E9"))
         diags.append({
             "source": "ruff",
-            "severity": "error" if is_error else "warning",
+            "severity": _py_severity(code, it.get("message", "")),
             "line": (it.get("location") or {}).get("row"),
             "code": code,
             "message": it.get("message", ""),
@@ -235,6 +269,7 @@ def _run_pyflakes(path: str) -> list[dict]:
         result = subprocess.run(
             _tool_argv("pyflakes") + [str(path)],
             capture_output=True, text=True, timeout=TIMEOUT,
+            creationflags=_NO_WINDOW,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
@@ -249,7 +284,7 @@ def _run_pyflakes(path: str) -> list[dict]:
             continue
         diags.append({
             "source": "pyflakes",
-            "severity": "error",  # pyflakes only emits real problems
+            "severity": _py_severity(m.group(2), m.group(3)),
             "line": int(m.group(1)),
             "code": m.group(2) or None,
             "message": m.group(3).strip(),
@@ -269,6 +304,7 @@ def _check_generic(path: str, cmd_template: list[str]) -> dict:
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=TIMEOUT,
+            creationflags=_NO_WINDOW,
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "diagnostics": [{
@@ -365,6 +401,127 @@ def validate_file(path: str) -> dict:
         "diagnostics": diags,
         "semantic_check_ran": semantic_ran,
     }
+
+
+def _diag_signature(d: dict) -> tuple:
+    """A line-INDEPENDENT identity for a diagnostic. Line numbers shift when
+    you insert/delete code, so they can't be part of the identity — otherwise
+    every pre-existing error below an inserted line would look 'new'. Identity
+    is (source, code, normalized message). Trailing quoted names ('foo') are
+    kept because they distinguish 'undefined name x' from 'undefined name y'.
+    """
+    msg = (d.get("message") or "").strip()
+    # Collapse run-of-the-mill numeric noise (column counts, etc.) so the same
+    # logical message matches even if a number wiggles.
+    msg = re.sub(r"\b\d+\b", "#", msg)
+    return (d.get("source"), d.get("code"), msg)
+
+
+def snapshot_diagnostics(path: str) -> list[dict] | None:
+    """Capture a file's current diagnostics BEFORE an edit, so the post-edit
+    delta can show only what the edit introduced. Returns None if the file
+    doesn't exist yet (a fresh Add) — the caller treats that as 'no baseline'.
+    """
+    if not Path(path).exists():
+        return None
+    try:
+        return validate_file(path).get("diagnostics", []) or []
+    except Exception:
+        return None
+
+
+def diff_diagnostics(before: list[dict] | None,
+                     after: list[dict]) -> dict:
+    """Compare a before/after diagnostic set and split 'after' into the errors
+    the edit INTRODUCED versus ones that were already there.
+
+    Matching is by line-independent signature and is multiset-aware: if a file
+    had two identical pre-existing warnings and still has two, neither is 'new';
+    if it now has three, exactly one is 'new'. Returns:
+
+        {
+          "introduced":  [diags the edit added],
+          "introduced_errors": [subset with severity == error],
+          "preexisting_count": N,        # how many we suppressed as not-yours
+          "ok": bool,                    # True if the edit introduced no errors
+        }
+    """
+    from collections import Counter
+    before_counts: Counter = Counter(
+        _diag_signature(d) for d in (before or []))
+    introduced: list[dict] = []
+    for d in after:
+        sig = _diag_signature(d)
+        if before_counts.get(sig, 0) > 0:
+            before_counts[sig] -= 1   # account for one pre-existing instance
+        else:
+            introduced.append(d)
+    introduced_errors = [d for d in introduced
+                         if d.get("severity") == "error"]
+    preexisting = len(after) - len(introduced)
+    return {
+        "introduced": introduced,
+        "introduced_errors": introduced_errors,
+        "preexisting_count": preexisting,
+        "ok": not introduced_errors,
+    }
+
+
+def build_validation_result(path: str, status: str,
+                            baseline: list[dict] | None = None,
+                            error_prefix: str = "") -> dict:
+    """Shared post-edit validation shape for every edit tool (file_write,
+    file_edit, multi_edit, apply_patch). Runs validate_file, and — when a
+    pre-edit *baseline* is supplied — surfaces only the errors THIS edit
+    introduced, suppressing the file's pre-existing noise.
+
+    error_prefix may contain "{n}", replaced with the introduced-error count.
+    Returns a result dict (caller json.dumps it) with `status`, optional
+    `error`+`diagnostics` (introduced errors only), optional `warnings`, and
+    an optional `note`.
+    """
+    result: dict = {"status": status}
+    try:
+        validation = validate_file(path)
+    except Exception:
+        return result
+    after = validation.get("diagnostics", []) or []
+
+    if baseline is None:
+        errors = [d for d in after if d.get("severity") == "error"]
+        suppressed = 0
+    else:
+        delta = diff_diagnostics(baseline, after)
+        errors = delta["introduced_errors"]
+        suppressed = delta["preexisting_count"]
+    warnings = [d for d in after if d.get("severity") == "warning"]
+
+    if errors:
+        if error_prefix:
+            prefix = error_prefix.replace("{n}", str(len(errors)))
+        else:
+            prefix = f"This edit introduced {len(errors)} new error(s). "
+        result["error"] = (
+            prefix + "Re-read, fix the issues below, and edit again."
+            + ("" if baseline is None else
+               " (Pre-existing errors are not shown.)")
+        )
+        result["diagnostics"] = errors
+    elif warnings:
+        result["warnings"] = warnings[:10]
+
+    if suppressed:
+        result["note"] = (
+            f"{suppressed} pre-existing diagnostic(s) left as-is "
+            "(not introduced by this edit)."
+        )
+    if validation.get("semantic_check_ran") is False and \
+            Path(path).suffix.lower() in {".py", ".pyi"}:
+        prior = result.get("note", "")
+        sem = ("Python semantic check skipped (install `ruff` or `pyflakes` "
+               "to catch missing imports / undefined names).")
+        result["note"] = (prior + " " + sem).strip() if prior else sem
+    return result
 
 
 def safe_write_text(path: str, content: str, encoding: str = "utf-8") -> str | None:

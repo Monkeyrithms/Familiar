@@ -23,12 +23,13 @@ from tools.registry import registry
 
 def reflect(when: str = "after", scope: str = "turn",
             criteria: str = "", action: str = "enable") -> str:
-    from core.agent import _active_agent
-    if _active_agent is None:
+    from core.agent import current_agent
+    agent = current_agent()
+    if agent is None:
         return json.dumps({"error": "No active agent to attach reflection to."})
 
     if action == "cease":
-        _active_agent.clear_reflection()
+        agent.clear_reflection()
         return json.dumps({"status": "Reflection ceased."})
 
     when = (when or "after").lower().strip()
@@ -43,7 +44,7 @@ def reflect(when: str = "after", scope: str = "turn",
                      "against (e.g. \"don't write the user's character\")."
         })
 
-    _active_agent.set_reflection(when, scope, criteria)
+    agent.set_reflection(when, scope, criteria)
     phase = {"before": "before answering",
              "after": "after drafting (silent rewrite)",
              "both": "before and after"}[when]

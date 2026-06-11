@@ -1,7 +1,10 @@
 """
 apply_patch — structured multi-file patch tool.
 
-Format (inspired by OpenAI Codex's apply_patch):
+Accepts THREE input shapes (auto-detected) so it matches whatever a model
+naturally emits instead of forcing one rigid grammar:
+
+1. The `*** Begin Patch` envelope (Codex-style):
 
     *** Begin Patch
     *** Add File: path/to/new.py
@@ -17,15 +20,27 @@ Format (inspired by OpenAI Codex's apply_patch):
     *** Delete File: path/to/old.py
     *** End Patch
 
-- Add File: body lines must be prefixed with "+" (the "+" is stripped).
-- Delete File: body must be empty.
-- Update File: one or more hunks. Hunk lines start with " " (context),
-  "-" (remove), or "+" (add). Hunks can be anchored with one or more
-  "@@ <anchor>" lines — useful when context is ambiguous (e.g. the
-  same method shows up in two classes). Anchors must literally exist
-  on successive non-consecutive lines in the file.
-- Update File can take an optional "*** Move to: new/path" line
-  immediately after the header to rename while editing.
+2. A raw unified diff (git / `diff -u` / patch(1) style), no envelope:
+
+    --- a/path/to/x.py
+    +++ b/path/to/x.py
+    @@ -1,4 +1,4 @@
+     context
+    -old
+    +new
+
+   `/dev/null` on either side is understood as an add / delete.
+
+3. Either of the above wrapped in a ```diff / ```patch markdown fence.
+
+Robustness niceties (all so a near-miss still applies instead of erroring):
+- `*** ` prefixes on headers are optional (`Update File:` works too).
+- A `@@ -1,4 +1,4 @@` unified hunk header inside the envelope is treated
+  as a positional separator, not a literal anchor.
+- Leading / trailing *blank context* lines in a hunk are trimmed before
+  matching (they're formatting noise, not real context).
+- Context matching itself is a 4-tier cascade (exact → rstrip → strip →
+  unicode-normalized), so dropped indentation / smart quotes still match.
 
 Why this instead of file_edit? file_edit is great for a single targeted
 replacement per file. apply_patch lets a single tool call mutate several
@@ -65,34 +80,94 @@ class Op:
 
 _BEGIN = "*** Begin Patch"
 _END = "*** End Patch"
-_HDR_ADD = re.compile(r"^\*\*\*\s+Add File:\s+(.+?)\s*$")
-_HDR_DEL = re.compile(r"^\*\*\*\s+Delete File:\s+(.+?)\s*$")
-_HDR_UPD = re.compile(r"^\*\*\*\s+Update File:\s+(.+?)\s*$")
-_HDR_MOVE = re.compile(r"^\*\*\*\s+Move to:\s+(.+?)\s*$")
+
+# Headers — `*** ` prefix optional so loose forms still parse.
+_HDR_ADD = re.compile(r"^(?:\*\*\*\s+)?Add File:\s+(.+?)\s*$")
+_HDR_DEL = re.compile(r"^(?:\*\*\*\s+)?Delete File:\s+(.+?)\s*$")
+_HDR_UPD = re.compile(r"^(?:\*\*\*\s+)?Update File:\s+(.+?)\s*$")
+_HDR_MOVE = re.compile(r"^(?:\*\*\*\s+)?Move to:\s+(.+?)\s*$")
+_BEGIN_RE = re.compile(r"^\s*(?:\*\*\*\s+)?Begin Patch\s*$")
+_END_RE = re.compile(r"^\s*(?:\*\*\*\s+)?End Patch\s*$")
+_FENCE_RE = re.compile(r"^\s*`{3,}\s*\w*\s*$")
+
+# A unified-diff hunk header like `@@ -1,4 +1,4 @@ optional section`.
+_UNIFIED_HUNK = re.compile(
+    r"^@@+\s*-?\d+(?:,\d+)?\s+\+?\d+(?:,\d+)?\s*@@+(.*)$")
 
 
 class PatchError(ValueError):
     pass
 
 
+def _strip_fences(text: str) -> str:
+    """Drop markdown code-fence lines (```diff / ```patch / ```). Code rarely
+    contains a line that is *only* a triple-backtick, so this is safe."""
+    if "```" not in text:
+        return text
+    kept = [ln for ln in text.splitlines() if not _FENCE_RE.match(ln)]
+    return "\n".join(kept)
+
+
+def _is_boundary(line: str) -> bool:
+    """True if *line* begins a new op or ends the envelope."""
+    return bool(
+        _HDR_ADD.match(line) or _HDR_DEL.match(line) or _HDR_UPD.match(line)
+        or _END_RE.match(line))
+
+
+def _strip_diff_path(raw: str) -> str:
+    """Normalize a unified-diff path token: drop `a/`/`b/` prefix, a trailing
+    tab-timestamp, and surrounding quotes."""
+    p = raw.strip()
+    # `+++ b/x.py\t2020-...` — diff keeps a tab-separated timestamp
+    if "\t" in p:
+        p = p.split("\t", 1)[0].strip()
+    if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+        p = p[1:-1]
+    if p[:2] in ("a/", "b/"):
+        p = p[2:]
+    return p
+
+
+def _looks_like_unified_diff(text: str) -> bool:
+    lines = text.splitlines()
+    has_marker = any(
+        ln.startswith("--- ") or ln.startswith("+++ ")
+        or ln.startswith("diff --git") for ln in lines)
+    has_hunk = any(_UNIFIED_HUNK.match(ln) for ln in lines)
+    return has_marker and has_hunk
+
+
 def parse_patch(text: str) -> list[Op]:
-    """Parse a patch envelope into a list of operations.
+    """Parse a patch (any supported shape) into a list of operations.
 
     Raises PatchError on malformed input — the tool returns the error
     text verbatim so the model can retry with a fix.
     """
-    if not text or _BEGIN not in text:
-        raise PatchError(f"Patch must start with '{_BEGIN}'.")
+    if not text or not text.strip():
+        raise PatchError("Empty patch.")
+    text = _strip_fences(text)
+
+    has_envelope = any(_BEGIN_RE.match(ln) for ln in text.splitlines())
+    if has_envelope:
+        return _parse_envelope(text)
+    if _looks_like_unified_diff(text):
+        return _parse_unified_diff(text)
+    raise PatchError(
+        "Unrecognized patch. Use a '*** Begin Patch' envelope or a unified "
+        "diff (lines starting with '--- ', '+++ ', and '@@').")
+
+
+def _parse_envelope(text: str) -> list[Op]:
     lines = text.splitlines()
-    # Trim to body between Begin/End
     try:
-        start = next(i for i, ln in enumerate(lines) if ln.strip() == _BEGIN) + 1
+        start = next(i for i, ln in enumerate(lines)
+                     if _BEGIN_RE.match(ln)) + 1
     except StopIteration:
         raise PatchError(f"Missing '{_BEGIN}'.")
-    try:
-        end = next(i for i, ln in enumerate(lines) if ln.strip() == _END)
-    except StopIteration:
-        raise PatchError(f"Missing '{_END}'.")
+    # End marker is optional — fall back to EOF so a dropped footer still works.
+    end = next((i for i, ln in enumerate(lines) if _END_RE.match(ln)),
+               len(lines))
     body = lines[start:end]
 
     ops: list[Op] = []
@@ -106,24 +181,22 @@ def parse_patch(text: str) -> list[Op]:
             path = m_add.group(1).strip()
             i += 1
             content: list[str] = []
-            while i < len(body) and not body[i].lstrip().startswith("*** "):
+            while i < len(body) and not _is_boundary(body[i]):
                 row = body[i]
-                if not row.startswith("+"):
-                    raise PatchError(
-                        f"Add File body lines must start with '+', got: {row!r}")
-                content.append(row[1:])
+                if row.startswith("+"):
+                    content.append(row[1:])
+                elif row.strip() == "":
+                    content.append("")          # tolerate blank body lines
+                else:
+                    content.append(row)         # tolerate missing '+'
                 i += 1
             ops.append(Op(kind="add", path=path, body_add=content))
             continue
         if m_del:
             path = m_del.group(1).strip()
             i += 1
-            # Body must be empty; tolerate blank lines
-            while i < len(body) and not body[i].lstrip().startswith("*** "):
-                if body[i].strip() != "":
-                    raise PatchError(
-                        f"Delete File body must be empty, got: {body[i]!r}")
-                i += 1
+            while i < len(body) and not _is_boundary(body[i]):
+                i += 1                            # ignore any del body
             ops.append(Op(kind="delete", path=path))
             continue
         if m_upd:
@@ -137,18 +210,28 @@ def parse_patch(text: str) -> list[Op]:
                     i += 1
             hunks: list[Hunk] = []
             current: Hunk | None = None
-            while i < len(body) and not body[i].lstrip().startswith("*** "):
+            while i < len(body) and not _is_boundary(body[i]):
                 row = body[i]
                 if row.startswith("@@"):
-                    anchor = row[2:].strip()
-                    if current is None or current.lines:
+                    uni = _UNIFIED_HUNK.match(row)
+                    if uni:
+                        # Positional `@@ -n,m +n,m @@` — start a fresh hunk;
+                        # any trailing section text becomes an anchor hint.
                         current = Hunk()
                         hunks.append(current)
-                    current.anchors.append(anchor)
+                        hint = uni.group(1).strip()
+                        if hint:
+                            current.anchors.append(hint)
+                    else:
+                        anchor = row[2:].strip().rstrip("@").strip()
+                        if current is None or current.lines:
+                            current = Hunk()
+                            hunks.append(current)
+                        if anchor:
+                            current.anchors.append(anchor)
                     i += 1
                     continue
                 if row == "":
-                    # Treat blank lines as context (empty) rather than ending
                     if current is None:
                         current = Hunk()
                         hunks.append(current)
@@ -156,29 +239,104 @@ def parse_patch(text: str) -> list[Op]:
                     i += 1
                     continue
                 op = row[0]
-                rest = row[1:] if len(row) > 0 else ""
+                rest = row[1:]
                 if op not in (" ", "-", "+"):
-                    raise PatchError(
-                        f"Update hunk lines must start with ' ', '-', or '+' "
-                        f"(or '@@'), got: {row!r}")
+                    # A bare line with no prefix → treat as context. Models
+                    # often drop the leading space on unchanged lines.
+                    op, rest = " ", row
                 if current is None:
                     current = Hunk()
                     hunks.append(current)
                 current.lines.append((op, rest))
                 i += 1
+            hunks = [h for h in hunks if h.lines or h.anchors]
             if not hunks:
                 raise PatchError(f"Update File '{path}' has no hunks.")
             ops.append(Op(kind="update", path=path,
                           hunks=hunks, move_to=move_to))
             continue
-        # Unknown header / stray content between ops — skip blank lines,
-        # otherwise it's an error
         if ln.strip() == "":
             i += 1
             continue
         raise PatchError(f"Unexpected line (not inside an op): {ln!r}")
     if not ops:
         raise PatchError("Patch contained no operations.")
+    return ops
+
+
+def _parse_unified_diff(text: str) -> list[Op]:
+    """Translate a raw unified diff into the same Op model the envelope uses.
+
+    Handles update, add (`--- /dev/null`), and delete (`+++ /dev/null`).
+    """
+    lines = text.splitlines()
+    ops: list[Op] = []
+    old_path: str | None = None
+    new_path: str | None = None
+    git_path: str | None = None
+    cur_hunks: list[Hunk] = []
+    cur_hunk: Hunk | None = None
+
+    def flush():
+        nonlocal old_path, new_path, git_path, cur_hunks, cur_hunk
+        path = None
+        kind = "update"
+        if new_path == "/dev/null":            # file removed
+            kind, path = "delete", old_path
+        elif old_path == "/dev/null":          # file created
+            kind, path = "add", new_path
+        else:
+            path = new_path or old_path or git_path
+        if path and path != "/dev/null":
+            clean = [h for h in cur_hunks if h.lines]
+            if kind == "add":
+                body = [t for h in clean for op, t in h.lines if op == "+"]
+                ops.append(Op(kind="add", path=path, body_add=body))
+            elif kind == "delete":
+                ops.append(Op(kind="delete", path=path))
+            elif clean:
+                ops.append(Op(kind="update", path=path, hunks=clean))
+        old_path = new_path = git_path = None
+        cur_hunks = []
+        cur_hunk = None
+
+    for ln in lines:
+        if ln.startswith("diff --git"):
+            flush()
+            parts = ln.split()
+            if len(parts) >= 4:
+                git_path = _strip_diff_path(parts[-1])
+            continue
+        if ln.startswith("index ") or ln.startswith("similarity ") \
+                or ln.startswith("rename ") or ln.startswith("new file ") \
+                or ln.startswith("deleted file ") or ln.startswith("Index: ") \
+                or ln.startswith("==="):
+            continue
+        if ln.startswith("--- "):
+            old_path = _strip_diff_path(ln[4:])
+            continue
+        if ln.startswith("+++ "):
+            new_path = _strip_diff_path(ln[4:])
+            continue
+        if _UNIFIED_HUNK.match(ln):
+            cur_hunk = Hunk()
+            cur_hunks.append(cur_hunk)
+            continue
+        if cur_hunk is None:
+            continue
+        if ln.startswith("\\"):                 # "\ No newline at end of file"
+            continue
+        if ln == "":
+            cur_hunk.lines.append((" ", ""))
+            continue
+        op = ln[0]
+        if op in (" ", "-", "+"):
+            cur_hunk.lines.append((op, ln[1:]))
+        else:
+            cur_hunk.lines.append((" ", ln))    # tolerate missing prefix
+    flush()
+    if not ops:
+        raise PatchError("Unified diff contained no applicable hunks.")
     return ops
 
 
@@ -272,21 +430,40 @@ def _seek_context(file_lines: list[str], pattern: list[str], start: int) -> int:
     return -1
 
 
+def _trim_edge_blanks(lines: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Drop leading/trailing pure-blank *context* lines — they're formatting
+    noise that wouldn't match the file. Middle blanks (real) are kept, and
+    blank +/- lines are kept (they carry an edit)."""
+    out = lines[:]
+    while out and out[0] == (" ", ""):
+        out.pop(0)
+    while out and out[-1] == (" ", ""):
+        out.pop()
+    return out
+
+
 def _apply_update(file_lines: list[str], hunk: Hunk) -> list[str]:
     """Apply a single hunk. Returns new lines. Raises PatchError on failure."""
-    before: list[str] = [text for op, text in hunk.lines if op in (" ", "-")]
+    eff = _trim_edge_blanks(hunk.lines)
+    before: list[str] = [text for op, text in eff if op in (" ", "-")]
     window = _find_anchor_window(file_lines, hunk.anchors) if hunk.anchors else 0
     if window < 0:
-        raise PatchError(f"Could not locate anchors: {hunk.anchors!r}")
+        # Anchors didn't resolve — they may be soft hints (e.g. the section
+        # text trailing a `@@ -n,m +n,m @@` header). Fall back to anchorless
+        # context matching across the whole file rather than hard-failing.
+        window = 0
+        hunk = Hunk(anchors=[], lines=hunk.lines)
 
     if not before:
         # Pure-insert hunk: anchors are required so we know WHERE to insert.
         if not hunk.anchors:
             raise PatchError("Pure-insert hunk needs at least one '@@' anchor.")
-        new_lines = [text for op, text in hunk.lines if op == "+"]
+        new_lines = [text for op, text in eff if op == "+"]
         return file_lines[:window] + new_lines + file_lines[window:]
 
     match_idx = _seek_context(file_lines, before, window)
+    if match_idx < 0 and window > 0:
+        match_idx = _seek_context(file_lines, before, 0)  # widen past anchors
     if match_idx < 0:
         sample = "\n".join(f"  {ln!r}" for ln in before[:3])
         raise PatchError(
@@ -303,7 +480,7 @@ def _apply_update(file_lines: list[str], hunk: Hunk) -> list[str]:
                 "Hunk context matches multiple locations — add one or more "
                 "'@@ anchor' lines to scope the hunk.")
 
-    replacement = [text for op, text in hunk.lines if op in (" ", "+")]
+    replacement = [text for op, text in eff if op in (" ", "+")]
     n = len(before)
     return file_lines[:match_idx] + replacement + file_lines[match_idx + n:]
 
@@ -319,6 +496,11 @@ def apply_patch(patch_text: str, dry_run: bool = False) -> str:
     originals: dict[str, str] = {}
     changes: list[dict] = []
     warnings: list[str] = []
+    # Per-file diagnostics captured BEFORE we touch anything, so the post-edit
+    # report can show only the errors THIS patch introduced — not the pile of
+    # pre-existing ones already in a big file.
+    baseline_diags: dict[str, list[dict]] = {}
+    from tools.lint import snapshot_diagnostics
 
     # Checkpoint before any mutation so cancel / rollback stays coherent.
     from core.checkpoints import checkpoint_manager
@@ -353,6 +535,9 @@ def apply_patch(patch_text: str, dry_run: bool = False) -> str:
             if not Path(abs_path).is_file():
                 return json.dumps({
                     "error": f"Update File target missing: {abs_path}"})
+            # Snapshot existing diagnostics before the edit (line-independent
+            # baseline for the post-edit delta).
+            baseline_diags[abs_path] = snapshot_diagnostics(abs_path) or []
             src = Path(abs_path).read_text(encoding="utf-8", errors="replace")
             originals[abs_path] = src
             # Preserve the file's line-ending style when writing back
@@ -451,35 +636,56 @@ def apply_patch(patch_text: str, dry_run: bool = False) -> str:
             break
     play_edit_sound(sound_path)
 
-    # Combined lint + LSP per modified file. Surface errors as a TOP-LEVEL
-    # `error`/`diagnostics` field per file so the model can't gloss past them
-    # buried in a status string.
-    from tools.lint import validate_file
+    # Combined lint + LSP per modified file, then DIFF against the pre-edit
+    # baseline so we only surface errors THIS patch introduced — not the pile
+    # of pre-existing ones in a big file. Surfaced as a TOP-LEVEL
+    # `error`/`diagnostics` field so the model can't gloss past real breakage.
+    from tools.lint import validate_file, diff_diagnostics
     file_diagnostics: dict[str, list[dict]] = {}
+    suppressed_total = 0
     has_any_error = False
     for change in changes:
         if change["op"] not in ("add", "update", "update+move"):
             continue
         file_path = change.get("to") or change["path"]
+        orig_path = change["path"]  # baseline was keyed on the pre-move path
         try:
             v = validate_file(file_path)
         except Exception:
             continue
-        errs = [d for d in v.get("diagnostics", []) if d.get("severity") == "error"]
-        if errs:
+        after = v.get("diagnostics", []) or []
+        baseline = baseline_diags.get(orig_path)
+        if baseline is None:
+            # New file (Add) — everything is "introduced" by definition.
+            introduced_errors = [d for d in after
+                                 if d.get("severity") == "error"]
+            suppressed = 0
+        else:
+            delta = diff_diagnostics(baseline, after)
+            introduced_errors = delta["introduced_errors"]
+            suppressed = delta["preexisting_count"]
+        suppressed_total += suppressed
+        if introduced_errors:
             has_any_error = True
-            file_diagnostics[file_path] = errs
+            file_diagnostics[file_path] = introduced_errors
 
     result: dict = {
         "status": f"Applied {len(changes)} operation(s).",
         "changes": changes,
     }
+    if suppressed_total:
+        # Tell the model we filtered noise, so silence isn't mistaken for
+        # "the file is pristine".
+        result["note"] = (
+            f"{suppressed_total} pre-existing diagnostic(s) in the edited "
+            "file(s) were left as-is (not introduced by this patch)."
+        )
     if has_any_error:
         total = sum(len(v) for v in file_diagnostics.values())
         result["error"] = (
-            f"Validation failed: {total} error(s) across "
-            f"{len(file_diagnostics)} file(s). Re-read the affected files, "
-            "fix the issues below, and patch again."
+            f"This patch introduced {total} new error(s) across "
+            f"{len(file_diagnostics)} file(s). Re-read, fix the issues below, "
+            "and patch again. (Pre-existing errors are not shown.)"
         )
         result["diagnostics"] = file_diagnostics
     return json.dumps(result)
@@ -489,6 +695,8 @@ def apply_patch(patch_text: str, dry_run: bool = False) -> str:
 
 _DESCRIPTION = (
     "Patch tool. Add/edit/delete/rename files atomically. 3+ files: plan first.\n\n"
+    "Accepts the '*** Begin Patch' envelope OR a raw unified diff "
+    "(--- / +++ / @@), optionally inside a ```diff fence.\n\n"
     "  *** Begin Patch\n"
     "  *** Add File: path/new.py\n"
     "  +line1\n"
@@ -501,8 +709,9 @@ _DESCRIPTION = (
     "  *** Delete File: path/gone.py\n"
     "  *** End Patch\n\n"
     "Add: lines '+'. Delete: empty body. Update: ' '=ctx '-'=rm '+'=add. "
-    "@@ scopes to block; stack for repeated names. Ambiguous: rejected. "
-    "Move: '*** Move to: new/path' after header. Any error rolls all back."
+    "@@ scopes to block; stack for repeated names. Ambiguous (no anchor, "
+    "multi-match): rejected. Move: '*** Move to: new/path' after header. "
+    "Any error rolls all back."
 )
 
 registry.register(
@@ -513,8 +722,8 @@ registry.register(
         "properties": {
             "patch": {
                 "type": "string",
-                "description": "The full patch envelope, from '*** Begin Patch' "
-                               "through '*** End Patch'.",
+                "description": "The full patch — '*** Begin Patch' envelope "
+                               "or a unified diff.",
             },
             "dry_run": {
                 "type": "boolean",

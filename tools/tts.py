@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from tools.registry import registry
 from tools import tts_backends
+from core.proc import NO_WINDOW
 
 CACHE_DIR = Path(__file__).parent.parent / "data" / "audio_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,7 +77,8 @@ def _play_audio(path: str, blocking: bool = False):
         players.append([vlc, "--play-and-exit", "--intf", "dummy", "--quiet", path])
     for cmd in players:
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=NO_WINDOW)  # no console flash on Windows
             if blocking:
                 proc.wait()
                 return True

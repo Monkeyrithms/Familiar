@@ -7,6 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 from tools.registry import registry
+from core.proc import NO_WINDOW
 
 
 def _run_git(args: list[str], cwd: str, timeout: int = 30) -> dict:
@@ -18,6 +19,7 @@ def _run_git(args: list[str], cwd: str, timeout: int = 30) -> dict:
             capture_output=True,
             text=True,
             timeout=timeout,
+            creationflags=NO_WINDOW,  # no console flash on Windows
         )
         return {
             "stdout": result.stdout,

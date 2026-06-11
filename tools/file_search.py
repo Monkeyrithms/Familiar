@@ -27,7 +27,7 @@ IGNORE_EXTS = {
     ".pyc", ".pyo", ".exe", ".dll", ".so", ".dylib", ".o", ".obj",
     ".bin", ".dat", ".db", ".sqlite", ".lock",
 }
-MAX_CANDIDATES = 20_000
+MAX_CANDIDATES = 200_000
 
 
 def _fuzzy_score(query: str, candidate: str, case_sensitive: bool) -> tuple[float, int]:
@@ -106,6 +106,7 @@ def file_search(query: str, path: str = None, max_results: int = None,
 
     # Collect candidates
     candidates: list[str] = []
+    hit_cap = False
     for dirpath, dirnames, filenames in os.walk(search_root):
         dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS and not d.startswith(".")]
         for fname in filenames:
@@ -119,6 +120,7 @@ def file_search(query: str, path: str = None, max_results: int = None,
                 rel = full
             candidates.append(rel)
             if len(candidates) >= MAX_CANDIDATES:
+                hit_cap = True
                 break
         if len(candidates) >= MAX_CANDIDATES:
             break
@@ -135,6 +137,7 @@ def file_search(query: str, path: str = None, max_results: int = None,
             "results": "No matches found.",
             "count": 0,
             "searched": len(candidates),
+            "truncated": hit_cap,
             "hint": "Try a shorter or simpler query, or use glob for exact patterns.",
         })
 
@@ -151,6 +154,7 @@ def file_search(query: str, path: str = None, max_results: int = None,
         "count": len(top),
         "total_matched": len(scored),
         "searched": len(candidates),
+        "truncated": hit_cap,
         "root": str(search_root),
     }, ensure_ascii=False)
 

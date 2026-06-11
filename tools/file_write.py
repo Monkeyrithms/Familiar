@@ -30,10 +30,14 @@ def file_write(path: str, content: str) -> str:
     except Exception as e:
         return json.dumps({"error": f'Failed to create directory "{p.parent}": {e}'})
 
+    # Snapshot diagnostics before writing so we can report only NEW errors
+    # (an overwrite of an existing file may sit on top of pre-existing noise).
+    from tools.lint import (safe_write_text, snapshot_diagnostics,
+                            build_validation_result)
+    baseline = snapshot_diagnostics(path) if existed else None
     # Verified write — re-reads after writing to catch silent overwrites
     # (file watcher, IDE autosave, hot-reload races) that would otherwise
     # leave us reporting success on a file that drifted.
-    from tools.lint import safe_write_text, validate_file
     write_err = safe_write_text(path, content)
     if write_err:
         return json.dumps({"error": write_err})
@@ -50,30 +54,14 @@ def file_write(path: str, content: str) -> str:
     from core.sounds import play_edit_sound
     play_edit_sound(path)
 
-    # Combined lint + LSP. Surface errors as a TOP-LEVEL `error`/`diagnostics`
-    # field so the model can't gloss past them buried in a status string.
-    validation = validate_file(path)
-    result = {
-        "status": f'{action} "{path}" ({line_count} lines, {byte_count} bytes).',
-    }
-    diags = validation.get("diagnostics", [])
-    errors = [d for d in diags if d.get("severity") == "error"]
-    warnings = [d for d in diags if d.get("severity") == "warning"]
-    if errors:
-        result["error"] = (
-            f"Validation failed: {len(errors)} error(s) in the written file. "
-            "Re-read the file, fix the issues below, and write again."
-        )
-        result["diagnostics"] = errors
-    elif warnings:
-        result["warnings"] = warnings
-    if validation.get("semantic_check_ran") is False and Path(path).suffix.lower() in {".py", ".pyi"}:
-        # AST parse passed but neither ruff nor pyflakes is installed — tell the
-        # model so it doesn't trust "lint clean" too hard for missing imports.
-        result["note"] = (
-            "Python semantic check skipped (install `ruff` or `pyflakes` to "
-            "catch missing imports / undefined names)."
-        )
+    # Combined lint + LSP via the shared shaper. Surfaces only NEW errors as a
+    # TOP-LEVEL `error`/`diagnostics` field so the model can't gloss past real
+    # breakage, while pre-existing noise is suppressed with a note.
+    status = f'{action} "{path}" ({line_count} lines, {byte_count} bytes).'
+    result = build_validation_result(
+        path, status, baseline=baseline,
+        error_prefix=("File WAS written to disk, but this write introduced "
+                      f"{{n}} error(s). The save succeeded \u2014 "))
     return json.dumps(result)
 
 

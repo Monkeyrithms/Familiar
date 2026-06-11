@@ -8,6 +8,7 @@ something, look up a fact, or organize its notes.
 """
 
 import json
+import time
 from tools.registry import registry
 from core.database import (
     list_note_categories, list_notes_in_category, read_note,
@@ -19,9 +20,10 @@ from core.database import (
 def _get_streams() -> list[str]:
     """Get current conversation's readable streams from the active agent."""
     try:
-        from core.agent import _active_agent
-        if _active_agent is not None:
-            return _active_agent.get_readable_streams()
+        from core.agent import current_agent
+        agent = current_agent()
+        if agent is not None:
+            return agent.get_readable_streams()
     except Exception:
         pass
     return ["General"]
@@ -33,9 +35,10 @@ WRITE_ACTIONS = {"save", "delete", "rename_category", "move_category", "rename_n
 def _get_writable_streams() -> list[str]:
     """Get streams this conversation can write to from the active agent."""
     try:
-        from core.agent import _active_agent
-        if _active_agent is not None:
-            return _active_agent.get_writable_streams()
+        from core.agent import current_agent
+        agent = current_agent()
+        if agent is not None:
+            return agent.get_writable_streams()
     except Exception:
         pass
     return _get_streams()
@@ -142,10 +145,62 @@ def memory(action: str, stream: str = "", category: str = "",
         return json.dumps({"moved": ok, "title": title,
                            "from": category, "to": query})
 
+    elif action == "compress":
+        """Compress memory: agent-driven trimming of notes to a target size."""
+        from core.database import list_note_categories
+        if not category:
+            # Compress entire stream
+            cats = list_note_categories(stream)
+            total_notes = sum(len(list_notes_in_category(stream, cat["category"])) for cat in cats)
+            target_reduction = max(10, int(total_notes * 0.3))  # Remove ~30% or min 10 notes
+            return json.dumps({
+                "error": f"Compress entire stream not yet supported. "
+                         f"Specify a category to compress ({total_notes} total notes, "
+                         f"recommend removing ~{target_reduction})"
+            })
+        else:
+            # Compress single category
+            notes = list_notes_in_category(stream, category)
+            if len(notes) < 2:
+                return json.dumps({
+                    "compressed": False, "reason": "category too small",
+                    "count": len(notes)
+                })
+            
+            # Read all notes and show which are candidates for removal
+            note_summaries = []
+            for note_info in notes:
+                note = read_note(stream, category, note_info["title"])
+                if note:
+                    # Extract current section (before ## Evidence header)
+                    content = note["content"]
+                    lines = content.splitlines()
+                    evi_idx = next(
+                        (i for i, ln in enumerate(lines)
+                         if ln.strip().lower().startswith("## evidence")),
+                        None
+                    )
+                    curr = "\n".join(lines[:evi_idx]).strip() if evi_idx else content.strip()
+                    note_summaries.append({
+                        "title": note["title"],
+                        "confidence": note.get("confidence", 0.8),
+                        "importance": note.get("importance", "medium"),
+                        "age_days": (time.time() - note.get("updated_at", time.time())) / 86400,
+                        "chars": len(curr),
+                    })
+            
+            return json.dumps({
+                "stream": stream, "category": category,
+                "total_notes": len(notes),
+                "candidates_for_removal": note_summaries,
+                "guidance": "Review candidates and call memory action=delete for notes to remove. "
+                            "Prioritize low confidence/importance, or oldest notes."
+            }, ensure_ascii=False)
+
     else:
         return json.dumps({
             "error": f"Unknown action: {action}. "
-                     "Use: browse, read, save, delete, search, "
+                     "Use: browse, read, save, delete, search, compress, "
                      "rename_category, move_category, rename_note, move_note"
         })
 
@@ -166,7 +221,7 @@ registry.register(
             "action": {
                 "type": "string",
                 "enum": ["browse", "read", "save", "delete", "search",
-                         "rename_category", "move_category", "rename_note", "move_note"],
+                         "compress", "rename_category", "move_category", "rename_note", "move_note"],
                 "description": "Memory op.",
             },
             "stream": {"type": "string", "description": "Stream name (default: first subscribed)."},

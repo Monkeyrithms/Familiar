@@ -7,7 +7,6 @@ Supports recursive glob patterns like '**/*.md'.
 """
 
 import json
-import os
 from pathlib import Path
 from tools.registry import registry
 
@@ -19,8 +18,13 @@ IGNORE_DIRS = {
 }
 
 
-def glob_files(pattern: str, path: str = None, max_results: int = None) -> str:
-    """List files matching a glob pattern, sorted by modification time (newest first)."""
+def glob_files(pattern: str, path: str = None, max_results: int = None,
+               include_dirs: bool = False) -> str:
+    """List paths matching a glob pattern, sorted by mtime (newest first).
+
+    By default only files are returned. Set include_dirs=True to also surface
+    directories — needed when discovering a project folder by name.
+    """
     search_root = Path(path) if path else Path.cwd()
     max_results = max_results or DEFAULT_MAX_FILES
 
@@ -30,7 +34,10 @@ def glob_files(pattern: str, path: str = None, max_results: int = None) -> str:
     matches = []
     try:
         for p in search_root.glob(pattern):
-            if not p.is_file():
+            is_dir = p.is_dir()
+            if not include_dirs and not p.is_file():
+                continue
+            if include_dirs and not (p.is_file() or is_dir):
                 continue
             # Skip ignored directories
             parts = p.relative_to(search_root).parts
@@ -47,6 +54,7 @@ def glob_files(pattern: str, path: str = None, max_results: int = None) -> str:
                 "abs_path": str(p),
                 "size": size,
                 "mtime": mtime,
+                "is_dir": is_dir,
             })
             if len(matches) >= max_results * 2:  # gather extra for sorting
                 break
@@ -60,8 +68,11 @@ def glob_files(pattern: str, path: str = None, max_results: int = None) -> str:
     # Format concise output
     lines = []
     for m in matches:
-        size_str = _human_size(m["size"])
-        lines.append(f"{m['path']}  ({size_str})")
+        if m.get("is_dir"):
+            lines.append(f"{m['path']}/  (dir)")
+        else:
+            size_str = _human_size(m["size"])
+            lines.append(f"{m['path']}  ({size_str})")
 
     total = len(matches)
     output = "\n".join(lines) if lines else "No files matched."
@@ -104,6 +115,10 @@ registry.register(
             "max_results": {
                 "type": "integer",
                 "description": "Max files (default 500).",
+            },
+            "include_dirs": {
+                "type": "boolean",
+                "description": "Also list matching directories (default false, files only).",
             },
         },
         "required": ["pattern"],

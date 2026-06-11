@@ -30,14 +30,15 @@ try:
         Uses str/object types for cross-thread safety. Qt can't reliably
         marshal dict/list across threads — use 'object' for compound types.
         """
-        # Emitted when a sub-agent job starts (insert card into chat)
-        job_started = pyqtSignal(str, str)   # (job_id, tasks_json_str)
+        # Emitted when a sub-agent job starts (insert card into chat).
+        # conv_id routes the card to the originating conversation's column.
+        job_started = pyqtSignal(str, str, str)   # (job_id, tasks_json_str, conv_id)
         # Emitted when a task status changes (update card)
         task_updated = pyqtSignal(str, str, str)  # (task_id, status, data_json_str)
         # Emitted when a sub-agent needs a terminal tab
         terminal_requested = pyqtSignal(str, str, str)  # (task_id, command, cwd)
         # Emitted when entire job completes
-        job_completed = pyqtSignal(str, str)  # (job_id, summary_json_str)
+        job_completed = pyqtSignal(str, str, str)  # (job_id, summary_json_str, conv_id)
 
     _bridge = SubAgentBridge()
 
@@ -79,8 +80,10 @@ def subagent(action: str, goal: str = "", mode: str = "general",
     from core.subagent import get_orchestrator, get_existing
 
     workspace = ""
+    conv_id = ""
     if ctx:
         workspace = ctx.cwd
+        conv_id = getattr(ctx, "conv_id", "") or ""
     if not workspace:
         try:
             config_path = __import__("pathlib").Path(__file__).parent.parent / "config.json"
@@ -108,6 +111,7 @@ def subagent(action: str, goal: str = "", mode: str = "general",
         provider, model = resolve_subagent_llm(mode="decompose")
 
         orch._workspace = workspace
+        orch._conv_id = conv_id
 
         # Decompose the goal into tasks
         tasks = orch.decompose(goal, model=model, provider=provider,
@@ -115,13 +119,15 @@ def subagent(action: str, goal: str = "", mode: str = "general",
 
         # Notify UI to insert job card
         if _bridge:
-            _bridge.job_started.emit(orch._job_id, json.dumps([t.to_dict() for t in tasks]))
+            _bridge.job_started.emit(orch._job_id,
+                                     json.dumps([t.to_dict() for t in tasks]),
+                                     conv_id)
 
         # Execute in background thread (non-blocking to the main agent)
         def _run():
             summary = orch.execute()
             if _bridge:
-                _bridge.job_completed.emit(orch._job_id, json.dumps(summary))
+                _bridge.job_completed.emit(orch._job_id, json.dumps(summary), conv_id)
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
@@ -150,6 +156,7 @@ def subagent(action: str, goal: str = "", mode: str = "general",
         orch._workspace = workspace
         orch._model = model
         orch._provider = provider
+        orch._conv_id = conv_id
 
         task = orch.add_single_task(
             title=title or description[:80],
@@ -158,12 +165,12 @@ def subagent(action: str, goal: str = "", mode: str = "general",
         )
 
         if _bridge:
-            _bridge.job_started.emit(orch._job_id, json.dumps([task.to_dict()]))
+            _bridge.job_started.emit(orch._job_id, json.dumps([task.to_dict()]), conv_id)
 
         def _run():
             summary = orch.execute()
             if _bridge:
-                _bridge.job_completed.emit(orch._job_id, json.dumps(summary))
+                _bridge.job_completed.emit(orch._job_id, json.dumps(summary), conv_id)
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()

@@ -9,6 +9,29 @@ from pathlib import Path
 from tools.registry import registry
 
 
+# Every SQLite database begins with this fixed 16-byte magic string,
+# regardless of file extension (.db, .sqlite, .world, no suffix, ...).
+# See https://www.sqlite.org/fileformat.html — header string, offset 0.
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+
+
+def _is_sqlite(p: Path) -> bool:
+    """True if the file is a SQLite database — by content, not by name.
+
+    Accepts a known suffix as a fast-path (covers freshly-created, still-empty
+    DBs that have no header written yet), otherwise sniffs the magic header so
+    any extension — including .world — is recognized.
+    """
+    if p.suffix.lower() in _SQLITE_SUFFIXES:
+        return True
+    try:
+        with open(p, "rb") as fh:
+            return fh.read(16) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
 def db_query(path: str, query: str = "", write: bool = False, limit: int = 100,
              action: str = "query") -> str:
     """
@@ -21,8 +44,11 @@ def db_query(path: str, query: str = "", write: bool = False, limit: int = 100,
     p = Path(path)
     if not p.exists():
         return json.dumps({"error": f"Database not found: {path}"})
-    if p.suffix not in (".db", ".sqlite", ".sqlite3"):
-        return json.dumps({"error": "Only .db/.sqlite/.sqlite3 files supported"})
+    if not _is_sqlite(p):
+        return json.dumps({"error": (
+            f"Not a SQLite database: {path} "
+            "(no .db/.sqlite/.sqlite3 suffix and no 'SQLite format 3' header)."
+        )})
 
     try:
         conn = sqlite3.connect(str(p), timeout=5)
@@ -152,7 +178,7 @@ registry.register(
     parameters={
         "type": "object",
         "properties": {
-            "path":   {"type": "string",  "description": ".db | .sqlite | .sqlite3 path."},
+            "path":   {"type": "string",  "description": "Path to a SQLite database. Any extension (.db/.sqlite/.world/...) — detected by file content, not suffix."},
             "action": {"type": "string",  "enum": ["query", "inspect"],
                        "description": "'query' (SQL) | 'inspect' (schema). Default 'query'."},
             "query":  {"type": "string",  "description": "SQL (required for query)."},

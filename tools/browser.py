@@ -17,6 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from tools.registry import registry
+from core.proc import NO_WINDOW
 
 # ---------------------------------------------------------------------------
 # Session management
@@ -92,6 +93,7 @@ def _run(command: str, args: list[str] = None, task_id: str = None,
                 stderr=err_f,
                 stdin=subprocess.DEVNULL,
                 shell=_USE_SHELL,
+                creationflags=NO_WINDOW,  # no console flash on Windows
             )
             proc.wait(timeout=timeout)
 

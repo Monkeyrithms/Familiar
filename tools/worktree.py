@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 from tools.registry import registry
+from core.proc import NO_WINDOW
 
 WORKTREE_ROOT = Path(__file__).parent.parent / "data" / "worktrees"
 WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -26,6 +27,7 @@ def _run_git(args: list[str], cwd: str, timeout: int = _TIMEOUT) -> dict:
         r = subprocess.run(
             ["git"] + args, cwd=cwd,
             capture_output=True, text=True, timeout=timeout,
+            creationflags=NO_WINDOW,  # no console flash on Windows
         )
         return {"stdout": r.stdout, "stderr": r.stderr, "returncode": r.returncode}
     except FileNotFoundError:

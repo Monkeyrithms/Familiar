@@ -6,6 +6,7 @@ Uses paramiko if available, falls back to system ssh command.
 import json
 import subprocess
 from tools.registry import registry
+from core.proc import NO_WINDOW
 
 
 def ssh_exec(host: str, command: str, user: str = "", port: int = 22,
@@ -61,7 +62,8 @@ def ssh_exec(host: str, command: str, user: str = "", port: int = 22,
 
         proc = subprocess.run(
             ssh_cmd, capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace")
+            encoding="utf-8", errors="replace",
+            creationflags=NO_WINDOW)  # no console flash on Windows
 
         from core.redact import redact
         return redact(json.dumps({

@@ -4,7 +4,6 @@ Only takes effect on the Anthropic provider with Claude 3.5+ Sonnet/Opus.
 """
 
 import json
-from core.agent import load_config, save_config
 from tools.registry import registry
 
 # Named presets: label -> budget_tokens (0 = disabled)
@@ -19,6 +18,7 @@ _PRESETS = {
 
 def set_thinking(level: str = None, budget: int = None) -> str:
     """Set extended thinking level by name or exact token budget."""
+    from core.agent import load_config, save_config  # lazy: avoid circular import
     cfg = load_config()
 
     if level is not None:

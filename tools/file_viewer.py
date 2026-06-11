@@ -14,10 +14,12 @@ class _ViewerBridge(QObject):
     # (path, highlight_text_or_empty)
     open_requested = pyqtSignal(str, str)
     refresh_requested = pyqtSignal(str)
-    # Fires when the agent edits a file: (path, original_content_or_empty).
+    # Fires when the agent edits a file: (path, original_content_or_empty, agent).
     # Empty original means the file was newly created — no diff to show but
-    # the viewer still opens/blinks/grabs attention.
-    edit_notified = pyqtSignal(str, str)
+    # the viewer still opens/blinks/grabs attention. `agent` is the Agent that
+    # made the edit (or None) so the UI can drop the diff card in THAT column's
+    # chat — not always the anchor column. Typed `object` to carry the opaque ref.
+    edit_notified = pyqtSignal(str, str, object)
 
 
 bridge = _ViewerBridge()
@@ -29,11 +31,13 @@ def notify_file_changed(path: str):
         bridge.refresh_requested.emit(os.path.abspath(path))
 
 
-def notify_edit(path: str, original: str):
+def notify_edit(path: str, original: str, agent=None):
     """Called by agent after a file mutation tool runs — opens the file in
-    the viewer, highlights the diff, and requests attention (blink + expand)."""
+    the viewer, highlights the diff, and requests attention (blink + expand).
+    `agent` identifies the column that made the edit so its diff card lands in
+    the right chat pane (the bridge itself is wired once, on the anchor)."""
     if path:
-        bridge.edit_notified.emit(os.path.abspath(path), original or "")
+        bridge.edit_notified.emit(os.path.abspath(path), original or "", agent)
 
 
 def file_show(path: str, highlight: str = "") -> str:

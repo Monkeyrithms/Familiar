@@ -92,17 +92,23 @@ def _expand_patterns(patterns: list, extra_ignores: list) -> list:
             for sub in p.rglob("*"):
                 _add(sub)
             continue
-        # Glob pattern — try resolving from cwd
+        # Glob pattern. Use stdlib glob, NOT Path(".").glob: pathlib rejects
+        # absolute patterns ("D:\\proj\\*.py"), which silently returned zero
+        # matches for any absolute-path glob. stdlib glob handles absolute
+        # anchors and recursive ** transparently.
+        import glob as _glob
         try:
-            for matched in Path(".").glob(pat):
-                if matched.is_dir():
-                    for sub in matched.rglob("*"):
+            for hit in _glob.glob(pat, recursive=("**" in pat)):
+                m = Path(hit)
+                if m.is_dir():
+                    for sub in m.rglob("*"):
                         _add(sub)
                 else:
-                    _add(matched)
+                    _add(m)
         except Exception:
             pass
     return found
+
 
 
 def _estimate_tokens(path: Path) -> int:
@@ -211,14 +217,11 @@ def explore_files(action: str, patterns: list = None, query: str = "",
 
         orch = get_orchestrator()
         orch._workspace = ctx.cwd if ctx else ""
+        conv_id = getattr(ctx, "conv_id", "") if ctx else ""
+        orch._conv_id = conv_id
 
-        # Pull explore-specific model from config
-        config = {}
-        try:
-            cfg_path = Path(__file__).parent.parent / "config.json"
-            config = json.loads(cfg_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        from core.agent import load_config
+        config = load_config()
         orch._provider = (config.get("subagent_explore_provider")
                           or config.get("provider", "anthropic"))
         orch._model = (config.get("subagent_explore_model")
@@ -230,12 +233,13 @@ def explore_files(action: str, patterns: list = None, query: str = "",
 
         if _bridge:
             _bridge.job_started.emit(orch._job_id,
-                                      json.dumps([t.to_dict() for t in tasks]))
+                                      json.dumps([t.to_dict() for t in tasks]),
+                                      conv_id)
 
         def _run():
             summary = orch.execute()
             if _bridge:
-                _bridge.job_completed.emit(orch._job_id, json.dumps(summary))
+                _bridge.job_completed.emit(orch._job_id, json.dumps(summary), conv_id)
 
         threading.Thread(target=_run, daemon=True).start()
 

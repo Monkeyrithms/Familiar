@@ -1,12 +1,5 @@
 # Import tool modules so they self-register with the registry on startup.
 import tools.web_search  # noqa: F401
-# Notebook tools — calendar / notes / todos / flow charts shared with
-# the vispy_dashboard Notebook app. Wrapped in try so a missing or
-# broken Notebook install doesn't brick root Agent startup.
-try:
-    import tools.notebook  # noqa: F401
-except Exception as _e:
-    print(f"[tools] Notebook tools unavailable: {_e}")
 import tools.terminal     # noqa: F401
 import tools.file_read    # noqa: F401
 import tools.file_write   # noqa: F401
@@ -77,6 +70,8 @@ import tools.audit               # noqa: F401
 import tools.worktree            # noqa: F401
 import tools.ask_user            # noqa: F401
 import tools.reflect             # noqa: F401
+import tools.notes               # noqa: F401
+import tools.network_tool        # noqa: F401
 try:
     import tools.mcp_tool          # noqa: F401
 except Exception as _e:

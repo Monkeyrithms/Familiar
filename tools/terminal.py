@@ -23,8 +23,11 @@ DEFAULT_TIMEOUT = 120   # Raised from 30 to match opencode-dev (2 minutes)
 # On Windows we spawn agent subprocesses in their own process group so we can
 # deliver CTRL_BREAK_EVENT (the only signal the Win32 console API will route
 # to a foreign-console process). Without this flag, send_signal does nothing.
+# CREATE_NO_WINDOW is OR'd in so the spawned console child never flashes a window
+# (the app is a GUI process with no console of its own to inherit).
 _POPEN_GROUP_FLAGS = (
-    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS else {}
+    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    if IS_WINDOWS else {}
 )
 
 # Shared output queue — UI polls this for live terminal lines
@@ -509,10 +512,11 @@ def _try_convert_command(command: str, cwd: str | None) -> str | None:
         env["PYTHONUNBUFFERED"] = "1"
         try:
             result = subprocess.run(
-                ["cmd", "/c", win_cmd],
+                'cmd /s /c "' + win_cmd + '"',
                 capture_output=True, text=True,
                 cwd=cwd or None, env=env,
                 timeout=30, encoding="utf-8", errors="replace",
+                creationflags=(subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0),
             )
             out = (result.stdout + result.stderr).strip()
             note = f"[auto-converted '{cmd}' → '{win_name}']"
@@ -547,10 +551,11 @@ def _try_convert_command(command: str, cwd: str | None) -> str | None:
         env = os.environ.copy()
         try:
             result = subprocess.run(
-                ["cmd", "/c", win_cmd],
+                'cmd /s /c "' + win_cmd + '"',
                 capture_output=True, text=True,
                 cwd=search_path, env=env,
                 timeout=30, encoding="utf-8", errors="replace",
+                creationflags=(subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0),
             )
             out = (result.stdout + result.stderr).strip()
             return json.dumps({
@@ -649,7 +654,15 @@ def terminal(command: str, timeout: int = None, cwd: str = None,
             return json.dumps({"output": str(e), "exit_code": 1}, ensure_ascii=False)
 
     if IS_WINDOWS:
-        shell_cmd = ["cmd", "/c", command]
+        # Pass the command as a STRING, not a list. With a list, subprocess
+        # runs it through list2cmdline, which backslash-escapes any inner
+        # quotes (python -c "..." -> python -c \"...\"); cmd.exe doesn't grok
+        # \" and the inner program receives broken args (the classic
+        # "unterminated string literal"). As a string, Python passes the line
+        # to CreateProcess verbatim, and `cmd /s /c "<command>"` strips ONLY
+        # the outer quote pair, leaving the inner quotes intact. Quote the
+        # whole command so redirects/operators still parse as one line.
+        shell_cmd = 'cmd /s /c "' + command + '"'
     else:
         shell_cmd = ["bash", "-c", command]
 

@@ -326,6 +326,11 @@ def file_edit(path: str, old_string: str, new_string: str,
     except Exception as e:
         return json.dumps({"error": f'Could not read "{path}": {e}'})
 
+    # Snapshot diagnostics before the edit so _build_edit_result can show only
+    # the errors this edit introduced, not the file's pre-existing pile.
+    from tools.lint import snapshot_diagnostics
+    _baseline = snapshot_diagnostics(path)
+
     # Detect line ending style to preserve it
     uses_crlf = "\r\n" in original
     if uses_crlf:
@@ -367,6 +372,7 @@ def file_edit(path: str, old_string: str, new_string: str,
                 return _build_edit_result(
                     path,
                     f'Replaced {count} occurrence{"s" if count != 1 else ""} in "{path}".',
+                    baseline=_baseline,
                 )
 
             # For single replacement, verify uniqueness
@@ -433,34 +439,21 @@ def file_edit(path: str, old_string: str, new_string: str,
     return _build_edit_result(
         path,
         f'Replaced 1 occurrence in "{path}"{strategy_note}.',
+        baseline=_baseline,
     )
 
 
-def _build_edit_result(path: str, status: str) -> str:
-    """Run validate_file(path) and return a JSON tool result with structured
-    error/diagnostics fields when the post-edit check finds problems. Shared
+def _build_edit_result(path: str, status: str,
+                       baseline: list[dict] | None = None) -> str:
+    """Return a JSON tool result with structured error/diagnostics fields when
+    the post-edit check finds problems. Delegates to the shared
+    build_validation_result so every edit tool reports identically, and — given
+    a pre-edit baseline — surfaces only the errors this edit introduced. Shared
     by both the replace_all and single-replace exit paths."""
     from core.sounds import play_edit_sound
-    from tools.lint import validate_file
+    from tools.lint import build_validation_result
     play_edit_sound(path)
-    validation = validate_file(path)
-    result: dict = {"status": status}
-    diags = validation.get("diagnostics", [])
-    errors = [d for d in diags if d.get("severity") == "error"]
-    warnings = [d for d in diags if d.get("severity") == "warning"]
-    if errors:
-        result["error"] = (
-            f"Validation failed: {len(errors)} error(s) in the edited file. "
-            "Re-read the file, fix the issues below, and edit again."
-        )
-        result["diagnostics"] = errors
-    elif warnings:
-        result["warnings"] = warnings
-    if validation.get("semantic_check_ran") is False and Path(path).suffix.lower() in {".py", ".pyi"}:
-        result["note"] = (
-            "Python semantic check skipped (install `ruff` or `pyflakes` to "
-            "catch missing imports / undefined names)."
-        )
+    result = build_validation_result(path, status, baseline=baseline)
     return json.dumps(result)
 
 

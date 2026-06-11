@@ -6,13 +6,13 @@ import json
 import base64
 import httpx
 from core.providers import get_client, load_keys, PROVIDER_INFO
-from core.agent import load_config
 from tools.registry import registry
 
 
 def vision_analyze(image_url: str, prompt: str = "Describe this image in detail.") -> str:
     """Analyze an image from a URL or local file path using a vision-capable model."""
     import os
+    from core.agent import load_config  # lazy: avoid circular import at tool-registration time
     cfg = load_config()
     provider = cfg.get("provider", "openrouter")
     # Use the same provider/model as the main agent — most modern models support vision
