@@ -162,6 +162,105 @@ def _model_supports_reasoning(provider: str, model: str) -> bool:
     return any(re.search(p, m) for p in patterns)
 
 
+# ── Per-(provider, model) reasoning-effort capability map ───────────
+# The UI shows exactly the levels a model actually accepts. "off" (rendered as
+# "None") is always first and always available — it means "send no reasoning
+# override". A model with no reasoning knob returns just ["off"], so the UI
+# shows a single locked "None" choice. Levels are kept current with each
+# provider's documented conventions (Anthropic effort param, OpenAI
+# reasoning_effort incl. gpt-5 minimal, OpenRouter unified reasoning.effort,
+# Gemini 3 low/high-only, etc.).
+REASONING_LEVEL_LABELS = {
+    "off": "None", "minimal": "Minimal", "low": "Low",
+    "medium": "Medium", "high": "High", "xhigh": "X-High", "max": "Max",
+}
+
+
+def _claude_reasoning_levels(m: str) -> list[str]:
+    import re
+    # Reasoning-capable Claude families (effort param OR extended-thinking budget).
+    if not re.search(r"(opus-4|sonnet-4|haiku-4-5|3-7-sonnet|claude-3\.7)", m):
+        return ["off"]
+    lv = ["off", "low", "medium", "high"]
+    # The GA effort param (low|medium|high|max, +xhigh on Opus 4.7+) is supported
+    # on Opus 4.5/4.6/4.7/4.8 and Sonnet 4.6. "max" is Opus-tier only.
+    if re.search(r"opus-4-(5|6|7|8)", m):
+        lv.append("max")
+        if re.search(r"opus-4-(7|8)", m):
+            lv.insert(lv.index("max"), "xhigh")
+    return lv
+
+
+def _openai_reasoning_levels(m: str) -> list[str]:
+    import re
+    # gpt-5.1+ / gpt-6: 'none' (==off) | low | medium | high
+    if re.search(r"gpt-5[.\-]1|gpt-5\.[1-9]|gpt-6", m):
+        return ["off", "low", "medium", "high"]
+    # gpt-5 base: minimal | low | medium | high (no true "none")
+    if re.search(r"gpt-5", m):
+        return ["off", "minimal", "low", "medium", "high"]
+    # o-series reasoning models (o1/o3/o4-mini, ...): low | medium | high
+    if re.search(r"(^|[/-])o[1-9]([.\-]|$)", m):
+        return ["off", "low", "medium", "high"]
+    return ["off"]
+
+
+def _google_reasoning_levels(m: str) -> list[str]:
+    import re
+    # Gemini 3 maps reasoning_effort→thinking_level and accepts only low|high.
+    if re.search(r"gemini-3", m):
+        return ["off", "low", "high"]
+    if re.search(r"gemini-2[.\-]5", m):
+        return ["off", "low", "medium", "high"]
+    return ["off"]
+
+
+def reasoning_levels(provider: str, model: str) -> list[str]:
+    """Ordered list of reasoning-effort levels a (provider, model) pair accepts.
+
+    Always starts with "off" (UI label "None"). A model with no reasoning
+    control returns just ["off"]. Use REASONING_LEVEL_LABELS for display text."""
+    import re
+    p = (provider or "").strip().lower()
+    m = (model or "").strip().lower()
+
+    if p == "anthropic":
+        return _claude_reasoning_levels(m)
+    if p == "openai":
+        return _openai_reasoning_levels(m)
+    if p == "google":
+        return _google_reasoning_levels(m)
+    if p == "deepseek":
+        # deepseek-reasoner / r1 always reason; there is no adjustable knob.
+        return ["off"]
+    if p == "openrouter":
+        sub = m.split("/", 1)[1] if "/" in m else m
+        if "claude" in sub:
+            return _claude_reasoning_levels(sub)
+        if re.search(r"gpt-5|gpt-6|(^|[/-])o[1-9]([.\-]|$)", sub):
+            return _openai_reasoning_levels(sub)
+        if "gemini" in sub:
+            return _google_reasoning_levels(sub)
+        # Other OpenRouter backends route through its unified reasoning.effort.
+        return ["off", "low", "medium", "high"]
+
+    def _generic(pats: list[str]) -> list[str]:
+        return (["off", "low", "medium", "high"]
+                if any(re.search(x, m) for x in pats) else ["off"])
+
+    if p == "kimi":
+        return _generic([r"kimi-thinking", r"kimi-k2", r"moonshot"])
+    if p == "zai":
+        return _generic([r"glm-4\.[6-9]", r"glm-5", r"glm-z"])
+    if p == "alibaba":
+        return _generic([r"qwen3", r"qwq", r"qwen-plus", r"qwen-max"])
+    if p == "minimax":
+        return _generic([r"minimax-m"])
+    if p in ("huggingface", "local"):
+        return ["off", "low", "medium", "high"]
+    return ["off"]
+
+
 def _build_reasoning_openai_kwargs(provider: str, model: str, effort: str) -> dict:
     """Return a dict of kwargs to merge into an OpenAI-SDK .create() call so
     the underlying API runs in reasoning mode. Empty dict if unsupported /
@@ -180,11 +279,11 @@ def _build_reasoning_openai_kwargs(provider: str, model: str, effort: str) -> di
     if provider == "openrouter":
         return {"extra_body": {"reasoning": {"effort": effort}}}
 
-    # Google Gemini via OpenAI-compat endpoint: nested google.thinking_config
+    # Google Gemini via OpenAI-compat endpoint: the compat layer maps top-level
+    # reasoning_effort → Gemini's thinking_level (and avoids the thinking_budget
+    # vs thinking_level conflict on Gemini 3, which rejects "medium").
     if provider == "google":
-        return {"extra_body": {
-            "google": {"thinking_config": {"thinking_budget": _effort_to_budget(effort)}}
-        }}
+        return {"reasoning_effort": effort}
 
     # DeepSeek / Kimi / Z.AI / Qwen / MiniMax: most route through OpenRouter's
     # shape when self-hosted. These native endpoints are provider-specific and
@@ -198,6 +297,33 @@ def _build_reasoning_openai_kwargs(provider: str, model: str, effort: str) -> di
         }}
 
     return {}
+
+
+def _anthropic_supports_effort_param(model: str) -> bool:
+    """True for Claude models that take the GA `output_config.effort` parameter
+    (Opus 4.5/4.6/4.7/4.8 and Sonnet 4.6). Older thinking-capable Claudes use a
+    `budget_tokens` budget instead; non-reasoning Claudes use neither."""
+    import re
+    m = (model or "").lower()
+    return bool(re.search(r"opus-4-(5|6|7|8)", m) or re.search(r"sonnet-4-6", m))
+
+
+def _anthropic_effort_value(effort: str, model: str) -> str:
+    """Normalize a cross-provider effort string to an Anthropic effort value.
+    `max` is Opus-tier only and `xhigh` is Opus 4.7+; downgrade on other models."""
+    import re
+    e = (effort or "").strip().lower()
+    if e == "minimal":
+        e = "low"
+    if e not in ("low", "medium", "high", "xhigh", "max"):
+        e = "high"
+    m = (model or "").lower()
+    is_opus = "opus-4" in m
+    if e == "max" and not is_opus:
+        e = "high"
+    if e == "xhigh" and not re.search(r"opus-4-(7|8)", m):
+        e = "high"
+    return e
 
 
 # ── Anthropic → OpenAI adapter ──────────────────────────────────────
@@ -307,6 +433,18 @@ def _consume_openai_stream(stream, on_delta):
         _stream_error = e
         finish_reason = finish_reason or "error"
 
+    # ── Stream end without an explicit finish_reason ──
+    # We get here only when the `for chunk in stream` loop completed WITHOUT
+    # raising — i.e. the server ended the stream cleanly. A genuine mid-stream
+    # cutoff raises and is marked "error" above. So a clean end with content but
+    # no finish_reason is a COMPLETE response whose provider simply never emitted
+    # one (common for Claude-via-proxy models). It must NOT be treated as a stall:
+    # doing so made the agent append a "please continue" prompt and re-call the
+    # API, which produced a SECOND full reply — the duplicate-response bug. Treat
+    # a clean end as a normal stop.
+    if finish_reason is None and (content_parts or tool_calls):
+        finish_reason = "stop"
+
     tc_list = None
     if tool_calls:
         tc_list = [
@@ -378,10 +516,16 @@ class _AnthropicCompletions:
         tools = kwargs.get("tools", None)
         tool_choice = kwargs.get("tool_choice", None)
         thinking_budget = kwargs.get("thinking_budget", 0)  # 0 = disabled
-        # Accept a cross-provider reasoning_effort too; map to a budget when
-        # Anthropic is the backend. Explicit thinking_budget wins if both set.
-        if not thinking_budget:
-            effort = str(kwargs.get("reasoning_effort", "") or "").lower()
+        effort = str(kwargs.get("reasoning_effort", "") or "").strip().lower()
+        # Modern Claude (Opus 4.5+/Sonnet 4.6) take the GA effort parameter via
+        # output_config + adaptive thinking, and REJECT budget_tokens/temperature.
+        # Older thinking-capable models still take a fixed budget_tokens. An
+        # explicit thinking_budget (legacy pin) forces the budget path.
+        use_effort_param = (
+            _anthropic_supports_effort_param(model) and not thinking_budget
+        )
+        if not use_effort_param and not thinking_budget:
+            # Legacy budget path: derive a budget from the effort string.
             if effort and effort != "off" and _model_supports_reasoning("anthropic", model):
                 thinking_budget = _effort_to_budget(effort, ceiling=max_tokens - 1)
 
@@ -428,8 +572,28 @@ class _AnthropicCompletions:
         # (system prompt uses breakpoint #1, these use #2-4 — Anthropic max is 4)
         self._apply_cache_breakpoints(conv_messages)
 
-        # Thinking requires temperature=1 and budget_tokens < max_tokens
-        if thinking_budget > 0:
+        if use_effort_param and effort and effort != "off":
+            # GA effort parameter + adaptive thinking. These models reject
+            # temperature and budget_tokens, so we omit both. (When no effort is
+            # selected we fall through to the plain path below, preserving the
+            # existing temperature behavior for non-reasoning turns.)
+            #
+            # `output_config` / `thinking:{type:"adaptive"}` are newer than the
+            # pinned Anthropic SDK (0.52.x) knows about, so we pass them via
+            # extra_body — the SDK forwards it verbatim into the request body
+            # rather than rejecting it as an unknown typed kwarg.
+            api_kwargs = dict(
+                model=model,
+                messages=conv_messages,
+                max_tokens=max_tokens,
+                extra_body={
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": _anthropic_effort_value(effort, model)},
+                },
+            )
+        elif thinking_budget > 0:
+            # Legacy extended-thinking path: temperature must be 1 and
+            # budget_tokens < max_tokens.
             temperature = 1
             thinking_budget = min(thinking_budget, max_tokens - 1)
             api_kwargs = dict(

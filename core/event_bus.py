@@ -150,7 +150,16 @@ def _setup_default_subscribers():
         try:
             if original is not None:
                 from tools.file_viewer import notify_edit
-                notify_edit(path, original)
+                # Runs synchronously on the tool's worker thread, where
+                # current_agent() is bound to the editing column's agent — pass
+                # it through so the diff card lands in THAT column's chat pane.
+                agent = None
+                try:
+                    from core.agent import current_agent
+                    agent = current_agent()
+                except Exception:
+                    agent = None
+                notify_edit(path, original, agent)
             else:
                 from tools.file_viewer import notify_file_changed
                 notify_file_changed(path)

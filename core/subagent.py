@@ -703,6 +703,7 @@ class Orchestrator:
         self._model = ""
         self._provider = ""
         self._workspace = ""
+        self._conv_id = ""  # conversation that spawned this job (UI routing)
         self._tasks_by_id: dict[str, SubTask] = {}
         self._futures: dict[str, Future] = {}
         self._lock = threading.Lock()
@@ -967,6 +968,20 @@ def get_orchestrator(job_id: str = "") -> Orchestrator:
 def get_existing(job_id: str) -> Orchestrator | None:
     with _orch_lock:
         return _orchestrators.get(job_id)
+
+
+def get_job_conv_id(job_or_task_id: str) -> str:
+    """Resolve the conversation that owns a job, given a job_id OR a task_id.
+
+    Task ids are always prefixed with their job id (see decompose/add_single_task),
+    so the leading segment identifies the job. Returns "" if unknown — callers
+    treat that as "route by local ownership" rather than dropping the event."""
+    if not job_or_task_id:
+        return ""
+    job_id = job_or_task_id.split("-", 1)[0]
+    with _orch_lock:
+        orch = _orchestrators.get(job_id)
+        return getattr(orch, "_conv_id", "") if orch else ""
 
 
 def cleanup_old(max_age: float = 3600):

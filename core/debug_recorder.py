@@ -51,7 +51,7 @@ class DebugRecorder:
     One deque of turns per conversation id (in-memory), mirrored to SQLite.
     """
 
-    def __init__(self, max_turns: int = 25):
+    def __init__(self, max_turns: int = 12):
         self._lock = threading.RLock()
         self._max_turns = max_turns
         self._by_conv: Dict[str, List[Dict[str, Any]]] = {}

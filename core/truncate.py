@@ -75,13 +75,16 @@ def truncate_output(text: str, max_chars: int = DEFAULT_MAX_CHARS,
     head_budget = int(max_chars * head_ratio)
     tail_budget = max_chars - head_budget - 300  # Reserve space for marker
 
-    # Find clean line boundaries
+    # Find clean line boundaries — CLAMPED: on single-giant-line content the
+    # nearest newline can sit thousands of chars from the boundary, silently
+    # discarding most of the budget. If snapping costs more than half the
+    # budget on either end, cut mid-line instead.
     head_end = text.rfind("\n", 0, head_budget)
-    if head_end == -1:
+    if head_end == -1 or head_end < head_budget // 2:
         head_end = head_budget
 
     tail_start = text.find("\n", len(text) - tail_budget)
-    if tail_start == -1:
+    if tail_start == -1 or tail_start > len(text) - tail_budget // 2:
         tail_start = len(text) - tail_budget
 
     removed = tail_start - head_end

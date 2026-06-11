@@ -8,11 +8,39 @@ if no embedding provider is available or the model field is blank.
 
 import json
 import struct
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
 _DEFAULT_MODEL = "openai/text-embedding-3-small"
 _DEFAULT_DIMS = 1536  # text-embedding-3-small default
+
+# Embeddings are deterministic for a given (model, input), so an identical
+# string never needs a second network round-trip. A repeated search query,
+# memory recall over stable text, or a re-run vector_search would otherwise
+# pay full latency + token cost to recompute a vector we already have. Bounded
+# LRU keyed on (model, text) — capped so it can't grow unbounded in a long
+# session.
+_EMBED_CACHE: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
+_EMBED_CACHE_MAX = 2048
+
+
+def _cache_get(model: str, text: str):
+    key = (model, text)
+    vec = _EMBED_CACHE.get(key)
+    if vec is not None:
+        _EMBED_CACHE.move_to_end(key)  # mark as most-recently used
+    return vec
+
+
+def _cache_put(model: str, text: str, vec: list[float]) -> None:
+    if vec is None:
+        return
+    key = (model, text)
+    _EMBED_CACHE[key] = vec
+    _EMBED_CACHE.move_to_end(key)
+    while len(_EMBED_CACHE) > _EMBED_CACHE_MAX:
+        _EMBED_CACHE.popitem(last=False)  # evict least-recently used
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 # Keys live under data/ (user-state / gitignore boundary). Match providers.py.
@@ -136,8 +164,13 @@ def embed_text(text: str, purpose: str = "general") -> Optional[list[float]]:
         return None
     try:
         text = text[:8000]
+        cached = _cache_get(model, text)
+        if cached is not None:
+            return cached
         resp = client.embeddings.create(model=model, input=text)
-        return resp.data[0].embedding
+        vec = resp.data[0].embedding
+        _cache_put(model, text, vec)
+        return vec
     except Exception as e:
         print(f"[Embeddings] Error: {e}")
         return None
@@ -153,10 +186,23 @@ def embed_batch(texts: list[str],
         return [None] * len(texts)
     try:
         capped = [t[:8000] for t in texts]
-        resp = client.embeddings.create(model=model, input=capped)
-        result = [None] * len(texts)
-        for item in resp.data:
-            result[item.index] = item.embedding
+        result: list = [None] * len(texts)
+        # Serve any cache hits locally; only send the misses to the API.
+        miss_idx = []
+        miss_text = []
+        for i, t in enumerate(capped):
+            hit = _cache_get(model, t)
+            if hit is not None:
+                result[i] = hit
+            else:
+                miss_idx.append(i)
+                miss_text.append(t)
+        if miss_text:
+            resp = client.embeddings.create(model=model, input=miss_text)
+            for item in resp.data:
+                orig_i = miss_idx[item.index]
+                result[orig_i] = item.embedding
+                _cache_put(model, miss_text[item.index], item.embedding)
         return result
     except Exception as e:
         print(f"[Embeddings] Batch error: {e}")

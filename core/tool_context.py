@@ -35,6 +35,12 @@ class ToolContext:
     # ── Working directory ──
     cwd: str = ""
 
+    # ── Originating conversation ──
+    # The conversation that issued this tool call. Lets UI bridges (e.g. the
+    # sub-agent card/terminal bridge) route live widgets back to the correct
+    # chat column when several conversations are open side by side.
+    conv_id: str = ""
+
     # ── Abort signal ──
     # Set by the agent when the user hits Stop. Tools should check
     # `ctx.abort_signal.is_set()` periodically during long operations
@@ -135,6 +141,7 @@ def make_context(
     message_id: str = "",
     agent_name: str = "Agent",
     call_id: str = "",
+    conv_id: str = "",
     abort_signal: threading.Event | None = None,
     metadata_callback: Callable[[dict], None] | None = None,
     ask_callback: Callable[[str], bool] | None = None,
@@ -148,6 +155,7 @@ def make_context(
         tool_name=tool_name,
         call_id=call_id,
         cwd=cwd,
+        conv_id=conv_id,
         abort_signal=abort_signal or _global_abort,
         _metadata_callback=metadata_callback,
         _ask_callback=ask_callback,

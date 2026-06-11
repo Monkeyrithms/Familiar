@@ -17,6 +17,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from core.proc import NO_WINDOW
+
 CHECKPOINT_DIR = Path(__file__).parent.parent / "data" / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -59,6 +61,7 @@ def _git(args: list, shadow: Path, working_dir: str,
             capture_output=True, text=True, timeout=timeout,
             env=_git_env(shadow, working_dir),
             cwd=str(Path(working_dir).resolve()),
+            creationflags=NO_WINDOW,  # no console flash on Windows
         )
         return r.returncode == 0, r.stdout.strip(), r.stderr.strip()
     except subprocess.TimeoutExpired:

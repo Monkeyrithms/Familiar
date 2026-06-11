@@ -11,6 +11,7 @@ Runs in a background thread so it never blocks the user.
 """
 
 import json
+import queue
 import time
 import threading
 from pathlib import Path
@@ -23,6 +24,16 @@ from core.database import (
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 MIN_TURN_CHARS = 80  # Skip trivial exchanges ("ok", "thanks", etc.)
+# Cap notes scanned per stream when building the librarian inventory — avoids
+# N×read_note() round-trips that hold the GIL and stall the Qt main thread.
+_MAX_INVENTORY_NOTES_PER_STREAM = 80
+
+# Single background worker serializes commits. Spawning one thread per turn let
+# several LLM+DB-heavy jobs overlap and contend on the GIL / SQLite locks,
+# which showed up as multi-second typing freezes when an old commit finished.
+_mem_job_queue: queue.Queue = queue.Queue()
+_mem_worker_started = False
+_mem_worker_lock = threading.Lock()
 
 COMMIT_SYSTEM_PROMPT = """Role: memory librarian. After each turn: (1) update long-term memory notes, (2) update the workspace notes pool.
 
@@ -207,6 +218,145 @@ def _parse_commit_response(text: str) -> tuple[list, list]:
     return _parse_json_array(t), []
 
 
+def _current_section_summary(text: str, limit: int = 300) -> str:
+    """Extract the Current section from note text (or SQL preview)."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    evi_idx = next(
+        (i for i, ln in enumerate(lines)
+         if ln.strip().lower().startswith("## evidence")),
+        None,
+    )
+    current = ("\n".join(lines[:evi_idx]).strip()
+               if evi_idx is not None else text.strip())
+    if current.lower().startswith("## current"):
+        current = current.split("\n", 1)[1].strip() if "\n" in current else ""
+    return current[:limit]
+
+
+def _build_existing_inventory(stream_names: list[str]) -> dict:
+    """Compact note inventory for the commit prompt.
+
+    Uses list_notes_in_category previews (one query per category) instead of
+    read_note() per title — the old path could open hundreds of SQLite
+    connections and parse full note bodies on the GIL, freezing the UI."""
+    existing: dict = {}
+    for stream in stream_names:
+        try:
+            cats = list_note_categories(stream)
+            stream_info = {"categories": {}}
+            note_count = 0
+            for cat in cats:
+                if note_count >= _MAX_INVENTORY_NOTES_PER_STREAM:
+                    break
+                titles = list_notes_in_category(stream, cat["category"])
+                cat_notes = []
+                for t in titles:
+                    if note_count >= _MAX_INVENTORY_NOTES_PER_STREAM:
+                        break
+                    current = _current_section_summary(t.get("preview") or "")
+                    cat_notes.append({"title": t["title"], "current": current})
+                    note_count += 1
+                if cat_notes:
+                    stream_info["categories"][cat["category"]] = cat_notes
+            existing[stream] = stream_info
+        except Exception:
+            existing[stream] = {"categories": {}}
+    return existing
+
+
+def _execute_memory_commit(job: dict) -> None:
+    user_msg = job["user_msg"]
+    agent_reply = job["agent_reply"]
+    stream_names = job["stream_names"]
+    conv_id = job["conv_id"]
+    _ws_notes = job["workspace_notes"]
+    on_workspace_update = job.get("on_workspace_update")
+
+    existing = _build_existing_inventory(stream_names)
+
+    prompt = (
+        f"existing_notes:\n{json.dumps(existing, indent=2)}\n\n"
+        f"workspace_notes:\n{json.dumps(_ws_notes)}\n\n"
+        f"exchange:\n"
+        f"[User]: {user_msg[:1500]}\n\n"
+        f"[Agent]: {agent_reply[:1500]}\n\n"
+        f"Output JSON object with memory_notes and workspace_notes."
+    )
+
+    raw = _quick_llm(COMMIT_SYSTEM_PROMPT, prompt)
+    mem_notes, new_ws_notes = _parse_commit_response(raw)
+
+    saved_titles = []
+    for note in mem_notes:
+        stream = note.get("stream", "")
+        category = note.get("category", "")
+        title = note.get("title", "")
+        content = note.get("content", "")
+        kw = note.get("keywords", "")
+        if not all([stream, category, title, content]):
+            continue
+        if stream not in stream_names:
+            continue
+
+        # Check for near-duplicate before saving
+        existing_note = read_note(stream, category, title)
+        if existing_note and existing_note["content"].strip() == content.strip():
+            continue
+
+        # Auto-committed notes are model-extracted from the conversation,
+        # so they're 'inferred' (not user-confirmed fact) until verified.
+        save_note(stream, category, title, content, keywords=kw,
+                  source_conv=conv_id, provenance="inferred")
+        saved_titles.append(title)
+
+    if saved_titles:
+        titles_str = ", ".join(saved_titles)
+        print(f"[MemoryAgent] Committed {len(saved_titles)} note(s): {titles_str}")
+
+    # Sanitize workspace notes: keep only non-empty strings, cap at 15
+    clean_ws = [str(n).strip() for n in new_ws_notes if str(n).strip()][:15]
+    if clean_ws == _ws_notes:
+        return
+
+    if on_workspace_update is not None:
+        try:
+            on_workspace_update(clean_ws)
+            print(f"[MemoryAgent] Workspace notes updated: {len(clean_ws)} entries")
+        except Exception as e:
+            print(f"[MemoryAgent] workspace update callback error: {e}")
+
+    if conv_id:
+        try:
+            from core.database import set_workspace_notes
+            set_workspace_notes(conv_id, clean_ws)
+        except Exception as e:
+            print(f"[MemoryAgent] Failed to persist workspace notes: {e}")
+
+
+def _memory_commit_worker() -> None:
+    while True:
+        job = _mem_job_queue.get()
+        try:
+            _execute_memory_commit(job)
+        except Exception as e:
+            print(f"[MemoryAgent] commit error: {e}")
+        finally:
+            _mem_job_queue.task_done()
+
+
+def _ensure_memory_worker() -> None:
+    global _mem_worker_started
+    with _mem_worker_lock:
+        if _mem_worker_started:
+            return
+        _mem_worker_started = True
+        threading.Thread(
+            target=_memory_commit_worker, daemon=True, name="memory-agent",
+        ).start()
+
+
 def commit_to_memory(user_msg: str, agent_reply: str, stream_names: list[str],
                      conv_id: str = "",
                      workspace_notes: Optional[list[str]] = None,
@@ -222,92 +372,15 @@ def commit_to_memory(user_msg: str, agent_reply: str, stream_names: list[str],
     if len(user_msg) + len(agent_reply) < MIN_TURN_CHARS:
         return
 
-    _ws_notes = workspace_notes or []
-
-    def _run():
-        # Build context: what categories/notes already exist, with Current-section summaries
-        existing = {}
-        for stream in stream_names:
-            try:
-                cats = list_note_categories(stream)
-                stream_info = {"categories": {}}
-                for cat in cats:
-                    titles = list_notes_in_category(stream, cat["category"])
-                    cat_notes = []
-                    for t in titles:
-                        note = read_note(stream, cat["category"], t["title"])
-                        current = ""
-                        if note and note.get("content"):
-                            # Show only Current section (strip Evidence tail) to keep inventory compact
-                            c = note["content"]
-                            lines = c.splitlines()
-                            evi_idx = next(
-                                (i for i, ln in enumerate(lines)
-                                 if ln.strip().lower().startswith("## evidence")),
-                                None
-                            )
-                            current = ("\n".join(lines[:evi_idx]).strip()
-                                       if evi_idx is not None else c.strip())
-                            # Drop "## Current" header if present
-                            if current.lower().startswith("## current"):
-                                current = current.split("\n", 1)[1].strip() if "\n" in current else ""
-                            current = current[:300]
-                        cat_notes.append({"title": t["title"], "current": current})
-                    stream_info["categories"][cat["category"]] = cat_notes
-                existing[stream] = stream_info
-            except Exception:
-                existing[stream] = {"categories": {}}
-
-        prompt = (
-            f"existing_notes:\n{json.dumps(existing, indent=2)}\n\n"
-            f"workspace_notes:\n{json.dumps(_ws_notes)}\n\n"
-            f"exchange:\n"
-            f"[User]: {user_msg[:1500]}\n\n"
-            f"[Agent]: {agent_reply[:1500]}\n\n"
-            f"Output JSON object with memory_notes and workspace_notes."
-        )
-
-        raw = _quick_llm(COMMIT_SYSTEM_PROMPT, prompt)
-        mem_notes, new_ws_notes = _parse_commit_response(raw)
-
-        saved_titles = []
-        for note in mem_notes:
-            stream = note.get("stream", "")
-            category = note.get("category", "")
-            title = note.get("title", "")
-            content = note.get("content", "")
-            kw = note.get("keywords", "")
-            if not all([stream, category, title, content]):
-                continue
-            if stream not in stream_names:
-                continue
-
-            # Check for near-duplicate before saving
-            existing_note = read_note(stream, category, title)
-            if existing_note and existing_note["content"].strip() == content.strip():
-                continue
-
-            # Auto-committed notes are model-extracted from the conversation,
-            # so they're 'inferred' (not user-confirmed fact) until verified.
-            save_note(stream, category, title, content, keywords=kw,
-                      source_conv=conv_id, provenance="inferred")
-            saved_titles.append(title)
-
-        if saved_titles:
-            titles_str = ", ".join(saved_titles)
-            print(f"[MemoryAgent] Committed {len(saved_titles)} note(s): {titles_str}")
-
-        # Sanitize workspace notes: keep only non-empty strings, cap at 15
-        clean_ws = [str(n).strip() for n in new_ws_notes if str(n).strip()][:15]
-        if on_workspace_update is not None:
-            try:
-                on_workspace_update(clean_ws)
-                if clean_ws != _ws_notes:
-                    print(f"[MemoryAgent] Workspace notes updated: {len(clean_ws)} entries")
-            except Exception as e:
-                print(f"[MemoryAgent] workspace update callback error: {e}")
-
-    threading.Thread(target=_run, daemon=True).start()
+    _ensure_memory_worker()
+    _mem_job_queue.put({
+        "user_msg": user_msg,
+        "agent_reply": agent_reply,
+        "stream_names": list(stream_names),
+        "conv_id": conv_id,
+        "workspace_notes": list(workspace_notes or []),
+        "on_workspace_update": on_workspace_update,
+    })
 
 
 def _expand_queries(user_msg: str) -> list[str]:

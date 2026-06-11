@@ -30,6 +30,10 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 
+# Suppress the console window Windows otherwise allocates for console-subsystem
+# children (pylsp.exe, etc.) when the parent is a GUI process with no console.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 # ── LSP JSON-RPC transport ──────────────────────────────────────────────
 
@@ -338,6 +342,7 @@ class LspServer:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 cwd=self.workspace_root,
+                creationflags=_NO_WINDOW,
             )
             self._transport = LspTransport(proc)
         except Exception:

@@ -393,6 +393,7 @@ class RollingSummarizer:
         temperature: float = 0.3,
         librarian_active: bool = False,
         fast_path_enabled: bool = True,
+        status_callback=None,
     ) -> tuple[list[dict], int]:
         """Build context with per-stream summaries. Returns (context_messages, cutoff_index).
 
@@ -453,53 +454,71 @@ class RollingSummarizer:
             if model:
                 summary_routes.append({"provider": provider, "model": model})
 
-        # Update each stream's summary independently
-        for ss in self._streams.values():
-            new_chars = total_chars - ss._last_total_chars
-            ss.chars_since_last_summary += max(0, new_chars)
-            ss._last_total_chars = total_chars
+        # Update each stream's summary independently. status_callback(True) fires
+        # once, the moment an actual (potentially slow) LLM summarization begins,
+        # so the UI can show "summarizing…" instead of "typing…"; the finally
+        # always clears it.
+        _summarizing_signaled = False
+        try:
+            for ss in self._streams.values():
+                new_chars = total_chars - ss._last_total_chars
+                ss.chars_since_last_summary += max(0, new_chars)
+                ss._last_total_chars = total_chars
 
-            needs_update = (ss.current_summary is None or
-                            ss.chars_since_last_summary >= refresh_chars)
+                needs_update = (ss.current_summary is None or
+                                ss.chars_since_last_summary >= refresh_chars)
 
-            # ── Free-compaction fast path ──────────────────────────────
-            # Skip the merge LLM call when the librarian is actively capturing
-            # recent activity (its workspace_notes / memory_notes are already
-            # injected into context, so the gap is covered) AND we haven't
-            # fallen too far behind. Each skip saves one summarizer LLM call;
-            # the live tail keeps growing until either the librarian goes
-            # quiet, the gap exceeds 2× refresh_chars, or hard char_limit
-            # forces a re-cut on a future turn.
-            if (needs_update
-                and fast_path_enabled
-                and librarian_active
-                and ss.current_summary is not None
-                and ss.summary_end_index > 0
-                and ss.chars_since_last_summary < refresh_chars * 2):
-                # Fast path taken — preserve summary state, skip the merge.
-                # Do NOT reset chars_since_last_summary so the next call
-                # re-evaluates the threshold.
-                needs_update = False
+                # ── Free-compaction fast path ──────────────────────────────
+                # Skip the merge LLM call when the librarian is actively capturing
+                # recent activity (its workspace_notes / memory_notes are already
+                # injected into context, so the gap is covered) AND we haven't
+                # fallen too far behind. Each skip saves one summarizer LLM call;
+                # the live tail keeps growing until either the librarian goes
+                # quiet, the gap exceeds 2× refresh_chars, or hard char_limit
+                # forces a re-cut on a future turn.
+                if (needs_update
+                    and fast_path_enabled
+                    and librarian_active
+                    and ss.current_summary is not None
+                    and ss.summary_end_index > 0
+                    and ss.chars_since_last_summary < refresh_chars * 2):
+                    # Fast path taken — preserve summary state, skip the merge.
+                    # Do NOT reset chars_since_last_summary so the next call
+                    # re-evaluates the threshold.
+                    needs_update = False
 
-            if needs_update and summary_routes and cutoff > 0:
-                if ss.current_summary and ss.summary_end_index > 0:
-                    new_msgs = messages[ss.summary_end_index:cutoff]
-                    if new_msgs:
-                        updated = ss._merge(
-                            ss.current_summary, new_msgs, summary_routes, temperature)
-                        if updated is not None:
-                            ss.current_summary = updated
+                if needs_update and summary_routes and cutoff > 0:
+                    # First real LLM summarization this turn — tell the UI.
+                    if status_callback is not None and not _summarizing_signaled:
+                        _summarizing_signaled = True
+                        try:
+                            status_callback(True)
+                        except Exception:
+                            pass
+                    if ss.current_summary and ss.summary_end_index > 0:
+                        new_msgs = messages[ss.summary_end_index:cutoff]
+                        if new_msgs:
+                            updated = ss._merge(
+                                ss.current_summary, new_msgs, summary_routes, temperature)
+                            if updated is not None:
+                                ss.current_summary = updated
+                                ss.summary_end_index = cutoff
+                                ss.chars_since_last_summary = 0
+                                ss.save_state()
+                    else:
+                        generated = ss._generate(
+                            messages[:cutoff], summary_routes, temperature)
+                        if generated:
+                            ss.current_summary = generated
                             ss.summary_end_index = cutoff
                             ss.chars_since_last_summary = 0
                             ss.save_state()
-                else:
-                    generated = ss._generate(
-                        messages[:cutoff], summary_routes, temperature)
-                    if generated:
-                        ss.current_summary = generated
-                        ss.summary_end_index = cutoff
-                        ss.chars_since_last_summary = 0
-                        ss.save_state()
+        finally:
+            if _summarizing_signaled and status_callback is not None:
+                try:
+                    status_callback(False)
+                except Exception:
+                    pass
 
         # Build combined context with all stream summaries
         context = []

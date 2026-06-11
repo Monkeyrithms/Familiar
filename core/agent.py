@@ -9,6 +9,8 @@ import json
 import base64
 import os
 import time
+import threading
+import contextvars
 from pathlib import Path
 from core.workspace_paths import AGENT_ROOT, resolve_workspace_entry_path
 from core.providers import get_client
@@ -56,7 +58,7 @@ _TOOL_CATEGORIES: dict[str, dict] = {
         "tools": {
             "file_read", "file_write", "file_edit", "multi_edit", "multi_file",
             "file_search", "glob", "grep", "diff_tool", "apply_patch",
-            "file_watcher", "file_viewer", "notebook",
+            "file_watcher", "file_viewer",
         },
     },
     "exec": {
@@ -80,8 +82,8 @@ _TOOL_CATEGORIES: dict[str, dict] = {
         "tools": {"subagent", "explore_files", "vector_search", "session_search", "vision", "plan", "thinking", "memory", "ask_user_question", "reflect"},
     },
     "io": {
-        "desc": "Clipboard, notifications, sounds, screenshots, TTS, transcription.",
-        "tools": {"clipboard", "notify", "play_sound", "screenshot", "tts", "transcribe"},
+        "desc": "Clipboard, notifications, sounds, Familiar self-window screenshot, TTS, transcription, the user's Notes tab.",
+        "tools": {"clipboard", "notify", "play_sound", "screenshot", "tts", "transcribe", "notes"},
     },
     "misc": {
         "desc": "SSH, MCP servers, language servers, task tracking, audit.",
@@ -467,7 +469,25 @@ def save_config(cfg: dict):
         _config_cache = _config_cache_key = None
 
 
+# `_active_agent` tracks the most recently CONSTRUCTED agent. It used to be the
+# sole way tools resolved "the current agent", but that breaks once multiple chat
+# columns each own their own Agent and run inferences CONCURRENTLY on separate
+# threads (whichever was built last would win). `_current_agent_var` is a
+# per-thread/per-context override set for the duration of each `chat()` run, so a
+# tool executing inside column A's inference thread resolves column A's agent.
+# `current_agent()` prefers the contextvar and falls back to `_active_agent` for
+# main-thread callers outside any inference (preserves the old single-agent
+# behavior).
 _active_agent: "Agent | None" = None
+_current_agent_var: "contextvars.ContextVar[Agent | None]" = contextvars.ContextVar(
+    "current_agent", default=None
+)
+
+
+def current_agent() -> "Agent | None":
+    """The agent that owns the currently-running inference (per-thread), or the
+    most recently constructed agent as a fallback."""
+    return _current_agent_var.get() or _active_agent
 
 
 class Agent:
@@ -475,6 +495,12 @@ class Agent:
         global _active_agent
         _active_agent = self
         self.config = load_config()
+        # Push the user's disabled-tool set into the registry so disabled
+        # tools cost zero schema tokens from the very first turn.
+        try:
+            registry.set_disabled(set(self.config.get("disabled_tools", [])))
+        except Exception:
+            pass
         self.context: list[dict] = []
         self.tool_call_log: list[dict] = []
         # Read-state ledger: path -> {"mtime": float, "ranges": set[(offset,limit)]}.
@@ -494,6 +520,9 @@ class Agent:
         self._context_note: str = ""
         self._provider_override: str = ""
         self._model_override: str = ""
+        # Per-conversation reasoning/thinking level ("" = none / provider default).
+        # Set from the Conversation dialog; overrides the global config knob.
+        self._reasoning_effort: str = ""
         self._tool_callback = None  # optional: called with (name, args) on each tool exec
         self._tool_batch_callback = None  # optional: called with ordered tool names for parallel batch UI
         # Optional streaming hooks set by the UI's inference thread:
@@ -501,9 +530,18 @@ class Agent:
         #   _on_round_start()            — fires before each model round (UI reset)
         self._stream_callback = None
         self._on_round_start = None
+        # Optional: _summarize_callback(active: bool) — fires True when a
+        # (possibly slow) rolling-summary LLM call starts mid-turn and False when
+        # it ends, so the UI can show "summarizing…" instead of "typing…".
+        self._summarize_callback = None
         self._include_context_timestamps = True  # per-conversation, gated in ConversationDialog
         self._summary_cutoff: int = 0  # context index: messages before this were summarized
         self._stop_requested = False
+        # Per-agent tool-abort signal. Each column owns its Agent, so STOP in one
+        # column must abort only ITS tools — not a process-global event shared by
+        # every concurrently-inferring column. Passed into each tool's ToolContext
+        # below; the UI sets it via this agent on Stop and clears it per turn.
+        self._abort_event = threading.Event()
         self._conv_id: str = ""
         self._conversation_cwd: str = ""
         # Self-review / reflection state (see core/reflection.py + the reflect
@@ -690,6 +728,17 @@ class Agent:
 
     def set_model(self, model: str):
         self._model_override = model
+
+    def set_reasoning_effort(self, effort: str, persist: bool = True):
+        """Set the per-conversation reasoning level ("" = none). Persists to the
+        conversation row so it survives reloads and column switches."""
+        self._reasoning_effort = (effort or "").strip().lower()
+        if persist and self._conv_id:
+            try:
+                from core.database import set_conversation_reasoning_effort
+                set_conversation_reasoning_effort(self._conv_id, self._reasoning_effort)
+            except Exception:
+                pass
 
     def set_system_prompt(self, prompt: str):
         self.config["system_prompt"] = prompt
@@ -956,7 +1005,7 @@ First-pass often misses \u2014 run multiple searches in parallel with varied key
 
 ## Editing files
 file_edit default: old_string must match exactly once (enough context). Prefer small hunks (<30 lines). \u2717 file_write whole files for partial changes.
-After code change: run it. After UI change: screenshot it.
+After code change: run it. After Familiar UI change in this app: screenshot (target='self').
 
 ## Verifying
 Run tests if they exist. Exercise the changed code path. \u2717 Declare done until code actually runs.
@@ -980,7 +1029,11 @@ Stage specific files. \u2717 git add . / -A. \u2717 Force push. \u2717 Commit se
 
 ## Plans & browsers
 plan tool for multi-step tasks. read_browser=right-panel page, browser=headless, web_fetch=one-shot URL, web_search=open web.
-After local server: screenshot before declaring done.
+After local server: verify via terminal output; if the page is in the workspace browser use read_browser.
+
+## Screenshots
+screenshot targets: 'self' (Familiar's own window — UI checks), 'desktop'/'all' (whole screen/all monitors), 'screen:N' (one monitor), 'window:<title>' (an external app window, Windows-only). Captured image shows in chat AND is shared with a remote viewer when this conversation is mirrored — so a peer can ask to see this machine's screen. (Desktop capture needs a display.)
+read_browser = workspace browser tab (user session + vision when needed). terminal / workspace_terminal = command text. vision_analyze = existing image path or URL.
 
 ## Showing files
 User says "show/display/open/let me see/pull up" a file \u2192 call file_show(path). \u2717 file_read for that (it only fills your context; the user sees nothing). Edited files auto-surface.""")
@@ -1216,7 +1269,8 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                 stream_configs=stream_configs,
                 temperature=summary_temp,
                 librarian_active=librarian_active,
-                fast_path_enabled=fast_path_enabled)
+                fast_path_enabled=fast_path_enabled,
+                status_callback=getattr(self, "_summarize_callback", None))
             messages.extend(summarized)
         else:
             messages.extend(self.context)
@@ -1395,14 +1449,31 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
         )
         # Cross-provider reasoning / thinking. `reasoning_effort` is routed to
         # the right payload shape per provider by ReasoningClientWrapper (for
-        # OpenAI-SDK clients) and by the Anthropic adapter. `thinking_budget`
-        # still works for Anthropic users who want to pin an exact budget.
-        if self.config.get("thinking_enabled"):
+        # OpenAI-SDK clients) and by the Anthropic adapter. A per-conversation
+        # level (set in the Conversation dialog) takes precedence over the global
+        # config knob; we only send a level the (provider, model) actually
+        # accepts, so a stale value never trips a 400.
+        conv_effort = (getattr(self, "_reasoning_effort", "") or "").strip().lower()
+        if conv_effort:
+            effort = conv_effort
+        elif self.config.get("thinking_enabled"):
             effort = str(self.config.get("reasoning_effort") or "medium").lower()
-            if effort and effort != "off":
+        else:
+            effort = ""
+        if effort and effort != "off":
+            send = True
+            try:
+                from core.providers import reasoning_levels
+                send = effort in reasoning_levels(ep, model)
+            except Exception:
+                pass
+            if send:
                 kwargs["reasoning_effort"] = effort
-            if ep == "anthropic" and self.config.get("thinking_budget"):
-                kwargs["thinking_budget"] = int(self.config.get("thinking_budget", 8000))
+        # Legacy exact-budget pin (Anthropic only), when no per-conv level is set.
+        if (not conv_effort and ep == "anthropic"
+                and self.config.get("thinking_enabled")
+                and self.config.get("thinking_budget")):
+            kwargs["thinking_budget"] = int(self.config.get("thinking_budget", 8000))
         if tools_list:
             kwargs["tools"] = tools_list
             # Don't set tool_choice — let the model decide naturally.
@@ -1430,6 +1501,15 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                     delay = API_BASE_DELAY * (2 ** attempt)
                     _log(f"Transient error (attempt {attempt+1}/{API_MAX_RETRIES}): {err_str[:300]}. Retrying in {delay:.1f}s...")
                     time.sleep(delay)
+                    # The failed attempt may have already streamed partial text
+                    # to the live view; reset it so the retry's reply doesn't
+                    # render appended after the partial as a doubled response.
+                    if (kwargs.get("stream_callback") is not None
+                            and getattr(self, "_on_round_start", None) is not None):
+                        try:
+                            self._on_round_start()
+                        except Exception:
+                            pass
                 else:
                     raise
         raise last_error  # should not reach here
@@ -1514,6 +1594,13 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
     # ── Main chat method ─────────────────────────────────────────────
 
     def chat(self, user_message: str, image_path: str = None) -> str:
+        # Bind THIS agent as the current one for the duration of this inference.
+        # Runs on the column's InferenceThread, so the contextvar (per-thread)
+        # routes tool lookups (memory/reflect streams, etc.) to this agent even
+        # when other columns are inferring concurrently. No reset needed: each
+        # thread has its own context and re-binds on its next chat() call.
+        _current_agent_var.set(self)
+
         # Guard: empty message
         if not user_message and not image_path:
             _log("WARNING: Empty message received, skipping")
@@ -1656,6 +1743,8 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
         _recall_text = "\n".join(recall_parts) if recall_parts else ""
 
         client = get_client(self.provider)
+        # Re-sync disabled tools each turn so a Settings change applies live.
+        registry.set_disabled(set(load_config().get("disabled_tools", [])))
         tools_list = registry.get_schemas()
         if not self.config.get("full_tools_list", True) and tools_list and user_message:
             tools_list = self._route_tools_category(client, user_message, tools_list)
@@ -2056,8 +2145,10 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
 
             # ── Execute tools (parallel when multiple, sequential when single) ──
             import concurrent.futures
-            from core.tool_context import make_context, get_global_abort, reset_global_abort
-            reset_global_abort()
+            from core.tool_context import make_context
+            # Clear THIS agent's abort signal at the start of each tool batch
+            # (per-column, not the process-global event).
+            self._abort_event.clear()
 
             def _exec_one(tc, name, args, *, announce_ui: bool = True):
                 """Execute a single tool call. Returns (tc, name, args, result, tb_str)."""
@@ -2073,9 +2164,10 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                     tool_name=name,
                     cwd=args.get("cwd", self.workspace_path),
                     session_id=getattr(self, '_session_id', ''),
+                    conv_id=getattr(self, '_conv_id', ''),
                     agent_name="Agent",
                     call_id=tc.id,
-                    abort_signal=get_global_abort(),
+                    abort_signal=self._abort_event,
                     metadata_callback=getattr(self, '_metadata_callback', None),
                     ask_callback=getattr(self, '_ask_callback', None),
                     messages=list(self.context[-20:]),  # Last 20 messages
@@ -2087,9 +2179,21 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                 # and waits for the user) must NOT time out — the user gets as long
                 # as they want. Everything else keeps the 120s runaway guard.
                 exec_timeout = None if name in NO_TIMEOUT_TOOLS else 120
+
+                # The tool runs on this inner pool thread, which does NOT inherit
+                # the inference thread's contextvars. Re-bind THIS agent as the
+                # current one inside the worker so current_agent() resolves to the
+                # column actually running the tool — not the most-recently-built
+                # agent (the _active_agent fallback). Without this, ask_user /
+                # approval / file-edit-card routing all marshal UI to the wrong
+                # column under concurrent conversations.
+                def _run_tool(_self=self, _name=name, _args=args, _ctx=ctx):
+                    _current_agent_var.set(_self)
+                    return registry.execute(_name, _args, ctx=_ctx)
+
                 try:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as inner:
-                        future = inner.submit(registry.execute, name, args, ctx=ctx)
+                        future = inner.submit(_run_tool)
                         result = future.result(timeout=exec_timeout)
                     # Redact secrets from tool output
                     from core.redact import redact

@@ -18,6 +18,10 @@ from core.database import (
     set_conversation_workspace,
     set_conversation_cwd,
     set_conversation_model,
+    set_conversation_private,
+    is_conversation_private,
+    set_conversation_allow_terminal,
+    conversation_allows_terminal,
     set_conversation_provider,
     set_conversation_streams,
     get_conversation_streams,
@@ -25,6 +29,20 @@ from core.database import (
     save_chat_image,
     load_chat_image,
     get_chat_image_path,
+    # Workspace (column group) layer
+    list_workspaces,
+    get_workspace,
+    create_workspace,
+    rename_workspace,
+    delete_workspace,
+    get_workspace_streams,
+    set_workspace_streams,
+    set_workspace_columns,
+    set_workspace_active_conv,
+    add_conversation_to_workspace,
+    remove_conversation_from_workspace,
+    workspace_for_conversation,
+    new_workspace_id,
 )
 
 # Re-export everything so existing imports keep working
@@ -38,6 +56,10 @@ __all__ = [
     "set_conversation_workspace",
     "set_conversation_cwd",
     "set_conversation_model",
+    "set_conversation_private",
+    "is_conversation_private",
+    "set_conversation_allow_terminal",
+    "conversation_allows_terminal",
     "set_conversation_streams",
     "get_conversation_streams",
     "search_conversations",
@@ -45,6 +67,20 @@ __all__ = [
     "load_chat_image",
     "get_chat_image_path",
     "new_conversation_id",
+    # Workspace layer
+    "list_workspaces",
+    "get_workspace",
+    "create_workspace",
+    "rename_workspace",
+    "delete_workspace",
+    "get_workspace_streams",
+    "set_workspace_streams",
+    "set_workspace_columns",
+    "set_workspace_active_conv",
+    "add_conversation_to_workspace",
+    "remove_conversation_from_workspace",
+    "workspace_for_conversation",
+    "new_workspace_id",
 ]
 
 

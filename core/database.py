@@ -112,6 +112,23 @@ def init_conversations_db():
             modified_at REAL NOT NULL
         );
 
+        -- A workspace is the dropdown entry that groups MULTIPLE concurrent
+        -- conversations ("columns") which all share the same memory streams.
+        -- `col_order_json` is the ordered list of member conversation ids shown
+        -- as columns; `active_conv` is the last-focused column. (The legacy
+        -- conversations.workspace column is an unrelated project-folder tag.)
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id             TEXT PRIMARY KEY,
+            name           TEXT NOT NULL,
+            streams_json   TEXT NOT NULL DEFAULT '[]',
+            folder         TEXT NOT NULL DEFAULT '',
+            col_order_json TEXT NOT NULL DEFAULT '[]',
+            active_conv    TEXT NOT NULL DEFAULT '',
+            sort_order     INTEGER NOT NULL DEFAULT 0,
+            created_at     REAL NOT NULL,
+            modified_at    REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS messages (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -127,6 +144,12 @@ def init_conversations_db():
 
         CREATE INDEX IF NOT EXISTS idx_messages_conv
             ON messages(conversation_id, position);
+
+        CREATE TABLE IF NOT EXISTS workspace_notes (
+            conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+            notes_json      TEXT NOT NULL DEFAULT '[]',
+            updated_at      REAL NOT NULL
+        );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             content,
@@ -184,6 +207,24 @@ def init_conversations_db():
         )
     except Exception:
         pass
+    # private: when 1, this conversation is NOT exposed over Familiar-Net — it's
+    # hidden from peers' remote-conversation lists and refuses subscribe/snapshot/
+    # input/file/browser access. A local-only conversation.
+    try:
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN private INTEGER NOT NULL DEFAULT 0"
+        )
+    except Exception:
+        pass
+    # allow_remote_terminal: when 1, a peer mirroring this conversation may open
+    # a real shell on THIS machine (in the conversation's workspace). Off by
+    # default — this grants remote code execution, so it's strictly opt-in.
+    try:
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN allow_remote_terminal INTEGER NOT NULL DEFAULT 0"
+        )
+    except Exception:
+        pass
     # context_note: per-conversation "author's note" injected as the LAST system
     # message every turn (after the conversation) for heavy recency weight.
     try:
@@ -205,6 +246,20 @@ def init_conversations_db():
     try:
         conn.execute(
             "ALTER TABLE conversations ADD COLUMN stream_live INTEGER NOT NULL DEFAULT 1"
+        )
+    except Exception:
+        pass
+    # workspace_id: which workspace (column group) this conversation belongs to.
+    try:
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''"
+        )
+    except Exception:
+        pass
+    # reasoning_effort: per-conversation reasoning/thinking level ("" = none).
+    try:
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''"
         )
     except Exception:
         pass
@@ -235,7 +290,54 @@ def init_conversations_db():
             """)
         except Exception as e:
             print(f"[DB] Could not create messages_vec: {e}")
+
+    # One-time workspace migration: give every conversation a home workspace.
+    try:
+        _migrate_conversations_to_workspaces(conn)
+    except Exception as e:
+        print(f"[DB] workspace migration skipped: {e}")
+
     conn.close()
+
+
+def _migrate_conversations_to_workspaces(conn) -> None:
+    """Back-fill the workspace model onto pre-existing conversations.
+
+    Each conversation that has no workspace yet becomes its OWN single-column
+    workspace (same name, streams seeded from the conversation) — matching the
+    reframing that 'the dropdown conversations are now workspaces'. Idempotent:
+    only conversations with workspace_id='' are touched, so it's safe to run on
+    every startup.
+    """
+    import json as _json
+    # Run only on first-ever setup: once ANY workspace exists, the back-fill is
+    # done. Skipping here is what stops a later orphan conversation (e.g. a chat
+    # whose workspace binding didn't land) from being turned into its own stray
+    # "New Chat N" workspace on every subsequent launch.
+    if conn.execute("SELECT 1 FROM workspaces LIMIT 1").fetchone():
+        return
+    rows = conn.execute(
+        "SELECT id, name, streams_json, workspace, modified_at "
+        "FROM conversations WHERE workspace_id='' OR workspace_id IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    for r in rows:
+        ws_id = f"ws_{r['id']}"
+        # INSERT OR IGNORE keeps this idempotent even if a prior run created the
+        # workspace row but didn't get to stamp the conversation (we still stamp
+        # it below).
+        conn.execute(
+            "INSERT OR IGNORE INTO workspaces (id, name, streams_json, folder, "
+            "col_order_json, active_conv, sort_order, created_at, modified_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (ws_id, r["name"] or "Workspace", r["streams_json"] or "[]",
+             r["workspace"] or "", _json.dumps([r["id"]]), r["id"],
+             0, r["modified_at"] or 0, r["modified_at"] or 0),
+        )
+        conn.execute(
+            "UPDATE conversations SET workspace_id=? WHERE id=?", (ws_id, r["id"]))
+    conn.commit()
 
 
 # ── Conversation CRUD ───────────────────────────────────────────────
@@ -247,6 +349,184 @@ def invalidate_conversation_list_cache() -> None:
     """Drop cached list_conversations() result after any conversation mutation."""
     global _conv_list_cache
     _conv_list_cache = None
+
+
+# ── Workspace CRUD ──────────────────────────────────────────────────
+# A workspace groups multiple concurrent conversations (columns) that share the
+# same memory streams. See the `workspaces` table + migration in
+# init_conversations_db.
+
+_ws_list_cache: list[dict] | None = None
+
+
+def _invalidate_workspace_cache() -> None:
+    global _ws_list_cache
+    _ws_list_cache = None
+
+
+def new_workspace_id() -> str:
+    import uuid
+    return f"ws_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+
+def _ws_row_to_dict(r) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "streams": json.loads(r["streams_json"] or "[]"),
+        "folder": r["folder"] or "",
+        "columns": json.loads(r["col_order_json"] or "[]"),
+        "active_conv": r["active_conv"] or "",
+        "sort_order": r["sort_order"],
+        "modified": r["modified_at"],
+    }
+
+
+def list_workspaces() -> list[dict]:
+    """All workspaces, ordered by sort_order then most-recently modified."""
+    global _ws_list_cache
+    if _ws_list_cache is not None:
+        return _ws_list_cache
+    conn = _conv_conn()
+    rows = conn.execute(
+        "SELECT * FROM workspaces ORDER BY sort_order ASC, modified_at DESC"
+    ).fetchall()
+    conn.close()
+    _ws_list_cache = [_ws_row_to_dict(r) for r in rows]
+    return _ws_list_cache
+
+
+def get_workspace(ws_id: str) -> dict | None:
+    if not ws_id:
+        return None
+    conn = _conv_conn()
+    r = conn.execute("SELECT * FROM workspaces WHERE id=?", (ws_id,)).fetchone()
+    conn.close()
+    return _ws_row_to_dict(r) if r else None
+
+
+def create_workspace(name: str, streams: list[str] | None = None,
+                     folder: str = "", ws_id: str | None = None) -> str:
+    """Create an (initially empty) workspace and return its id."""
+    ws_id = ws_id or new_workspace_id()
+    now = time.time()
+    conn = _conv_conn()
+    conn.execute(
+        "INSERT INTO workspaces (id, name, streams_json, folder, col_order_json, "
+        "active_conv, sort_order, created_at, modified_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (ws_id, name or "Workspace", json.dumps(streams or []), folder or "",
+         "[]", "", 0, now, now),
+    )
+    conn.commit()
+    conn.close()
+    _invalidate_workspace_cache()
+    return ws_id
+
+
+def rename_workspace(ws_id: str, name: str) -> None:
+    conn = _conv_conn()
+    conn.execute("UPDATE workspaces SET name=?, modified_at=? WHERE id=?",
+                 (name, time.time(), ws_id))
+    conn.commit()
+    conn.close()
+    _invalidate_workspace_cache()
+
+
+def delete_workspace(ws_id: str) -> None:
+    """Delete a workspace and every conversation (column) it contains."""
+    conn = _conv_conn()
+    member_ids = [row["id"] for row in conn.execute(
+        "SELECT id FROM conversations WHERE workspace_id=?", (ws_id,)).fetchall()]
+    for cid in member_ids:
+        conn.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
+        conn.execute("DELETE FROM conversations WHERE id=?", (cid,))
+    conn.execute("DELETE FROM workspaces WHERE id=?", (ws_id,))
+    conn.commit()
+    conn.close()
+    _invalidate_workspace_cache()
+    invalidate_conversation_list_cache()
+
+
+def get_workspace_streams(ws_id: str) -> list[str]:
+    ws = get_workspace(ws_id)
+    return ws["streams"] if ws else []
+
+
+def set_workspace_streams(ws_id: str, streams: list[str]) -> None:
+    """Set the workspace's shared memory streams. Member conversations are kept
+    in sync so each column's agent reads the same streams."""
+    conn = _conv_conn()
+    conn.execute("UPDATE workspaces SET streams_json=?, modified_at=? WHERE id=?",
+                 (json.dumps(streams or []), time.time(), ws_id))
+    # Mirror onto member conversations for back-compat with per-conv streams.
+    conn.execute("UPDATE conversations SET streams_json=? WHERE workspace_id=?",
+                 (json.dumps(streams or []), ws_id))
+    conn.commit()
+    conn.close()
+    _invalidate_workspace_cache()
+    invalidate_conversation_list_cache()
+
+
+def set_workspace_columns(ws_id: str, conv_ids: list[str]) -> None:
+    """Set the ordered member conversations (columns) of a workspace and stamp
+    each conversation's workspace_id."""
+    conn = _conv_conn()
+    conn.execute("UPDATE workspaces SET col_order_json=?, modified_at=? WHERE id=?",
+                 (json.dumps(conv_ids or []), time.time(), ws_id))
+    for cid in (conv_ids or []):
+        conn.execute("UPDATE conversations SET workspace_id=? WHERE id=?", (cid, ws_id))
+    conn.commit()
+    conn.close()
+    _invalidate_workspace_cache()
+
+
+def set_workspace_active_conv(ws_id: str, conv_id: str) -> None:
+    conn = _conv_conn()
+    conn.execute("UPDATE workspaces SET active_conv=?, modified_at=? WHERE id=?",
+                 (conv_id, time.time(), ws_id))
+    conn.commit()
+    conn.close()
+    _invalidate_workspace_cache()
+
+
+def add_conversation_to_workspace(ws_id: str, conv_id: str) -> None:
+    """Attach a conversation to a workspace, appending it as a new column."""
+    conn = _conv_conn()
+    r = conn.execute("SELECT col_order_json FROM workspaces WHERE id=?",
+                     (ws_id,)).fetchone()
+    cols = json.loads(r["col_order_json"] or "[]") if r else []
+    if conv_id not in cols:
+        cols.append(conv_id)
+    conn.execute("UPDATE workspaces SET col_order_json=?, modified_at=? WHERE id=?",
+                 (json.dumps(cols), time.time(), ws_id))
+    conn.execute("UPDATE conversations SET workspace_id=? WHERE id=?", (conv_id, ws_id))
+    conn.commit()
+    conn.close()
+    _invalidate_workspace_cache()
+
+
+def remove_conversation_from_workspace(ws_id: str, conv_id: str) -> None:
+    """Detach a conversation from a workspace's column list (does not delete it)."""
+    conn = _conv_conn()
+    r = conn.execute("SELECT col_order_json FROM workspaces WHERE id=?",
+                     (ws_id,)).fetchone()
+    cols = json.loads(r["col_order_json"] or "[]") if r else []
+    cols = [c for c in cols if c != conv_id]
+    conn.execute("UPDATE workspaces SET col_order_json=?, modified_at=? WHERE id=?",
+                 (json.dumps(cols), time.time(), ws_id))
+    conn.commit()
+    conn.close()
+    _invalidate_workspace_cache()
+
+
+def workspace_for_conversation(conv_id: str) -> str:
+    if not conv_id:
+        return ""
+    conn = _conv_conn()
+    r = conn.execute("SELECT workspace_id FROM conversations WHERE id=?",
+                     (conv_id,)).fetchone()
+    conn.close()
+    return (r["workspace_id"] if r else "") or ""
 
 
 def list_conversations() -> list[dict]:
@@ -452,6 +732,13 @@ def save_conversation(conv_id: str, name: str, messages: list[dict],
                 extra["diff_rows"] = msg.get("_diff_rows", [])
                 extra["diff_adds"] = msg.get("_diff_adds", 0)
                 extra["diff_dels"] = msg.get("_diff_dels", 0)
+            # Large-paste messages: persist the typed portion + collapsed paste
+            # blocks so they reload as cards. `content` already holds the FULL
+            # text (typed + pastes) for the LLM/transcript; these just drive the
+            # render-only collapse (without them the full text reloads exposed).
+            if msg.get("_pastes"):
+                extra["typed"] = msg.get("_typed", "")
+                extra["pastes"] = msg["_pastes"]
             metadata_json = json.dumps(extra) if extra else None
             cur = conn.execute("""
                 INSERT INTO messages (conversation_id, position, role, content,
@@ -546,7 +833,14 @@ def append_message_to_conversation(conv_id: str, role: str, content: str,
 def load_conversation(conv_id: str) -> dict | None:
     """Load a conversation with all messages."""
     conn = _conv_conn()
-    row = conn.execute("SELECT * FROM conversations WHERE id=?", (conv_id,)).fetchone()
+    # Select only the columns we actually use. NEVER "SELECT *": that pulls
+    # debug_turns_json, which can be HUNDREDS of MB for a long conversation and
+    # turned a sub-millisecond row fetch into a ~500ms stall on every switch.
+    row = conn.execute(
+        "SELECT name, workspace, model, provider, system_prompt, streams_json, "
+        "include_timestamps, conversation_cwd, composer_draft, reflect_json, "
+        "stream_live, context_note, prompt_replace, reasoning_effort "
+        "FROM conversations WHERE id=?", (conv_id,)).fetchone()
     if not row:
         conn.close()
         return None
@@ -616,6 +910,9 @@ def load_conversation(conv_id: str) -> dict | None:
                     msg["_diff_path"] = extra.get("diff_path", "")
                     msg["_diff_adds"] = extra.get("diff_adds", 0)
                     msg["_diff_dels"] = extra.get("diff_dels", 0)
+                if "pastes" in extra:
+                    msg["_pastes"] = extra["pastes"]
+                    msg["_typed"] = extra.get("typed", "")
             except (json.JSONDecodeError, ValueError):
                 pass
         # Restore image path from DB cache
@@ -647,6 +944,11 @@ def load_conversation(conv_id: str) -> dict | None:
         stream_live = (bool(row["stream_live"]) if "stream_live" in row.keys() else True)
     except (KeyError, IndexError):
         stream_live = True
+    try:
+        reasoning_effort = ((row["reasoning_effort"] if "reasoning_effort" in row.keys() else "")
+                            or "")
+    except (KeyError, IndexError):
+        reasoning_effort = ""
 
     return {
         "name": row["name"],
@@ -665,6 +967,7 @@ def load_conversation(conv_id: str) -> dict | None:
         "composer_draft": composer_draft,
         "reflect": reflect,
         "stream_live": stream_live,
+        "reasoning_effort": reasoning_effort,
     }
 
 
@@ -700,6 +1003,42 @@ def delete_conversation(conv_id: str):
     invalidate_conversation_list_cache()
 
 
+def get_workspace_notes(conv_id: str) -> list[str]:
+    """Load workspace notes for a conversation (ephemeral operational pool)."""
+    if not conv_id:
+        return []
+    conn = _conv_conn()
+    row = conn.execute(
+        "SELECT notes_json FROM workspace_notes WHERE conversation_id=?", (conv_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return []
+    try:
+        data = json.loads(row["notes_json"])
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+
+
+def set_workspace_notes(conv_id: str, notes: list[str]) -> None:
+    """Persist workspace notes for a conversation."""
+    if not conv_id:
+        return
+    payload = json.dumps(notes or [], ensure_ascii=False)
+    now = time.time()
+    with _conv_write_lock:
+        conn = _conv_conn()
+        conn.execute("""
+            INSERT INTO workspace_notes (conversation_id, notes_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                notes_json=excluded.notes_json, updated_at=excluded.updated_at
+        """, (conv_id, payload, now))
+        conn.commit()
+        conn.close()
+
+
 def get_conversation_debug_turns(conv_id: str) -> list:
     """Load persisted LLM debug turns (full-context snapshots) for a conversation."""
     if not conv_id:
@@ -724,11 +1063,45 @@ def get_conversation_debug_turns(conv_id: str) -> list:
         return []
 
 
+# Hard ceiling on the per-conversation debug payload. Each turn deep-copies the
+# full model context (and again per inference step), so on long conversations
+# this column ballooned to HUNDREDS of MB — bloating the DB and slowing loads.
+# We keep the most RECENT turns that fit this budget (oldest dropped first).
+_DEBUG_TURNS_MAX_BYTES = 4 * 1024 * 1024  # 4 MB
+
+
+def _fit_debug_turns(turns: list) -> str:
+    """Serialize debug turns, trimming to stay under the size budget. Drops
+    oldest whole turns first; if a single recent turn still overflows, trims the
+    bulky per-step context snapshots inside it (keeping responses + metadata)."""
+    turns = list(turns or [])
+    payload = json.dumps(turns, ensure_ascii=False, default=str)
+    if len(payload) <= _DEBUG_TURNS_MAX_BYTES:
+        return payload
+    # 1) Drop oldest turns until we fit (recent turns are the useful ones).
+    while len(turns) > 1 and len(payload) > _DEBUG_TURNS_MAX_BYTES:
+        turns.pop(0)
+        payload = json.dumps(turns, ensure_ascii=False, default=str)
+    if len(payload) <= _DEBUG_TURNS_MAX_BYTES:
+        return payload
+    # 2) Single oversized turn: drop the heaviest part — the duplicated context
+    #    snapshots on base_context and each step — leaving the response/meta.
+    for turn in turns:
+        if isinstance(turn, dict):
+            if turn.get("base_context"):
+                turn["base_context"] = ["[context omitted to cap debug size]"]
+            for step in (turn.get("steps") or []):
+                if isinstance(step, dict) and step.get("context"):
+                    step["context"] = ["[context omitted to cap debug size]"]
+    return json.dumps(turns, ensure_ascii=False, default=str)
+
+
 def set_conversation_debug_turns(conv_id: str, turns: list) -> None:
-    """Persist debug turns JSON for *conv_id* (replaces prior value)."""
+    """Persist debug turns JSON for *conv_id* (replaces prior value), capped so
+    it can never balloon the conversations row."""
     if not conv_id:
         return
-    payload = json.dumps(turns or [], ensure_ascii=False, default=str)
+    payload = _fit_debug_turns(turns)
     with _conv_write_lock:
         conn = _conv_conn()
         conn.execute(
@@ -1076,6 +1449,71 @@ def set_conversation_model(conv_id: str, model: str):
         conn = _conv_conn()
         conn.execute("UPDATE conversations SET model=?, modified_at=? WHERE id=?",
                      (model, time.time(), conv_id))
+        conn.commit()
+        conn.close()
+
+
+def set_conversation_private(conv_id: str, private: bool):
+    """Mark a conversation private (1) or shareable (0) over Familiar-Net."""
+    with _conv_write_lock:
+        conn = _conv_conn()
+        conn.execute("UPDATE conversations SET private=?, modified_at=? WHERE id=?",
+                     (1 if private else 0, time.time(), conv_id))
+        conn.commit()
+        conn.close()
+
+
+def is_conversation_private(conv_id: str) -> bool:
+    """Lightweight check (no message load) used by the network layer to gate
+    every remote access to a conversation. Defaults to private=False; a missing
+    conversation reads as not-private (the access then fails for other reasons)."""
+    if not conv_id:
+        return False
+    try:
+        conn = _conv_conn()
+        row = conn.execute(
+            "SELECT private FROM conversations WHERE id=?", (conv_id,)).fetchone()
+        conn.close()
+        return bool(row["private"]) if (row and "private" in row.keys()) else False
+    except Exception:
+        return False
+
+
+def set_conversation_allow_terminal(conv_id: str, allow: bool):
+    """Permit (1) or forbid (0) a remote shell for peers mirroring this conv."""
+    with _conv_write_lock:
+        conn = _conv_conn()
+        conn.execute(
+            "UPDATE conversations SET allow_remote_terminal=?, modified_at=? WHERE id=?",
+            (1 if allow else 0, time.time(), conv_id))
+        conn.commit()
+        conn.close()
+
+
+def conversation_allows_terminal(conv_id: str) -> bool:
+    """Whether a remote shell is permitted for this conversation. Defaults to
+    False (opt-in) — the network layer gates the WebSocket terminal on this."""
+    if not conv_id:
+        return False
+    try:
+        conn = _conv_conn()
+        row = conn.execute(
+            "SELECT allow_remote_terminal FROM conversations WHERE id=?",
+            (conv_id,)).fetchone()
+        conn.close()
+        return (bool(row["allow_remote_terminal"])
+                if (row and "allow_remote_terminal" in row.keys()) else False)
+    except Exception:
+        return False
+
+
+def set_conversation_reasoning_effort(conv_id: str, effort: str):
+    """Persist the per-conversation reasoning/thinking level ("" = none)."""
+    with _conv_write_lock:
+        conn = _conv_conn()
+        conn.execute(
+            "UPDATE conversations SET reasoning_effort=?, modified_at=? WHERE id=?",
+            ((effort or "").strip().lower(), time.time(), conv_id))
         conn.commit()
         conn.close()
 
@@ -1463,11 +1901,24 @@ def _init_stream_db_locked(stream_name: str):
         conn.execute("ALTER TABLE notes ADD COLUMN keywords TEXT NOT NULL DEFAULT ''")
     except Exception:
         pass  # Column already exists
-    # Migrate: add provenance column (origin/trust label) for existing DBs.
-    try:
-        conn.execute("ALTER TABLE notes ADD COLUMN provenance TEXT NOT NULL DEFAULT 'unverified'")
-    except Exception:
-        pass  # Column already exists
+        # Migrate: add provenance column (origin/trust label) for existing DBs.
+        try:
+            conn.execute("ALTER TABLE notes ADD COLUMN provenance TEXT NOT NULL DEFAULT 'unverified'")
+        except Exception:
+            pass  # Column already exists
+
+        # Migrate: add metadata columns for enhanced memory management
+        for col, typ, default in [
+            ("confidence", "REAL", "0.8"),
+            ("importance", "TEXT", "'medium'"),
+            ("last_used", "REAL", str(time.time())),
+            ("tags_json", "TEXT", "'[]'"),
+            ("summary", "TEXT", "''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE notes ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}")
+            except Exception:
+                pass  # Column already exists
 
     # Vector table for entries
     if _has_vec():
@@ -1681,16 +2132,21 @@ def list_note_categories(stream_name: str) -> list[dict]:
 
 
 def list_notes_in_category(stream_name: str, category: str) -> list[dict]:
-    """List note titles in a category (no content — just the index)."""
+    """List note titles in a category (index + short preview — not full content).
+
+    The preview is cut in SQL so the UI tree can show snippets without a
+    read_note() round-trip (and a fresh connection) per note."""
     init_stream_db(stream_name)
     conn = _stream_conn(stream_name)
     rows = conn.execute("""
-        SELECT id, title, LENGTH(content) as size, updated_at
+        SELECT id, title, LENGTH(content) as size, updated_at,
+               SUBSTR(content, 1, 160) as preview
         FROM notes WHERE category=? ORDER BY updated_at DESC
     """, (category,)).fetchall()
     conn.close()
     return [{"id": r["id"], "title": r["title"], "size": r["size"],
-             "updated_at": r["updated_at"]} for r in rows]
+             "updated_at": r["updated_at"],
+             "preview": r["preview"] or ""} for r in rows]
 
 
 def read_note(stream_name: str, category: str, title: str) -> dict | None:
@@ -1706,6 +2162,11 @@ def read_note(stream_name: str, category: str, title: str) -> dict | None:
     return {"id": row["id"], "category": row["category"], "title": row["title"],
             "content": row["content"], "keywords": row["keywords"] if "keywords" in row.keys() else "",
             "provenance": row["provenance"] if "provenance" in row.keys() else "unverified",
+            "confidence": row["confidence"] if "confidence" in row.keys() else 0.8,
+            "importance": row["importance"] if "importance" in row.keys() else "medium",
+            "last_used": row["last_used"] if "last_used" in row.keys() else row["created_at"],
+            "tags": json.loads(row["tags_json"]) if "tags_json" in row.keys() and row["tags_json"] else [],
+            "summary": row["summary"] if "summary" in row.keys() else "",
             "source_conv": row["source_conv"],
             "created_at": row["created_at"], "updated_at": row["updated_at"]}
 
@@ -1763,17 +2224,66 @@ def _embed_note_row(stream_name: str, note_id: int, title: str, content: str):
         print(f"[DB] note embed error ({stream_name}/{title}): {e}")
 
 
+def check_semantic_duplicate(stream_name: str, category: str, title: str, content: str) -> dict | None:
+    """Check if a note's content is a semantic duplicate of existing notes in the category.
+
+    Returns the matching note dict if found (so caller can decide to merge/skip),
+    or None if no duplicates detected.
+    
+    Cheap check: looks for exact current-section match in existing notes.
+    """
+    try:
+        # Get all existing notes in category
+        existing_list = list_notes_in_category(stream_name, category)
+        if not existing_list:
+            return None
+
+        # Extract current section of new note (skip evidence)
+        new_curr, _ = _split_note_content(content)
+        new_summary = new_curr[:500]  # For comparison
+
+        # Check against existing notes for exact or near-exact match
+        for note_info in existing_list:
+            existing = read_note(stream_name, category, note_info["title"])
+            if existing:
+                old_curr, _ = _split_note_content(existing["content"])
+                # Exact current-section match = duplicate (or very close)
+                if old_curr.strip() == new_curr.strip():
+                    return existing
+        return None
+    except Exception as e:
+        print(f"[DB] Dedup check error: {e}")
+        return None
+
+
 def save_note(stream_name: str, category: str, title: str, content: str,
-              keywords: str = "", source_conv: str = "", provenance: str = "") -> dict:
+              keywords: str = "", source_conv: str = "", provenance: str = "",
+              confidence: float = 0.8, importance: str = "medium", tags: list = None,
+              summary: str = "") -> dict:
     """Save or update a note. Content capped at MAX_NOTE_CHARS.
     On update: merges new Evidence lines into existing (append-only timeline).
     Embeds note into entries_vec for vector recall (best-effort).
+    Skips duplicates (returns existing note instead of creating duplicate).
     """
     content = sanitize_agent_paths(content)
     keywords = sanitize_agent_paths(keywords) if keywords else keywords
     existing = read_note(stream_name, category, title)
+    tags = tags or []
+
+    # Check for semantic duplicate before proceeding
+    dup = check_semantic_duplicate(stream_name, category, title, content)
+    if dup and dup.get("id") != existing.get("id") if existing else False:
+        # Found a semantic duplicate (different note with same content)
+        return {"saved": False, "skipped_duplicate": True, "duplicate_of": dup.get("title"),
+                "message": f"Content matches existing note '{dup.get('title')}'; skipped"}
+
     if existing:
         content = _merge_note_content(existing["content"], content)
+        # On update, inherit existing metadata unless explicitly overridden
+        if confidence == 0.8:  # default value, not explicitly set
+            confidence = existing.get("confidence", 0.8)
+        if importance == "medium":  # default value
+            importance = existing.get("importance", "medium")
     if len(content) > MAX_NOTE_CHARS:
         content = content[:MAX_NOTE_CHARS]
     # Provenance (origin/trust): an explicit value wins; otherwise keep the
@@ -1786,13 +2296,14 @@ def save_note(stream_name: str, category: str, title: str, content: str,
     with _stream_write_lock:
         conn = _stream_conn(stream_name)
         conn.execute("""
-            INSERT INTO notes (category, title, content, keywords, provenance, source_conv, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO notes (category, title, content, keywords, provenance, source_conv, created_at, updated_at, confidence, importance, last_used, tags_json, summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(category, title) DO UPDATE SET
                 content=excluded.content, keywords=excluded.keywords,
-                provenance=excluded.provenance,
-                source_conv=excluded.source_conv, updated_at=excluded.updated_at
-        """, (category, title, content, keywords, prov, source_conv, now, now))
+                provenance=excluded.provenance, source_conv=excluded.source_conv,
+                updated_at=excluded.updated_at, confidence=excluded.confidence,
+                importance=excluded.importance, last_used=excluded.last_used, tags_json=excluded.tags_json, summary=excluded.summary
+        """, (category, title, content, keywords, prov, source_conv, now, now, confidence, importance, now, json.dumps(tags), summary))
         note_id_row = conn.execute(
             "SELECT id FROM notes WHERE category=? AND title=?", (category, title)
         ).fetchone()
@@ -1801,7 +2312,8 @@ def save_note(stream_name: str, category: str, title: str, content: str,
     if note_id_row:
         _embed_note_row(stream_name, note_id_row["id"], title, content)
     return {"saved": True, "category": category, "title": title,
-            "chars": len(content), "keywords": keywords, "provenance": prov}
+            "chars": len(content), "keywords": keywords, "provenance": prov,
+            "confidence": confidence, "importance": importance, "tags": tags, "summary": summary}
 
 
 def delete_note(stream_name: str, category: str, title: str) -> bool:
