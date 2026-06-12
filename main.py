@@ -128,6 +128,11 @@ class MainWindow(QMainWindow):
         # Preload all sounds in the background so the first play is instant.
         import threading
         threading.Thread(target=self._preload_sounds, daemon=True).start()
+        # Warm the Settings dialog's import chain (tools.registry → mcp/httpx
+        # → numpy, ~1s cold) so the first click on Settings opens instantly.
+        # Module import only — no QWidget is constructed off-thread.
+        threading.Thread(target=self._preload_settings_module,
+                         daemon=True).start()
 
     # ── Frameless resize (no native borders) ─────────────────────────────
 
@@ -277,6 +282,13 @@ class MainWindow(QMainWindow):
         try:
             from core.sounds import preload_all
             preload_all()
+        except Exception:
+            pass
+
+    def _preload_settings_module(self):
+        """Import ui.settings_dialog ahead of first use (pure module import)."""
+        try:
+            import ui.settings_dialog  # noqa: F401
         except Exception:
             pass
 
@@ -671,6 +683,33 @@ def _global_kill_all():
 
 def main():
     """Main entry point."""
+    # Global crash guard. PyQt6 treats any unhandled Python exception that
+    # escapes a slot/signal handler as fatal (qFatal → process abort). One
+    # exhausted API retry or a bad callback must NOT take down the whole app:
+    # log it to logs/errors.log + stderr and keep the event loop running.
+    def _crash_guard(exc_type, exc_value, exc_tb):
+        if exc_type is KeyboardInterrupt:
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        import traceback
+        from datetime import datetime
+        tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        sys.stderr.write(tb)
+        sys.stderr.flush()
+        try:
+            from pathlib import Path
+            log_path = Path(__file__).resolve().parent / "logs" / "errors.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(f"\n=== {datetime.now().isoformat()} — unhandled exception ===\n{tb}\n")
+        except Exception:
+            pass
+    sys.excepthook = _crash_guard
+    # Same guard for non-Qt worker threads (threading module).
+    import threading
+    threading.excepthook = lambda args: _crash_guard(
+        args.exc_type, args.exc_value, args.exc_traceback)
+
     # Windows taskbar identity. Set BEFORE any window: without an explicit
     # AppUserModelID, Windows groups us under "pythonw.exe" (generic Python icon,
     # and pinning pins pythonw, not Familiar). Giving the process its own ID makes
@@ -686,6 +725,11 @@ def main():
 
     # Qt app
     app = QApplication(sys.argv)
+    # Force Fusion. Qt 6's default "windows11" native style ignores QSS borders
+    # on QAbstractScrollArea frames (QTextEdit, QGraphicsView, QScrollArea), so
+    # the whole QSS theme renders EXCEPT those borders (the composer outline
+    # vanishes). Fusion honors QSS fully — the right base for a QSS-driven theme.
+    app.setStyle("Fusion")
     _patch_qt()
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)

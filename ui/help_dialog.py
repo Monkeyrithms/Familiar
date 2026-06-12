@@ -148,7 +148,7 @@ Use this guide to configure providers, workspaces, and tools. Changes in
 </ul>
 
 <h2 id="tools">Tools</h2>
-<p>Familiar ships many tools (~55). By default a <strong>router</strong> sends only a relevant subset each turn (~85–90% fewer schema tokens). On the Tools tab:</p>
+<p>Familiar ships many tools (~50). By default a <strong>router</strong> sends only a relevant subset each turn (~85–90% fewer schema tokens). On the Tools tab:</p>
 <ul>
 <li><strong>Stats table</strong> — calls, tokens, errors; <code>explore_files</code> row is read-only (edit Explore on Model tab).</li>
 <li><strong>Subagent / Memory rows</strong> — set cheaper models for delegated work and the memory librarian.</li>
@@ -234,7 +234,9 @@ class HelpDialog(GlassDialog):
     def __init__(self, parent=None, on_open_settings=None):
         super().__init__(
             title="Help", parent=parent, width=700, height=760,
-            geometry_key="help",
+            # No geometry_key: saved positions can restore the dialog onto
+            # another monitor / a stale spot. Help must ALWAYS open centered
+            # over Familiar's window (see showEvent).
         )
         self.setModal(False)
         self.setWindowModality(Qt.WindowModality.NonModal)
@@ -287,6 +289,14 @@ class HelpDialog(GlassDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # Re-center over the main window every time it opens — never trust a
+        # stale position (parent may have moved/resized since last show).
+        if self.parent() is not None:
+            geo = self.parent().window().geometry()
+            self.move(
+                geo.x() + (geo.width() - self.width()) // 2,
+                geo.y() + (geo.height() - self.height()) // 2,
+            )
         try:
             self._body.scrollToAnchor("checklist")
         except Exception:

@@ -7,7 +7,7 @@
 
 &emsp;&emsp;Most capable open source agents assume you're comfortable in a command line environment, spinning up local servers, or wiring together CLI tools. Familiar is for everyone else: open a window, type, and get an open-source agent that can use your computer, browse the web, write and run code, and navigate your files — without you ever touching a command line. It's an agent-in-a-box that does the things, in a little UI that makes it easy for the non-technically-inclined to still get a lot done.
 
-&emsp;&emsp;With ~55 built-in tools, integrated terminals, an embedded browser with agentic control, a file and media viewer, semantic code search, persistent memory, sub-agents, and a scheduler for cron jobs, this little productivity fairy does it all, and takes up to a dozen LLM providers, keeps everything in local SQLite, and stays light enough to just leave open. Power users get the depth; everyone else gets to ignore it.
+&emsp;&emsp;With ~50 built-in tools, integrated terminals, an embedded browser with agentic control, a file and media viewer, semantic code search, persistent memory, sub-agents, and a scheduler for cron jobs, this little productivity fairy does it all, and takes up to a dozen LLM providers, keeps everything in local SQLite, and stays light enough to just leave open. Power users get the depth; everyone else gets to ignore it.
 
 &emsp;&emsp;If you're still using closed-source harnesses and want the power of open-source, still using VS Code for quick or agentic work, have a preference for windowed UIs or Python, dont wanna wire up Telegram or Discord to use your agent, or if you're just trying to figure out "how to openclaw" in the first place — this app is for you.
 
@@ -42,7 +42,7 @@
 ## Highlights
 
 - **12+ LLM providers, one window** — Use your own AI. Anthropic, OpenAI, OpenRouter, DeepSeek, Google Gemini, Kimi/Moonshot, Z.AI/GLM, MiniMax, Alibaba Qwen, Hugging Face, and any local OpenAI-compatible endpoint (Ollama / LM Studio). Switch provider/model per conversation. OAuth login supported for Anthropic (Claude Code creds) and OpenAI (Codex creds).
-- **~55 built-in tools** — files, shell, git, web, browser automation, vision, OCR, TTS, transcription, charts, PDF generation, databases, and more — each hot-reloadable without restarting the app.
+- **~50 built-in tools** — files, shell, git, web, browser automation, vision, OCR, TTS, transcription, charts, PDF generation, databases, and more — each hot-reloadable without restarting the app.
 - **Two-pass tool routing** — tools are grouped into ~8 categories; a cheap router picks the category first, so only the relevant schemas are sent. ~85–90% fewer tool-schema tokens per turn.
 - **Integrated PTY terminal** — a real pseudo-terminal (ConPTY on Windows, POSIX PTY elsewhere) that runs full-screen TUIs: `vim`, `htop`, even `claude` / `codex` themselves. The agent can drive it too.
 - **Embedded browser** — a persistent-profile Chromium tab (cookies, logins, OAuth) the agent can navigate and read.
@@ -94,11 +94,11 @@ The integrated PTY terminal needs `pyte` plus `pywinpty` (Windows) or `ptyproces
 
 ```bash
 cd "Apps/Agent"
-pip install -r requirements.txt
-
-# PyQt6 UI stack (install separately — has its own pinned versions)
-pip install PyQt6 PyQt6-WebEngine
+py -m pip install -r requirements.txt        # Windows
+# python3 -m pip install -r requirements.txt # macOS / Linux
 ```
+
+That's everything (PyQt6/WebEngine included). On Windows, `START.bat` runs this install for you automatically on first launch. Use `py -m pip` / `python3 -m pip` rather than a bare `pip` — `pip` often isn't on PATH even when Python is.
 
 Then add your API keys (see [Configuration](#configuration)) and launch.
 
@@ -318,7 +318,7 @@ The agent loop (`core/agent.py`) does much more than call an API:
 2. **Streaming** with per-delta callbacks for live UI updates.
 3. **Malformed tool-call recovery** — auto-repairs broken JSON and fuzzy-corrects misspelled tool names.
 4. **Refusal detection** — if a response opens with "I'm sorry / I cannot…", it retries on a fallback model.
-5. **Retry with backoff** — up to 4 attempts with exponential backoff.
+5. **Retry with backoff** — up to 7 attempts with exponential backoff (capped at 20s per wait). Context-overflow rejections trigger emergency re-compaction of the turn's tool payloads instead of a failure; output clipped at `max_tokens` auto-continues (up to 3 passes).
 6. **Learned model quirks** (`core/model_quirks.py`) — when a model rejects an unsupported kwarg, Familiar learns it and strips it on the next call (persisted to `data/`).
 7. **Per-model behavior nudges** (`core/model_behavior.py`) — short, targeted corrections for known failure modes per model family.
 8. **Output truncation** (`core/truncate.py`) — large tool results are head+tail trimmed (default 12K chars) with a model-friendly hint on how to re-fetch the rest.
@@ -408,7 +408,7 @@ Apps/Agent/
 ├── sounds/                 # UI sound effects
 ├── file_share/             # Familiar-Net synced folder (drop files to share)
 ├── core/                   # agent loop, providers, memory, safety, MCP, network, LSP, …
-├── tools/                  # ~55 self-registering, hot-reloadable tools
+├── tools/                  # ~50 self-registering, hot-reloadable tools
 ├── ui/                     # PyQt6 widgets, dialogs, theme, terminal, browser
 └── data/                   # runtime state (created as needed):
     ├── conversations / *.db        # SQLite conversation + memory stores

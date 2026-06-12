@@ -503,7 +503,11 @@ class InferenceThread(QThread):
         except InterruptedError:
             self._clear_agent_hooks()
             self.stopped.emit()
-        except Exception as e:
+        except BaseException as e:
+            # BaseException, not Exception: SystemExit / KeyboardInterrupt /
+            # GeneratorExit raised inside a provider lib or tool would otherwise
+            # unwind this thread WITHOUT any signal — UI shows nothing, turn
+            # looks finished, agent "just stopped". Every exit path must emit.
             self._clear_agent_hooks()
             tb = traceback.format_exc()
             sys.stderr.write(tb)
@@ -1441,6 +1445,16 @@ class ChatMessageWidget(QFrame):
         text_w = self._wrap_width - pad_h
         if text_w <= 0:
             return
+        # _wrap_width is the label's maximum width — a CAP, not a guarantee.
+        # When the layout gives the label LESS than the cap, text wraps onto
+        # more lines than a cap-width measurement predicts, so the pinned
+        # minimum comes out 1-2 lines short and the tail clips below the pane
+        # (until a resize re-measures at the true width — the "changing window
+        # geometry fixes it" symptom). Measure at the real laid-out width.
+        if body.width() > 0:
+            actual_w = body.width() - pad_h
+            if 0 < actual_w < text_w:
+                text_w = actual_w
         try:
             doc = QTextDocument()
             doc.setDefaultFont(body.font())
@@ -5144,52 +5158,32 @@ class ChatWindow(QWidget):
                 return self._timeline_tools_row_html(names, fs, force=True)
             return self._timeline_tools_row_html(names, fs)
         if t == "subagent":
-            tasks = item.get("tasks") or []
-            rows = ""
-            for task in tasks:
-                label = task.get("name") or task.get("task_id") or "task"
-                st = task.get("status") or "pending"
-                rows += (
-                    f'<div style="color:{p["muted_text"]};font-size:{max(fs - 1, 7)}pt;'
-                    f'padding:1px 0;">{label}: {st}</div>'
+            try:
+                from ui.gadget_cards import build_subagent_card
+                return build_subagent_card(
+                    item.get("tasks") or [],
+                    summary=item.get("summary") or {},
+                    live=bool(item.get("live")),
+                    fs=fs,
                 )
-            if not rows:
-                rows = (
-                    f'<div style="color:{p["muted_text"]};font-size:{max(fs - 1, 7)}pt;">'
-                    f'Starting…</div>'
-                )
-            return (
-                f'<div style="margin:8px auto;padding:8px 12px;max-width:94%;'
-                f'border:1px solid {p["border"]};border-radius:8px;'
-                f'background:{p["panel_alt"]};">'
-                f'<div style="text-align:center;color:{p["accent_muted"]};'
-                f'font-size:{max(fs - 1, 7)}pt;margin-bottom:4px;">Sub-agents</div>'
-                f'{rows}'
-                f'</div>'
-            )
+            except Exception:
+                # Never let a card-render error break the whole bubble.
+                return self._timeline_tools_row_html(["subagent"], fs)
         if t == "plan":
             pd = item.get("plan_data") or {}
-            title = pd.get("title") or pd.get("goal") or "Plan"
-            steps = pd.get("steps") or []
-            step_lines = ""
-            for i, step in enumerate(steps[:8], 1):
-                stxt = step if isinstance(step, str) else step.get("description", str(step))
-                step_lines += (
-                    f'<div style="color:{p["muted_text"]};font-size:{max(fs - 1, 7)}pt;">'
-                    f'{i}. {stxt}</div>'
-                )
-            extra = ""
-            if len(steps) > 8:
-                extra = f'<div style="color:{p["muted_text"]};opacity:0.7;">…</div>'
-            return (
-                f'<div style="margin:8px auto;padding:8px 12px;max-width:94%;'
-                f'border:1px solid {p["border"]};border-radius:8px;'
-                f'background:{p["panel_alt"]};">'
-                f'<div style="text-align:center;color:{p["accent_muted"]};'
-                f'font-size:{max(fs - 1, 7)}pt;margin-bottom:4px;">{title}</div>'
-                f'{step_lines}{extra}'
-                f'</div>'
-            )
+            if item.get("live"):
+                # Live plans persist plan_data only on finish — read the
+                # in-flight state directly so the card shows the actual plan.
+                try:
+                    from tools.plan import get_current_plan
+                    pd = get_current_plan() or pd
+                except Exception:
+                    pass
+            try:
+                from ui.gadget_cards import build_plan_card
+                return build_plan_card(pd, fs=fs, live=bool(item.get("live")))
+            except Exception:
+                return self._timeline_tools_row_html(["plan"], fs)
         if t == "screenshot":
             path = item.get("image_path") or ""
             if path and os.path.isfile(path):
@@ -6770,7 +6764,7 @@ class ChatWindow(QWidget):
             self._file_viewer.reset_explorer_pin()
         except Exception:
             pass
-        if not state or not state.get("ratio"):
+        if not state:
             self._file_viewer._ensure_scratch_tab()
             self._right_workspace.browser_panel.restore_state(None)
             self._right_workspace.set_workspace_page(3)
@@ -6782,10 +6776,19 @@ class ChatWindow(QWidget):
             except Exception:
                 pass
             return
-        # Restore splitter ratio
-        total = self._chat_hsplitter.width() or 800
-        ws = int(total * state["ratio"])
-        self._set_split(total - ws, ws)
+        # Restore splitter ratio. ratio == 0 only means the pane was COLLAPSED
+        # at the last save — it is NOT a "no saved state" sentinel. The explorer
+        # root, open tabs, and expanded folders are still valid and must be
+        # restored either way (treating ratio-0 as no-state was the bug where a
+        # restart forgot the user's navigation and re-rooted to the workspace).
+        try:
+            ratio = float(state.get("ratio") or 0)
+        except (TypeError, ValueError):
+            ratio = 0.0
+        if ratio > 0:
+            total = self._chat_hsplitter.width() or 800
+            ws = int(total * ratio)
+            self._set_split(total - ws, ws)
         # Restore tabs
         for path in state.get("paths", []):
             if os.path.isfile(path):
@@ -6829,6 +6832,11 @@ class ChatWindow(QWidget):
             # child indexes aren't available the instant we set the root.
             QTimer.singleShot(
                 150, lambda d=list(expanded): self._file_viewer.restore_expanded_dirs(d))
+        if ratio <= 0:
+            # The pane was collapsed at save time: restore the same resting
+            # look — but everything above (root, tabs, expansion) is loaded,
+            # so expanding the pane shows the user's spot, not the workspace.
+            self._collapse_workspace()
         try:
             from tools.workspace_sound_watch import mark_viewer_ready
             mark_viewer_ready()
@@ -7399,6 +7407,45 @@ class ChatWindow(QWidget):
         self._thread.chunk.connect(self._on_stream_chunk)
         self._thread.round_started.connect(self._on_stream_round_start)
         self._thread.start()
+        self._arm_inference_watchdog()
+
+    # ── Inference watchdog ────────────────────────────────────────────
+    # Catches the "agent just stopped" failure: the QThread ended but NO
+    # signal (finished/errored/stopped) ever reached the UI — e.g. a C-level
+    # crash inside a provider lib, or a signal lost during conv switching.
+    # Without this the UI stays in limbo: no typing indicator, no error, no
+    # interrupt dialog — and the user has to prompt "continue" blind.
+
+    def _arm_inference_watchdog(self):
+        if getattr(self, "_inference_watchdog", None) is None:
+            t = QTimer(self)
+            t.setInterval(3000)
+            t.timeout.connect(self._check_inference_alive)
+            self._inference_watchdog = t
+        self._watchdog_dead_ticks = 0
+        self._inference_watchdog.start()
+
+    def _check_inference_alive(self):
+        thread = getattr(self, "_thread", None)
+        if thread is None or not self._inferring:
+            self._inference_watchdog.stop()
+            return
+        if thread.isRunning():
+            self._watchdog_dead_ticks = 0
+            return
+        # Thread ended. Queued signals normally land within one event-loop
+        # pass; give it 2 ticks (6s) of grace before declaring it dead.
+        self._watchdog_dead_ticks += 1
+        if self._watchdog_dead_ticks < 2:
+            return
+        self._inference_watchdog.stop()
+        self._hide_thinking()
+        self._add_message(
+            AGENT_LABEL,
+            "⚠ The worker thread ended without reporting a result (likely a "
+            "crash inside a provider/tool library). The turn was recovered — "
+            "context is intact; say `continue` to resume.")
+        self._finish_inference()
 
     def _on_tool_batch(self, names: list):
         """Parallel read-only batch — reveal chips on one row, staggered in order."""
@@ -7482,9 +7529,20 @@ class ChatWindow(QWidget):
                     pw.start_polling()
                     self._live_plan_widget = pw
                 QTimer.singleShot(50, self._scroll_to_bottom)
+            elif action in ("update", "add_step", "remove_step"):
+                # Inline timeline plan cards re-render from get_current_plan();
+                # nudge a refresh shortly after the tool runs so step status
+                # flips live (the widget path covers itself by polling).
+                if (getattr(self, "_live_plan_timeline_ref", None)
+                        and self._stream_in_chat()):
+                    QTimer.singleShot(200, lambda: self._refresh_live_stream_display(
+                        show_ellipsis=self._stream_active))
             elif action == "finish":
-                from tools.plan import get_current_plan
-                plan_data = get_current_plan()
+                from tools.plan import get_current_plan, get_last_finished_plan
+                # The tool may have already executed (queued cross-thread
+                # signal) and cleared the live plan — fall back to the
+                # finished snapshot so the persisted card keeps its steps.
+                plan_data = get_current_plan() or get_last_finished_plan()
                 plan_ref = getattr(self, "_live_plan_timeline_ref", None)
                 if plan_ref and self._stream_in_chat():
                     meta_idx, tl_idx = plan_ref
@@ -8687,12 +8745,15 @@ class ChatWindow(QWidget):
 
     def _send_remote(self, text: str):
         """Deliver a composer message to the host that owns the mirrored
-        conversation. The host echoes it back as a 'user' event, so we don't
-        render optimistically — the host stays the single source of truth."""
+        conversation. Render it locally NOW (a chat where your own message
+        doesn't appear reads as broken); the host's 'user' echo is deduped
+        against this optimistic copy, so the host stays the source of truth."""
         m = self._remote_mirror
         if not m or not text.strip():
             return
         self.input.clear()
+        self._add_message("You", text)
+        m["pending_echo"] = text
         self._set_typing_prefix(f"{AGENT_LABEL} (remote) is thinking")
         self._show_thinking()
         self._arm_remote_watchdog()
@@ -8769,6 +8830,7 @@ class ChatWindow(QWidget):
             if m and data.get("combo_id") == m["combo_id"]:
                 self._disarm_remote_watchdog()
                 self._hide_thinking()
+                m.pop("pending_echo", None)
                 self._remote_notice(f"Couldn't deliver your message to the host: "
                                     f"{data.get('detail', 'unknown error')}")
             return
@@ -8780,7 +8842,11 @@ class ChatWindow(QWidget):
             return
         self._arm_remote_watchdog()
         if kind == "user":
-            self._add_message("You", data.get("message", {}).get("content", ""))
+            content = data.get("message", {}).get("content", "")
+            # Skip the host's echo of OUR optimistic message (already rendered
+            # at send time); still render other viewers'/the host's own input.
+            if m.pop("pending_echo", None) != content:
+                self._add_message("You", content)
         elif kind == "round_start":
             m["live_idx"] = None
         elif kind == "text":

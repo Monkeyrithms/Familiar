@@ -518,16 +518,138 @@ class PtyTerminalView(QWidget):
                           int(self._cw) + 1, int(self._ch) + 1))
 
     # ── Size <-> grid ───────────────────────────────────────────────
+
+    # Reflow at most this many scrollback lines on a width change. Reflowing
+    # is O(cells); the full 5000-line history would make interactive splitter
+    # drags stutter, and scrollback that far up rarely matters visually.
+    _REFLOW_HISTORY_CAP = 600
+
+    def _reflow(self, old_cols: int, new_cols: int, new_rows: int) -> None:
+        """Rewrap screen + recent history to a new width.
+
+        pyte has no soft-wrap tracking: its resize() just pads or clips each
+        row, so after widening the widget all existing text stays wrapped at
+        the old width. We approximate reflow the way emulators without wrap
+        flags do: a row whose content runs exactly to the old right edge is
+        treated as a soft-wrap continuation and joined with the next row;
+        the joined logical lines are then re-cut at the new width. A hard
+        line that happens to be exactly full-width gets joined too — rare,
+        and far less annoying than nothing ever rewrapping.
+        """
+        from pyte.screens import StaticDefaultDict
+        scr = self._screen
+
+        def cells(line) -> list:
+            """The occupied prefix of a row (holes filled with defaults)."""
+            if not line:
+                return []
+            ext = -1
+            for x, ch in line.items():
+                if x >= old_cols:
+                    continue
+                # Styled blanks (bg fills, reverse video) count as content so
+                # colored bars survive; plain default spaces don't.
+                if ch.data != " " or getattr(ch, "bg", "default") != "default" \
+                        or getattr(ch, "reverse", False):
+                    if x > ext:
+                        ext = x
+            if ext < 0:
+                return []
+            return [line[x] for x in range(ext + 1)]
+
+        top = list(scr.history.top)
+        keep_top = top[:-self._REFLOW_HISTORY_CAP] \
+            if len(top) > self._REFLOW_HISTORY_CAP else []
+        flow_top = top[len(keep_top):]
+        visible = [scr.buffer.get(y) for y in range(scr.lines)]
+        # history.bottom is only populated while paged up; flatten it back in.
+        phys = flow_top + visible + list(scr.history.bottom)
+
+        logical: list[list] = []
+        cur: list = []
+        joined_prev = False
+        for line in phys:
+            cs = cells(line)
+            cur.extend(cs)
+            if len(cs) == old_cols:
+                joined_prev = True
+                continue  # ran to the right edge → soft-wrap continuation
+            logical.append(cur)
+            cur = []
+            joined_prev = False
+        if cur or joined_prev:
+            logical.append(cur)
+
+        # Keep the prompt at the same distance from the bottom: remember how
+        # many blank rows trailed the visible screen, strip the blank tail,
+        # and re-append that many after rewrapping.
+        trailing_blanks = 0
+        for line in reversed(visible):
+            if cells(line):
+                break
+            trailing_blanks += 1
+        while logical and not logical[-1]:
+            logical.pop()
+
+        new_phys: list = []
+        for lg in logical:
+            if not lg:
+                new_phys.append(None)
+                continue
+            for i in range(0, len(lg), new_cols):
+                new_phys.append(lg[i:i + new_cols])
+        new_phys.extend([None] * trailing_blanks)
+
+        overflow = max(0, len(new_phys) - new_rows)
+        hist_rows, screen_rows = new_phys[:overflow], new_phys[overflow:]
+
+        def to_line(seq) -> StaticDefaultDict:
+            d = StaticDefaultDict(scr.default_char)
+            for x, ch in enumerate(seq or ()):
+                d[x] = ch
+            return d
+
+        # Commit (plain assignments — nothing here can half-apply).
+        scr.buffer.clear()
+        for y, seq in enumerate(screen_rows):
+            if seq:
+                scr.buffer[y] = to_line(seq)
+        scr.history.top.clear()
+        scr.history.top.extend(keep_top + [to_line(s) for s in hist_rows])
+        scr.history.bottom.clear()
+        try:
+            scr.history = scr.history._replace(position=scr.history.size)
+        except Exception:
+            pass
+        scr.lines, scr.columns = new_rows, new_cols
+        scr.margins = None
+        scr.tabstops = set(range(8, new_cols, 8))
+        # Park the cursor on the last content row; the shell repaints its
+        # prompt there once the PTY-side resize lands.
+        content_rows = len(screen_rows) - trailing_blanks
+        scr.cursor.y = max(0, min(new_rows - 1, max(content_rows - 1, 0)))
+        scr.cursor.x = min(scr.cursor.x, max(0, new_cols - 1))
+        scr.dirty.update(range(new_rows))
+
     def resizeEvent(self, ev):
         cols = max(1, int(self.width() / self._cw))
         rows = max(1, int(self.height() / self._ch))
         if cols == self._cols and rows == self._rows:
             return
+        old_cols = self._cols
         self._cols, self._rows = cols, rows
         try:
-            self._screen.resize(rows, cols)
+            if cols != old_cols:
+                self._reflow(old_cols, cols, rows)
+            else:
+                self._screen.resize(rows, cols)
         except Exception:
-            pass
+            # Reflow is best-effort cosmetics — never let it take the
+            # terminal down; fall back to pyte's pad/clip resize.
+            try:
+                self._screen.resize(rows, cols)
+            except Exception:
+                pass
         self._color_cache_dirty = True
         self.resize_requested.emit(rows, cols)
         self.update()

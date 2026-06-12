@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QGroupBox, QSlider, QColorDialog,
     QSpinBox, QCheckBox, QSizePolicy, QSpacerItem, QCompleter,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QPlainTextEdit,
+    QPlainTextEdit, QApplication, QMenu,
 )
 from PyQt6.QtCore import Qt, QStringListModel, QObject, pyqtSignal
 
@@ -28,7 +28,7 @@ class _CfDownloadWorker(QObject):
         from core.network import download_cloudflared
         ok, msg = download_cloudflared(progress=self.progress.emit)
         self.done.emit(ok, msg)
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor, QFont, QShortcut, QKeySequence
 from ui.theme import PALETTE, OVERRIDE_KEYS, build_palette
 from ui.glass_dialog import GlassDialog
 from core.providers import load_keys, save_keys, PROVIDER_INFO, resolve_google_api_key
@@ -261,7 +261,16 @@ class SettingsDialog(GlassDialog):
         for widget in self.findChildren(QSlider):
             widget.setStyleSheet(slider_style)
     def _mark_dirty(self, *_args) -> None:
-        self._dirty = True
+        # Count a change as a USER edit only when it happened in the widget
+        # that currently has focus. Async/programmatic population (network
+        # status fills, lazily-loaded combo items, sub-editors syncing
+        # line-edits) fires the exact same signals but never on the focused
+        # widget — those used to flip _dirty and trigger the discard prompt
+        # on a dialog the user never touched.
+        w = self.sender()
+        fw = QApplication.focusWidget()
+        if w is not None and fw is not None and (fw is w or w.isAncestorOf(fw)):
+            self._dirty = True
 
     def _wire_dirty_tracking(self) -> None:
         # NOTE: kept as a coarse hint only. The discard prompt is gated on an
@@ -308,14 +317,23 @@ class SettingsDialog(GlassDialog):
             sig.append(("sp", str(w.value())))
         for w in self.findChildren(QSlider):
             sig.append(("sl", str(w.value())))
+        for w in self.findChildren(QListWidget):
+            if w is getattr(self, "_net_share_list", None):
+                continue  # folder listing (environment state), not a setting
+            for i in range(w.count()):
+                sig.append(("li", w.item(i).text()))
         return tuple(sorted(sig))
 
     def _cancel_clicked(self) -> None:
         self.reject()
 
     def _confirm_discard(self) -> bool:
-        # Only prompt when an input's value genuinely differs from when the
-        # dialog opened — not merely because some signal flipped _dirty.
+        # Prompt only when BOTH hold: the user actually interacted with an
+        # input (_dirty, focus-gated) AND some value genuinely differs from
+        # when the dialog opened. Signature drift alone is not enough — async
+        # population shifts it on dialogs the user never touched.
+        if not self._dirty:
+            return True
         if self._settings_signature() == getattr(self, "_initial_signature", None):
             return True
         return GlassDialog.confirm(
@@ -3118,19 +3136,18 @@ class SettingsDialog(GlassDialog):
         self._cf_worker = None
         self._refresh_cf_status()
 
-        # Use an EXISTING tunnel (ngrok / named tunnel / reverse proxy) instead of
-        # cloudflared: paste its https URL here, or click Detect ngrok. When set,
-        # this overrides the auto-tunnel above.
-        ov_row = QHBoxLayout()
+        # Use an EXISTING public address instead of starting cloudflared. Any
+        # https URL that ultimately reaches this machine's inbound port works
+        # (own tunnel, reverse proxy) — no service is special-cased.
         self._net_override_edit = QLineEdit(net.get("public_url_override", ""))
         self._net_override_edit.setPlaceholderText(
-            "https://your-tunnel…  (any service: ngrok, named tunnel, proxy. "
-            "Blank = use cloudflared)")
-        ov_row.addWidget(self._net_override_edit, 1)
-        self._net_detect_ngrok_btn = QPushButton("Detect ngrok")
-        self._net_detect_ngrok_btn.clicked.connect(self._net_detect_ngrok_clicked)
-        ov_row.addWidget(self._net_detect_ngrok_btn)
-        in_form.addRow(QLabel("Use existing tunnel"), ov_row)
+            "https://your-address…  (blank = start cloudflared automatically)")
+        self._net_override_edit.setToolTip(
+            "Paste any https URL that reaches this machine's inbound port —\n"
+            "your own tunnel or reverse proxy. It must forward to THIS\n"
+            "machine's port above. Leave blank to let Familiar start its own\n"
+            "cloudflared (recommended).")
+        in_form.addRow(QLabel("Public address"), self._net_override_edit)
 
         self._net_public_edit = QLineEdit(net.get("public_url", ""))
         self._net_public_edit.setReadOnly(True)
@@ -3164,13 +3181,89 @@ class SettingsDialog(GlassDialog):
         peers_lay = QVBoxLayout(peers_box)
         self._net_peers_list = QListWidget()
         self._net_peers_list.setMaximumHeight(120)
+        # Rows are editable in place (double-click / F2) and copyable
+        # (Ctrl+C, right-click menu) — the display text "name  —  url" is
+        # the editing format too, reparsed into UserRole on commit so the
+        # save paths keep reading the same {"name", "url"} dict.
+        self._net_peers_list.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed)
+        self._net_peers_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        # The glass theme paints QLineEdit semi-transparent, but the inline
+        # item editor sits directly over the painted item text — with a
+        # translucent editor both texts show at once. Force a SOLID,
+        # theme-matched background on editors spawned inside this list.
+        self._net_peers_list.setStyleSheet(
+            f"QListWidget QLineEdit {{"
+            f" background: {PALETTE['panel']};"
+            f" color: {PALETTE['text']};"
+            f" border: 1px solid {PALETTE['accent']};"
+            f" padding: 1px;"
+            f"}}"
+        )
         for peer in net.get("peers", []):
             if isinstance(peer, dict) and peer.get("url"):
                 nm, url = peer.get("name", ""), peer["url"]
                 it = QListWidgetItem(f"{nm or url}  —  {url}")
                 it.setData(Qt.ItemDataRole.UserRole, {"name": nm or url, "url": url})
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
                 self._net_peers_list.addItem(it)
         peers_lay.addWidget(self._net_peers_list)
+
+        def _parse_peer_text(text: str) -> dict:
+            # "name  —  url" (em dash); name may be omitted. URLs can't
+            # contain "—", so split on the LAST one.
+            t = text.strip()
+            if "—" in t:
+                nm, _sep, url = t.rpartition("—")
+                nm, url = nm.strip(), url.strip()
+            else:
+                nm, url = "", t
+            return {"name": nm or url, "url": url}
+
+        def _peer_item_changed(it):
+            d = _parse_peer_text(it.text())
+            self._net_peers_list.blockSignals(True)
+            it.setData(Qt.ItemDataRole.UserRole, d)
+            it.setText(f"{d['name']}  —  {d['url']}")
+            self._net_peers_list.blockSignals(False)
+            self._dirty = True  # list isn't in the signature snapshot
+
+        self._net_peers_list.itemChanged.connect(_peer_item_changed)
+
+        def _peer_menu(pos):
+            it = self._net_peers_list.itemAt(pos)
+            if it is None:
+                return
+            d = it.data(Qt.ItemDataRole.UserRole) or {}
+            menu = QMenu(self._net_peers_list)
+            act_url = menu.addAction("Copy URL")
+            act_name = menu.addAction("Copy name")
+            act_row = menu.addAction("Copy row")
+            menu.addSeparator()
+            act_edit = menu.addAction("Edit")
+            chosen = menu.exec(self._net_peers_list.mapToGlobal(pos))
+            if chosen is act_url:
+                QApplication.clipboard().setText(d.get("url", ""))
+            elif chosen is act_name:
+                QApplication.clipboard().setText(d.get("name", ""))
+            elif chosen is act_row:
+                QApplication.clipboard().setText(it.text())
+            elif chosen is act_edit:
+                self._net_peers_list.editItem(it)
+
+        self._net_peers_list.customContextMenuRequested.connect(_peer_menu)
+
+        def _peer_copy_shortcut():
+            it = self._net_peers_list.currentItem()
+            if it is not None:
+                d = it.data(Qt.ItemDataRole.UserRole) or {}
+                QApplication.clipboard().setText(d.get("url", "") or it.text())
+
+        _peer_copy = QShortcut(QKeySequence.StandardKey.Copy, self._net_peers_list)
+        _peer_copy.setContext(Qt.ShortcutContext.WidgetShortcut)
+        _peer_copy.activated.connect(_peer_copy_shortcut)
 
         add_row = QHBoxLayout()
         self._net_peer_name = QLineEdit()
@@ -3185,14 +3278,19 @@ class SettingsDialog(GlassDialog):
                 return
             it = QListWidgetItem(f"{nm or url}  —  {url}")
             it.setData(Qt.ItemDataRole.UserRole, {"name": nm or url, "url": url})
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
+            self._net_peers_list.blockSignals(True)
             self._net_peers_list.addItem(it)
+            self._net_peers_list.blockSignals(False)
             self._net_peer_name.clear()
             self._net_peer_url.clear()
+            self._dirty = True
 
         def _rm_peer():
             row = self._net_peers_list.currentRow()
             if row >= 0:
                 self._net_peers_list.takeItem(row)
+                self._dirty = True
 
         add_btn = QPushButton("Add")
         add_btn.clicked.connect(_add_peer)
@@ -3205,6 +3303,92 @@ class SettingsDialog(GlassDialog):
         peers_lay.addLayout(add_row)
         outer.addWidget(peers_box)
 
+        # ── Shared files (file_share/) ──
+        share_box = QGroupBox("Shared files — file_share/ (synced to all peers)")
+        share_lay = QVBoxLayout(share_box)
+        self._net_share_list = QListWidget()
+        self._net_share_list.setMaximumHeight(140)
+        self._net_share_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        share_lay.addWidget(self._net_share_list)
+
+        def _fmt_size(n) -> str:
+            n = float(n)
+            for unit in ("B", "KB", "MB"):
+                if n < 1024:
+                    return f"{n:.0f} B" if unit == "B" else f"{n:.1f} {unit}"
+                n /= 1024.0
+            return f"{n:.1f} GB"
+
+        def _refresh_share_list():
+            from datetime import datetime
+            from core.file_share import list_share_files
+            self._net_share_list.clear()
+            try:
+                files = list_share_files()
+            except Exception as e:
+                self._net_share_list.addItem(f"(error listing file_share: {e})")
+                return
+            if not files:
+                ph = QListWidgetItem("(file_share/ is empty)")
+                ph.setFlags(Qt.ItemFlag.NoItemFlags)
+                self._net_share_list.addItem(ph)
+                return
+            for f in files:
+                when = datetime.fromtimestamp(f["mtime"]).strftime("%Y-%m-%d %H:%M")
+                it = QListWidgetItem(
+                    f"{f['rel']}  —  {_fmt_size(f['size'])}  —  {when}")
+                it.setData(Qt.ItemDataRole.UserRole, f["rel"])
+                self._net_share_list.addItem(it)
+
+        def _delete_shared_clicked():
+            rels = [it.data(Qt.ItemDataRole.UserRole)
+                    for it in self._net_share_list.selectedItems()]
+            rels = [r for r in rels if r]
+            if not rels:
+                return
+            preview = "\n".join(rels[:8]) + ("\n…" if len(rels) > 8 else "")
+            if not GlassDialog.confirm(
+                    self,
+                    "Delete everywhere?",
+                    f"Delete {len(rels)} file(s) from file_share on THIS machine "
+                    f"AND every connected peer?\n\n{preview}\n\n"
+                    "A tombstone propagates over Familiar-Net so peers delete "
+                    "their copy too instead of re-seeding it."):
+                return
+            from core.file_share import delete_shared_file
+            failed = [r for r in rels if not delete_shared_file(r)]
+            _refresh_share_list()
+            if failed:
+                QMessageBox.warning(
+                    self, "Delete failed",
+                    "Could not delete:\n" + "\n".join(failed))
+
+        def _open_share_folder():
+            from core.file_share import SHARE_DIR, _ensure_dir
+            _ensure_dir()
+            try:
+                os.startfile(str(SHARE_DIR))            # Windows
+            except AttributeError:
+                subprocess.Popen(
+                    ["open" if sys.platform == "darwin" else "xdg-open",
+                     str(SHARE_DIR)])
+
+        share_btns = QHBoxLayout()
+        share_del_btn = QPushButton("Delete selected (everywhere)")
+        share_del_btn.clicked.connect(_delete_shared_clicked)
+        share_refresh_btn = QPushButton("Refresh")
+        share_refresh_btn.clicked.connect(_refresh_share_list)
+        share_open_btn = QPushButton("Open folder")
+        share_open_btn.clicked.connect(_open_share_folder)
+        share_btns.addWidget(share_del_btn)
+        share_btns.addWidget(share_refresh_btn)
+        share_btns.addWidget(share_open_btn)
+        share_btns.addStretch()
+        share_lay.addLayout(share_btns)
+        outer.addWidget(share_box)
+        _refresh_share_list()
+
         note = QLabel(
             "The shared secret authenticates every message (HMAC, 30s replay window) — "
             "it is the gate for inbound traffic; keep it strong and private. The peers "
@@ -3216,7 +3400,15 @@ class SettingsDialog(GlassDialog):
         note.setStyleSheet(f"color:{PALETTE['muted_text']}; font-size:8pt;")
         outer.addWidget(note)
         outer.addStretch(1)
-        return w
+        # The Network tab outgrew the dialog (inbound + outbound + peers +
+        # shared files); without a scroll area Qt compresses every input to
+        # fit, squashing single-line edits into illegibility. Same treatment
+        # as the UI / API Keys tabs.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(w)
+        return scroll
 
     def _gather_network_cfg(self) -> dict:
         peers = []
@@ -3373,44 +3565,6 @@ class SettingsDialog(GlassDialog):
             self._net_status.setText(msg)
         QTimer.singleShot(200, _poll)
 
-    def _net_detect_ngrok_clicked(self):
-        """Read the local ngrok API and fill in its https tunnel as our public
-        address. If ngrok forwards to a different local port than the inbound
-        server, sync the port spin so they match (ngrok must point at Familiar)."""
-        import threading
-        from PyQt6.QtCore import QTimer
-        from core.network import detect_ngrok
-        want_port = self._net_port_spin.value()
-        self._net_detect_ngrok_btn.setEnabled(False)
-        self._net_status.setText("detecting ngrok…")
-        self._net_ngrok_result = None
-
-        def _probe():
-            self._net_ngrok_result = detect_ngrok(prefer_port=want_port)
-
-        threading.Thread(target=_probe, daemon=True, name="ngrok-detect").start()
-
-        def _poll():
-            res = getattr(self, "_net_ngrok_result", None)
-            if res is None:
-                QTimer.singleShot(200, _poll)
-                return
-            self._net_detect_ngrok_btn.setEnabled(True)
-            url, local_port = res
-            if not url:
-                self._net_status.setText(
-                    "no ngrok tunnel found — is ngrok running? (ngrok http "
-                    f"{want_port})")
-                return
-            self._net_override_edit.setText(url)
-            if local_port and local_port != want_port:
-                self._net_port_spin.setValue(local_port)
-                self._net_status.setText(
-                    f"found ngrok → {url}  (port set to {local_port} to match)")
-            else:
-                self._net_status.setText(f"found ngrok → {url}")
-        QTimer.singleShot(200, _poll)
-
     def _save_and_close(self):
         # Save keys
         keys = load_keys()
@@ -3556,9 +3710,11 @@ class SettingsDialog(GlassDialog):
             "enabled": self._net_enabled_check.isChecked(),
             "node_name": self._net_name_edit.text().strip(),
             "secret": self._net_secret_edit.text(),
+            "auto_respond": self._net_autorespond_check.isChecked(),
             "inbound_enabled": self._net_inbound_check.isChecked(),
             "port": self._net_port_spin.value(),
             "auto_tunnel": self._net_tunnel_check.isChecked(),
+            "public_url_override": self._net_override_edit.text().strip(),
             "peers": peers,
         })
         cfg["network"] = net
