@@ -7,8 +7,8 @@ from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QPushButton, QLabel, QGraphicsDropShadowEffect,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QVariantAnimation, QEasingCurve
-from PyQt6.QtGui import QFont, QPainter, QColor
-from ui.theme import PALETTE
+from PyQt6.QtGui import QFont, QPainter, QColor, QPen
+from ui.theme import PALETTE, dim_accent_edge
 
 _TITLE_ICON_PX = 20
 
@@ -145,7 +145,7 @@ class TitleBar(QWidget):
         self.refresh_btn.setFont(QFont("Consolas", 10))
         self.refresh_btn.setFixedSize(24, 24)
         self.refresh_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.refresh_btn.setToolTip("Refresh UI (hot-reload codebase changes)")
+        self.refresh_btn.setToolTip("Refresh UI — reload code changes + re-apply theme")
         self.refresh_btn.clicked.connect(self.refresh_clicked.emit)
         layout.addWidget(self.refresh_btn)
 
@@ -318,9 +318,11 @@ class TitleBar(QWidget):
         p = PALETTE
         bg = QColor(p["panel_alt"])
         painter.fillRect(self.rect(), bg)
-        # Bottom accent separator
-        painter.setPen(QColor(p["accent_muted"]))
-        painter.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+        # Faint accent-tinted frame — dimmed variant of the chosen UI color.
+        edge = QColor(dim_accent_edge())
+        painter.setPen(QPen(edge, 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
     # ── Dragging ─────────────────────────────────────────────────────
 

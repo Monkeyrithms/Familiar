@@ -23,6 +23,40 @@ from ui.theme import PALETTE
 
 _SIDE_PAD = 8
 
+# Cache for the inline Familiar icon used as the card glyph (replaces the old
+# ◆/◈ diamonds). Keyed by accent so it tracks the theme. Kept separate from the
+# nametag sparkle PNG (that one is rendered glow-hot); this one is the normal
+# accent-bodied icon, matching the colour the diamonds had.
+_CARD_ICON_CACHE: dict = {"key": None, "html": ""}
+
+
+def _familiar_icon_html(fs: int) -> str:
+    """The app's Familiar icon as an inline <img>, normal-colored (accent body +
+    hot core) — the drop-in for the old ◆/◈ diamond. Sized to the title line.
+    Returns '' on any failure so the titlebar just omits the glyph."""
+    try:
+        from pathlib import Path
+        from ui.app_icon import build_app_icon
+        p = PALETTE
+        accent = p.get("accent", "#33ff99")
+        hot = p.get("glow_hot") or p.get("accent_bright") or accent
+        key = (accent, hot)
+        if _CARD_ICON_CACHE["key"] != key or not _CARD_ICON_CACHE["html"]:
+            icon = build_app_icon(accent, hot)
+            out = Path(__file__).resolve().parent.parent / "data" / "sparkle_card.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if not icon.pixmap(32, 32).save(str(out), "PNG"):
+                return ""
+            src = str(out).replace(chr(92), "/")
+            _CARD_ICON_CACHE.update(key=key, html=f'file:///{src}')
+        dim = max(fs - 1, 8)
+        return (
+            f'<img src="{_CARD_ICON_CACHE["html"]}" '
+            f'width="{dim}" height="{dim}">'
+        )
+    except Exception:
+        return ""
+
 # Steps/tasks shown before the "+N more" line kicks in.
 _ROW_CAP = 24
 
@@ -156,7 +190,7 @@ def build_plan_card(plan_data: dict, *, fs: int = 9, live: bool = False) -> str:
     sub = f"{done}/{n} done" if n else ""
     if live and n and done < n:
         sub += " · live"
-    return _card(_titlebar("◆", title, sub, fs), "".join(rows))
+    return _card(_titlebar(_familiar_icon_html(fs), title, sub, fs), "".join(rows))
 
 
 def build_subagent_card(tasks: list, *, summary: dict | None = None,
@@ -246,4 +280,5 @@ def build_subagent_card(tasks: list, *, summary: dict | None = None,
     else:
         sub = (f"{n} {noun} · all done" if n and completed == n
                else f"{n} {noun} · {completed}/{n} done")
-    return _card(_titlebar("◈", title, sub, fs), "".join(rows), width_pct=72)
+    return _card(_titlebar(_familiar_icon_html(fs), title, sub, fs),
+                 "".join(rows), width_pct=72)

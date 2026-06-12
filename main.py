@@ -54,7 +54,6 @@ class MainWindow(QMainWindow):
 
         self.agent = agent
         self._dialog_count = 0  # For unique dialog windows
-        self._crt_overlay = None
         self._refresh_debounce = None
         self._always_on_top_enabled = False
 
@@ -116,9 +115,6 @@ class MainWindow(QMainWindow):
         
         # Restore window geometry / state
         self._restore_geometry()
-        
-        # CRT overlay (if enabled)
-        self._apply_crt()
 
         # App-wide event filter: catches mouse events anywhere in the window so
         # the frameless edges work as resize grips (and don't get swallowed by
@@ -258,13 +254,6 @@ class MainWindow(QMainWindow):
         painter.setPen(pen)
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
-    def resizeEvent(self, event):
-        """Keep the CRT scanline overlay sized to the window as it resizes."""
-        super().resizeEvent(event)
-        co = getattr(self, "_crt_overlay", None)
-        if co is not None and co.isVisible():
-            co.setGeometry(self.rect())
-
     def changeEvent(self, event):
         """Refocus the chat input when the window is (re)activated."""
         if event.type() == QEvent.Type.WindowActivate:
@@ -394,9 +383,14 @@ class MainWindow(QMainWindow):
         try:
             self.chat._shutting_down = True
             self.chat._stop_inference()
+            self.chat._shutdown_workers()
             self.chat._auto_save(immediate=True)
         except Exception as e:
             print(f"[MainWindow] Chat shutdown failed: {e}", flush=True)
+        try:
+            self.chat._right_workspace.shutdown_for_exit()
+        except Exception:
+            pass
         # Kill all sub-agent orchestrators.
         try:
             from core.subagent import _orchestrators
@@ -536,17 +530,6 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(30, _tick)
     
-    def _toggle_crt(self):
-        """Toggle CRT overlay on/off, save config."""
-        try:
-            from core.agent import save_config
-            cfg = load_config()
-            cfg["crt_enabled"] = not cfg.get("crt_enabled", False)
-            save_config(cfg)
-            self._apply_crt()
-        except Exception as e:
-            print(f"[MainWindow] Failed to toggle CRT: {e}", flush=True)
-    
     # Dialog handlers
     def _open_help(self):
         """Show help dialog."""
@@ -556,13 +539,12 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         """Open Settings via the focused chat column (non-modal). The column
         owns the dialog; we pass an on_accept callback so the whole window
-        repaints with the new palette/CRT when the user applies changes."""
+        repaints with the new palette when the user applies changes."""
         def _on_accept():
             refresh_palette()
             self._apply_styles()
             self.title_bar.apply_theme()
             self.chat.apply_theme()
-            self._apply_crt()
             self.update()
         self.chat._open_settings(on_accept=_on_accept)
 
@@ -583,7 +565,7 @@ class MainWindow(QMainWindow):
         """
         import sys
         import importlib
-        
+
         try:
             from core.sounds import play_ui
             play_ui("beep.mp3")
@@ -601,14 +583,22 @@ class MainWindow(QMainWindow):
                 "core.lsp_client", "core.sounds", "core.ui_watchdog", "core.tools",
                 "core.file_viewer_state",
             }
-            
-            # Reload all ui.* and remaining core.* modules
-            modules_to_reload = [
+
+            # Reload theme first so re-imported ui.* modules bind the fresh palette.
+            import ui.theme as theme_mod
+            try:
+                importlib.reload(theme_mod)
+            except Exception as e:
+                print(f"[Refresh] Warning: failed to reload ui.theme: {e}", flush=True)
+            theme_mod.refresh_palette()
+
+            modules_to_reload = sorted(
                 name for name in sys.modules.keys()
                 if (name.startswith("ui.") or name.startswith("core."))
                 and name not in SKIP_MODULES
-            ]
-            
+                and name != "ui.theme"
+            )
+
             for mod_name in modules_to_reload:
                 try:
                     mod = sys.modules.get(mod_name)
@@ -617,52 +607,42 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[Refresh] Warning: failed to reload {mod_name}: {e}", flush=True)
 
-            # Refresh theme and CRT overlay with newly loaded code
+            # Re-read config.json and push into the live PALETTE dict.
+            theme_mod.refresh_palette()
+            self._rebind_hot_reload_widgets()
+
             self._apply_styles()
             if self.title_bar:
                 self.title_bar.apply_theme()
             if self.chat:
                 self.chat.apply_theme()
             self.update()
-            
-            # Re-apply CRT overlay with fresh code
-            self._apply_crt()
-            
+
             print("[Refresh] UI reloaded successfully", flush=True)
         except Exception as e:
             print(f"[Refresh] Error during hot-reload: {e}", flush=True)
             import traceback
             traceback.print_exc()
 
-    def _apply_crt(self):
-        """Create or destroy CRT overlay based on config."""
-        from core.agent import load_config
-        cfg = load_config()
-        enabled = cfg.get("crt_enabled", False)
-        speed = cfg.get("crt_speed", 600)
-
-        if enabled and not self._crt_overlay:
-            from ui.crt_overlay import CRTOverlay
-            from PyQt6.QtGui import QColor
-            # Parent to the CENTRAL WIDGET, not the QMainWindow. A child of the
-            # main window sits behind the central widget (which fills the client
-            # area and paints over it); a child of the central widget, raised,
-            # sits on TOP of all siblings.
-            central = self.centralWidget()
-            if central:
-                self._crt_overlay = CRTOverlay(central)
-                self._crt_overlay.raise_()
-                self._crt_overlay.resize(central.size())
-                self._crt_overlay.show()
-                self._crt_overlay.animate(speed)
-        elif not enabled and self._crt_overlay:
-            self._crt_overlay.stop()
-            self._crt_overlay.hide()
-            self._crt_overlay.setParent(None)
-            self._crt_overlay = None
-        elif enabled and self._crt_overlay:
-            # Update speed
-            self._crt_overlay.animate(speed)
+    def _rebind_hot_reload_widgets(self):
+        """Point live shell widgets at reloaded classes so updated method bodies
+        take effect without tearing down terminals or conversations."""
+        try:
+            import ui.title_bar as title_mod
+            if self.title_bar is not None:
+                self.title_bar.__class__ = title_mod.TitleBar
+        except Exception as e:
+            print(f"[Refresh] Warning: title bar rebind failed: {e}", flush=True)
+        try:
+            import ui.chat_widget as chat_mod
+            if self.chat is not None:
+                self.chat.__class__ = chat_mod.ChatWindow
+                ws = getattr(self.chat, "_right_workspace", None)
+                if ws is not None:
+                    import ui.right_workspace as rw_mod
+                    ws.__class__ = rw_mod.RightWorkspacePanel
+        except Exception as e:
+            print(f"[Refresh] Warning: chat/workspace rebind failed: {e}", flush=True)
 
 
 def _global_kill_all():
@@ -784,10 +764,18 @@ def main():
 
     signal.signal(signal.SIGINT, sigint_handler)
 
-    # Go. After the event loop ends, force-exit so any lingering non-daemon
-    # thread (e.g. the network HTTP server) can't keep the process running.
+    # Go. After the event loop ends, let Qt finish tearing down QThreads /
+    # WebEngine workers before force-exit — otherwise stderr gets
+    # "QThreadStorage: entry N destroyed before end of thread" noise.
     exit_code = app.exec()
     _global_kill_all()
+    try:
+        from PyQt6.QtCore import QThread
+        for _ in range(6):
+            app.processEvents()
+            QThread.msleep(40)
+    except Exception:
+        pass
     import os
     os._exit(exit_code)
 

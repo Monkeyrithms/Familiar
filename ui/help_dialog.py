@@ -80,7 +80,7 @@ Use this guide to configure providers, workspaces, and tools. Changes in
 <h2 id="settings-map">Settings tabs (recommended order)</h2>
 <p>Title bar <strong>Settings</strong> opens these tabs:</p>
 <ol>
-<li><strong>UI</strong> — theme, chat display, workspace panel side, CRT overlay.</li>
+<li><strong>UI</strong> — theme, chat display, workspace panel side.</li>
 <li><strong>API Keys</strong> — provider credentials (+ Tavily for web search).</li>
 <li><strong>Model</strong> — main model, summary, vision, explore, embeddings, fallbacks, thinking.</li>
 <li><strong>Workspaces</strong> — project roots and optional Python venv paths.</li>

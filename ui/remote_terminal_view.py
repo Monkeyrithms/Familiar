@@ -130,3 +130,7 @@ class RemoteTerminalWidget(QWidget):
 
     def focus_active_input(self) -> None:
         self._view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def apply_theme(self) -> None:
+        self._apply_banner_style()
+        self._view.apply_theme()

@@ -348,39 +348,45 @@ def workspace_tab_bar_stylesheet(p: dict) -> str:
 
 
 def _page_toolbar_btn_stylesheet(p: dict, checked: bool) -> str:
-    """Edged toggle buttons with richer hover/active feedback."""
+    """Edged toggle buttons — selected state brightens label + border only.
+
+    Every state keeps the same 1px border and panel background so toggling
+    selection never shifts adjacent buttons."""
     ac = p["accent"]
-    hover_bg = p.get("accent_soft", p["panel_alt"])
     hover_fg = p.get("accent_bright", ac)
-    pressed_bg = p.get("panel_alt", p["panel"])
+    bg = p["panel"]
+    base = (
+        f"background:{bg};border:1px solid {{border}};border-radius:0;"
+        f"padding:4px 14px;font-family:Consolas;font-size:8pt;"
+    )
     if checked:
+        ss = base.format(border=ac)
         return (
             "QPushButton{"
-            f"color:{p['background']};background:{ac};"
-            f"border:1px solid {ac};border-radius:0;padding:4px 14px;"
-            f"font-family:Consolas;font-size:8pt;"
+            f"color:{hover_fg};{ss}"
             "}"
             "QPushButton:hover{"
-            f"color:{p['background']};background:{hover_fg};border:1px solid {hover_fg};"
+            f"color:{hover_fg};background:{bg};border:1px solid {hover_fg};"
+            f"border-radius:0;padding:4px 14px;"
             "}"
             "QPushButton:pressed{"
-            f"color:{p['background']};background:{ac};border:1px solid {ac};"
+            f"color:{ac};background:{bg};border:1px solid {ac};"
+            f"border-radius:0;padding:4px 14px;"
             "}"
         )
+    idle_border = p["border"]
+    ss = base.format(border=idle_border)
     return (
         "QPushButton{"
-        f"color:{p['muted_text']};background:{p['panel']};"
-        f"border:1px solid {p['border']};border-radius:0;padding:4px 14px;"
-        f"font-family:Consolas;font-size:8pt;"
+        f"color:{p['muted_text']};{ss}"
         "}"
         "QPushButton:hover{"
-        f"color:{hover_fg};background:{hover_bg};border:1px solid {ac};"
+        f"color:{hover_fg};background:{bg};border:1px solid {ac};"
+        f"border-radius:0;padding:4px 14px;"
         "}"
         "QPushButton:pressed{"
-        f"color:{p['text']};background:{pressed_bg};border:1px solid {ac};"
-        "}"
-        "QPushButton:checked{"
-        f"color:{p['background']};background:{ac};border:1px solid {ac};"
+        f"color:{p['text']};background:{bg};border:1px solid {ac};"
+        f"border-radius:0;padding:4px 14px;"
         "}"
     )
 
@@ -962,6 +968,13 @@ class BrowserWorkspacePanel(QFrame):
 class RightWorkspacePanel(QFrame):
     """Toolbar (Notes | Calendar | Browser | File | Terminal) + stacked pages."""
 
+    def shutdown_for_exit(self) -> None:
+        """Release WebEngine views before the app quits (avoids QThreadStorage noise)."""
+        try:
+            self.browser_panel.close_all_tabs()
+        except Exception:
+            pass
+
     def minimumSizeHint(self) -> QSize:
         # The splitter should honor the user's desired width, not a minimum
         # computed from whichever inner page (Browser / Terminal / Files)
@@ -1213,3 +1226,4 @@ class RightWorkspacePanel(QFrame):
         self.terminal_panel.apply_theme()
         self.notes_panel.apply_theme()
         self.calendar_panel.apply_theme()
+        self.remote_terminal.apply_theme()

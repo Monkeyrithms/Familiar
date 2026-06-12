@@ -33,6 +33,7 @@ from PyQt6.QtCore import Qt, QObject, QTimer, QRect, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QColor, QFont, QFontMetricsF, QKeyEvent, QTextOption,
 )
+from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PyQt6.QtWidgets import QWidget, QApplication, QMenu
 
 from ui.theme import PALETTE
@@ -353,6 +354,11 @@ class PtyTerminalView(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setCursor(Qt.CursorShape.IBeamCursor)
+        # Accept drag-and-drop of files (e.g. drop an image onto the terminal
+        # and its path is typed at the cursor — what Claude Code's "drag an
+        # image in" hint relies on). A plain QWidget rejects drops until this
+        # flag is set, so the OS never even offered the drop to us before.
+        self.setAcceptDrops(True)
 
         self._font = QFont("Consolas", 10)
         self._fm = QFontMetricsF(self._font)
@@ -1053,6 +1059,57 @@ class PtyTerminalView(QWidget):
         if self._private_mode(2004):
             payload = "\x1b[200~" + payload + "\x1b[201~"
         self.key_input.emit(payload)
+
+    # ── Drag & drop ──────────────────────────────────────────────────────
+    # Dropping a file (image, log, whatever) onto the terminal types its path
+    # at the cursor. This is what makes Claude Code's "drag an image in" work:
+    # the CLI reads the path the shell hands it. We never *send* file bytes —
+    # only the path string, the same as every native terminal.
+    def _drop_has_paths(self, md) -> bool:
+        return bool(md) and (md.hasUrls() or md.hasText())
+
+    def dragEnterEvent(self, ev: QDragEnterEvent):
+        if self._drop_has_paths(ev.mimeData()):
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev: QDragMoveEvent):
+        if self._drop_has_paths(ev.mimeData()):
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dropEvent(self, ev: QDropEvent):
+        md = ev.mimeData()
+        paths: list[str] = []
+        if md.hasUrls():
+            for url in md.urls():
+                local = url.toLocalFile()
+                paths.append(local if local else url.toString())
+        elif md.hasText():
+            paths.append(md.text())
+        paths = [p for p in (p.strip() for p in paths) if p]
+        if not paths:
+            ev.ignore()
+            return
+        # Quote each path so spaces survive at the shell. A path that already
+        # contains a double-quote falls back to single-quoting; otherwise wrap
+        # in double quotes (works in cmd, PowerShell, and POSIX shells).
+        def _quote(p: str) -> str:
+            if " " not in p and "\t" not in p:
+                return p
+            if '"' not in p:
+                return f'"{p}"'
+            return f"'{p}'"
+        payload = " ".join(_quote(p) for p in paths)
+        if len(paths) == 1:
+            payload += " "  # trailing space so the next arg/flag is separated
+        if self._private_mode(2004):
+            payload = "\x1b[200~" + payload + "\x1b[201~"
+        self.setFocus()
+        self.key_input.emit(payload)
+        ev.acceptProposedAction()
 
     def keyPressEvent(self, ev: QKeyEvent):
         key = ev.key()

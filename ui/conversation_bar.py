@@ -633,11 +633,14 @@ class ConversationBar(QWidget):
         a = QColor(p["accent"])
         return f"rgb({max(a.red()//6,12)},{max(a.green()//6,12)},{max(a.blue()//6,12)})"
 
-    def _combo_qss(self, border_color: str = "", border_w: int = 2) -> str:
-        # border_w stays constant (default 2px) across resting + blinking states
-        # so the alert flash only changes color and never reflows/shifts the UI.
+    def _combo_qss(self, border_color: str = "", border_w: int = 1) -> str:
+        # Resting border is a thin, muted hairline (1px, theme border color) so
+        # the single active-conversation combo reads as a calm field, not a
+        # perma-selected/alert box. The blink path passes an explicit
+        # border_color (hot/accent) to flash attention; width stays constant at
+        # 1px so the flash only changes color and never reflows/shifts the UI.
         p = PALETTE
-        border_color = border_color or p["accent"]
+        border_color = border_color or p["border"]
         return f"""
             QComboBox#ConvCombo {{
                 background: {self._brick_bg()};

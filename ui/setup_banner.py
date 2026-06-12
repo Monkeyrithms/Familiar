@@ -119,3 +119,34 @@ class SetupBanner(QFrame):
 
     def refresh_visibility(self) -> None:
         self.setVisible(should_show_setup_banner())
+
+    def apply_theme(self) -> None:
+        p = PALETTE
+        self.setStyleSheet(f"""
+            QFrame#SetupBanner {{
+                background: {p['panel']};
+                border-bottom: 1px solid {p['accent_muted']};
+            }}
+            QLabel {{
+                color: {p['text']};
+                background: transparent;
+                border: none;
+            }}
+            QPushButton {{
+                background: {p['panel_alt']};
+                color: {p['text']};
+                border: 1px solid {p['border']};
+                padding: 3px 10px;
+                font-family: Consolas;
+                font-size: 8pt;
+            }}
+            QPushButton:hover {{
+                background: {p['accent_muted']};
+                color: {p['background']};
+                border-color: {p['accent']};
+            }}
+            QPushButton#setupPrimary {{
+                color: {p['accent_bright']};
+                border-color: {p['accent']};
+            }}
+        """)

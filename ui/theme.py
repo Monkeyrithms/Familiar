@@ -220,6 +220,12 @@ def apply_selection_palette():
         pass
 
 
+def dim_accent_edge(strength: float = 0.16, palette: dict | None = None) -> str:
+    """Very faint accent-tinted edge for chrome borders (title bar, etc.)."""
+    p = palette if palette is not None else PALETTE
+    return _blend(p["accent"], p.get("panel_alt", p["panel"]), strength).name()
+
+
 def refresh_palette():
     """Reload palette from config. Call after settings change."""
     global PALETTE

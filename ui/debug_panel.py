@@ -156,10 +156,12 @@ class DebugPanel(QWidget):
         muted = p.get("muted_text", accent)
         text = p.get("text", accent)
         border = p.get("border", accent)
+        panel = p.get("panel", p.get("background", accent))
+        panel_alt = p.get("panel_alt", panel)
 
         view_css = (
             f"QTextEdit {{"
-            f"  background-color: #0d0d0d;"
+            f"  background-color: {panel};"
             f"  color: {text};"
             f"  border: 1px solid {border};"
             f"  selection-background-color: {accent};"
@@ -167,11 +169,11 @@ class DebugPanel(QWidget):
         )
         btn_css = (
             f"QPushButton {{"
-            f"  background-color: #1a1a1a; color: {accent};"
+            f"  background-color: {panel_alt}; color: {accent};"
             f"  border: 1px solid {accent}; border-radius: 3px; padding: 3px 8px;"
             f"}}"
-            f"QPushButton:hover {{ background-color: #222; }}"
-            f"QPushButton:pressed {{ background-color: {accent}; color: #111; }}"
+            f"QPushButton:hover {{ background-color: {panel}; }}"
+            f"QPushButton:pressed {{ background-color: {accent}; color: {panel}; }}"
         )
         lbl_css = f"color: {accent}; font-weight: bold;"
         muted_css = f"color: {muted};"
@@ -188,6 +190,14 @@ class DebugPanel(QWidget):
             lbl.setStyleSheet(lbl_css)
         for v in self._step_views.values():
             v.setStyleSheet(view_css)
+
+    def apply_theme(self) -> None:
+        """Re-apply chrome after a palette change; re-render HTML bodies too."""
+        self._apply_styles()
+        if self._current_turn is not None:
+            self._render(self._current_turn)
+        elif self._turn_index == -1:
+            self._refresh()
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -259,7 +269,8 @@ class DebugPanel(QWidget):
         # ── Per-round step panels ──────────────────────────────────────────────
         self._clear_steps()
         for step in turn.get("steps") or []:
-            self._add_step_panel(step, accent, muted, text_col)
+            if isinstance(step, dict):
+                self._add_step_panel(step, accent, muted, text_col)
 
     def _render_full_sandwich(
         self,
@@ -277,9 +288,14 @@ class DebugPanel(QWidget):
         base_ctx = turn.get("base_context") or []
 
         if not base_ctx:
-            return f"<p style='color:#ff5555;'><b>Context is empty.</b> The model received nothing.</p>"
+            danger = PALETTE.get("danger", "#ff5555")
+            return f"<p style='color:{danger};'><b>Context is empty.</b> The model received nothing.</p>"
 
         for msg in base_ctx:
+            if not isinstance(msg, dict):
+                # Size-capped turns store placeholder strings instead of messages
+                parts.append(self._msg_block("note", str(msg), accent, muted, text_col))
+                continue
             role = msg.get("role", "?")
             raw_content = msg.get("content") or ""
 
@@ -311,8 +327,9 @@ class DebugPanel(QWidget):
         text_col: str,
     ) -> str:
         """Render one message as a labeled block, full content, no truncation."""
+        panel_bg = PALETTE.get("panel", PALETTE.get("background", "#0c0c0c"))
         role_color = {
-            "system": "#888888",
+            "system": muted,
             "user": accent,
             "assistant": text_col,
             "tool": muted,
@@ -324,7 +341,7 @@ class DebugPanel(QWidget):
             f"border-bottom:1px solid {muted}; margin-bottom:4px; padding-bottom:2px;'>"
             f"[{html.escape(role.upper())}]</div>"
             f"<pre style='white-space:pre-wrap; margin:0; color:{text_col}; "
-            f"background:#0c0c0c; padding:6px;'>{html.escape(content)}</pre>"
+            f"background:{panel_bg}; padding:6px;'>{html.escape(content)}</pre>"
             f"</div>"
         )
 
@@ -370,9 +387,10 @@ class DebugPanel(QWidget):
         self._step_labels[idx] = lbl
 
         view = self._make_view(min_h=80, max_h=99999)
+        panel_bg = p.get("panel", p.get("background", accent))
         view.setStyleSheet(
-            f"QTextEdit {{ background-color:#0d0d0d; color:{p.get('text',accent)};"
-            f" border:1px solid {p.get('border',accent)}; }}"
+            f"QTextEdit {{ background-color:{panel_bg}; color:{p.get('text', accent)};"
+            f" border:1px solid {p.get('border', accent)}; }}"
         )
         view.setHtml(self._format_step(step, accent, muted, text_col))
         self._main_layout.addWidget(view)
@@ -387,6 +405,8 @@ class DebugPanel(QWidget):
     ) -> str:
         parts: List[str] = []
         meta = step.get("meta") or {}
+        panel_bg = PALETTE.get("panel", PALETTE.get("background", "#0c0c0c"))
+        warn = PALETTE.get("danger", "#ffaa00")
 
         # Tool calls the model requested
         tool_calls = meta.get("tool_calls") or []
@@ -397,7 +417,7 @@ class DebugPanel(QWidget):
                 tc_str = str(tool_calls)
             parts.append(f"<p style='color:{accent}; margin:0 0 4px 0;'><b>Tool Calls</b></p>")
             parts.append(
-                f"<pre style='white-space:pre-wrap; background:#0c0c0c; padding:6px;"
+                f"<pre style='white-space:pre-wrap; background:{panel_bg}; padding:6px;"
                 f" border:1px solid {muted}; color:{muted}; margin:0 0 8px 0;'>"
                 f"{html.escape(tc_str)}</pre>"
             )
@@ -407,13 +427,13 @@ class DebugPanel(QWidget):
         if thinking:
             parts.append(f"<p style='color:{accent}; margin:4px 0 4px 0;'><b>Extended Thinking</b></p>")
             parts.append(
-                f"<pre style='white-space:pre-wrap; background:#0c0c0c; padding:6px;"
+                f"<pre style='white-space:pre-wrap; background:{panel_bg}; padding:6px;"
                 f" border:1px solid {muted}; color:{muted}; margin:0 0 8px 0;'>"
                 f"{html.escape(thinking)}</pre>"
             )
 
         if meta.get("forced"):
-            parts.append(f"<p style='color:#ffaa00;'>⚠ Forced final answer (hard-stop)</p>")
+            parts.append(f"<p style='color:{warn};'>⚠ Forced final answer (hard-stop)</p>")
 
         # Context delta (what changed from previous round — tool results etc.)
         context = step.get("context") or []
@@ -423,6 +443,11 @@ class DebugPanel(QWidget):
                 f"<span style='color:{muted}; font-weight:normal;'>({len(context)} messages)</span></p>"
             )
             for i, msg in enumerate(context):
+                if not isinstance(msg, dict):
+                    parts.append(
+                        f"<p style='color:{muted};'><i>{html.escape(str(msg))}</i></p>"
+                    )
+                    continue
                 role = msg.get("role", "?")
                 raw = msg.get("content") or ""
                 tool_calls_msg = msg.get("tool_calls")
@@ -440,11 +465,11 @@ class DebugPanel(QWidget):
                     text, has_img = _extract_text(raw)
                     if has_img:
                         text += "\n[+ image]"
-                role_color = {"system": "#888", "user": accent, "assistant": text_col, "tool": muted}.get(role, accent)
+                role_color = {"system": muted, "user": accent, "assistant": text_col, "tool": muted}.get(role, accent)
                 parts.append(
                     f"<div style='margin-bottom:6px;'>"
                     f"<span style='color:{role_color}; font-weight:bold;'>[{html.escape(role.upper())}]</span>"
-                    f"<pre style='white-space:pre-wrap; margin:2px 0 0 0; background:#0c0c0c;"
+                    f"<pre style='white-space:pre-wrap; margin:2px 0 0 0; background:{panel_bg};"
                     f" padding:4px; color:{text_col};'>{html.escape(text)}</pre></div>"
                 )
 
@@ -453,7 +478,7 @@ class DebugPanel(QWidget):
         if response:
             parts.append(f"<p style='color:{accent}; margin:4px 0 4px 0;'><b>Response</b></p>")
             parts.append(
-                f"<pre style='white-space:pre-wrap; background:#0c0c0c; padding:6px;"
+                f"<pre style='white-space:pre-wrap; background:{panel_bg}; padding:6px;"
                 f" border:1px solid {muted}; color:{text_col}; margin:0;'>"
                 f"{html.escape(response)}</pre>"
             )
@@ -485,6 +510,11 @@ class DebugPanel(QWidget):
 
         # Full sandwich — every message in base_context, no truncations
         for msg in turn.get("base_context") or []:
+            if not isinstance(msg, dict):
+                lines.append(f"━━━ [NOTE] ━━━")
+                lines.append(str(msg))
+                lines.append("")
+                continue
             role = msg.get("role", "?").upper()
             raw = msg.get("content") or ""
             tc = msg.get("tool_calls")
@@ -508,6 +538,8 @@ class DebugPanel(QWidget):
 
         # Per-round steps
         for step in turn.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
             title = _step_display_name(str(step.get("name") or ""))
             lines.append(f"══════════════════════════════")
             lines.append(f"  {title.upper()}")
@@ -526,6 +558,9 @@ class DebugPanel(QWidget):
                 lines.append(str(meta["thinking"]))
                 lines.append("")
             for msg in step.get("context") or []:
+                if not isinstance(msg, dict):
+                    lines.append(f"  [NOTE]: {msg}")
+                    continue
                 role = msg.get("role", "?").upper()
                 raw = msg.get("content") or ""
                 tc = msg.get("tool_calls")

@@ -547,7 +547,7 @@ class SettingsDialog(GlassDialog):
         self._show_usage_check.setChecked(cfg.get("show_usage", False))
         layout.addRow("", self._show_usage_check)
 
-        # Cyberpunk styling (monocolor + CRT)
+        # Cyberpunk styling (monocolor)
         cyber_group = QGroupBox("Make it Cyberpunk")
         cyber_layout = QVBoxLayout(cyber_group)
         cyber_layout.setSpacing(8)
@@ -591,21 +591,6 @@ class SettingsDialog(GlassDialog):
         mono_images_layout.addWidget(self._monocolor_images_check)
         mono_images_layout.addStretch()
         cyber_layout.addWidget(mono_images_row)
-
-        crt_row = QHBoxLayout()
-        crt_row.setSpacing(8)
-        self._crt_check = QCheckBox("CRT Scanline Effect")
-        self._crt_check.setChecked(cfg.get("crt_enabled", False))
-        crt_row.addWidget(self._crt_check)
-        crt_row.addWidget(QLabel("Speed"))
-        self._crt_speed_spin = QSpinBox()
-        self._crt_speed_spin.setRange(50, 3000)
-        self._crt_speed_spin.setSingleStep(50)
-        self._crt_speed_spin.setValue(cfg.get("crt_speed", 600))
-        self._crt_speed_spin.setSuffix(" ms")
-        crt_row.addWidget(self._crt_speed_spin)
-        crt_row.addStretch()
-        cyber_layout.addLayout(crt_row)
 
         self._monocolor_check.toggled.connect(self._sync_monocolor_browser_visibility)
         self._sync_monocolor_browser_visibility()
@@ -3637,8 +3622,6 @@ class SettingsDialog(GlassDialog):
                 if val and QColor(val).isValid():
                     overrides[key] = val
             cfg["color_overrides"] = overrides
-        cfg["crt_enabled"] = self._crt_check.isChecked()
-        cfg["crt_speed"] = self._crt_speed_spin.value()
 
         # Audio settings
         cfg["ui_sounds"] = self._ui_sounds_check.isChecked()

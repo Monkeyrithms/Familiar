@@ -747,8 +747,11 @@ def _sparkle_img_html() -> str:
         key = (PALETTE.get("accent"), PALETTE.get("glow_hot"))
         if _SPARKLE_CACHE["key"] == key and _SPARKLE_CACHE["html"]:
             return _SPARKLE_CACHE["html"]
-        icon = build_app_icon(
-            PALETTE["accent"], PALETTE.get("glow_hot") or PALETTE.get("accent_bright"))
+        # Render glow-hot: pass the hot color for BOTH body and core so the icon
+        # beside the nametag burns at the same temperature as the name itself —
+        # exactly the titlebar treatment (build_app_icon(col, col)).
+        hot = PALETTE.get("glow_hot") or PALETTE.get("accent_bright")
+        icon = build_app_icon(hot, hot)
         out = Path(__file__).resolve().parent.parent / "data" / "sparkle_inline.png"
         out.parent.mkdir(parents=True, exist_ok=True)
         if not icon.pixmap(32, 32).save(str(out), "PNG"):
@@ -1181,7 +1184,8 @@ class ChatMessageWidget(QFrame):
 
     def update_content(self, content: str, cached_html: str | None = None,
                        tool_names: list[str] | None = None, usage: dict | None = None,
-                       inline_timeline: bool | None = None):
+                       inline_timeline: bool | None = None,
+                       measure_height: bool = True):
         """Live-update an assistant bubble while tokens stream in."""
         self.content = content
         if cached_html is not None:
@@ -1198,7 +1202,8 @@ class ChatMessageWidget(QFrame):
                 self._base_html = plain_html
                 self._current_html = plain_html
                 self._body.setText(plain_html)
-                self._sync_body_min_height()
+                if measure_height:
+                    self._sync_body_min_height()
             return
         combined_html = self._make_combined_html()
         combined_html = self._apply_ellipsis_markup(combined_html)
@@ -1206,7 +1211,8 @@ class ChatMessageWidget(QFrame):
         self._current_html = combined_html
         if hasattr(self, "_body"):
             self._body.setText(combined_html)
-            self._sync_body_min_height()
+            if measure_height:
+                self._sync_body_min_height()
 
     def reconfigure(self, *, sender: str, content: str, tool_names: list[str] | None = None,
                     image_path: str | None = None, cached_html: str | None = None,
@@ -3121,6 +3127,35 @@ class ChatWindow(QWidget):
         except RuntimeError:
             pass  # widget torn down mid-callback
 
+    def _workspace_preserves_focus(self, widget) -> bool:
+        """True when *widget* is an interactive workspace tool that should keep
+        keyboard focus after the agent finishes (Terminal, File viewer)."""
+        if widget is None:
+            return False
+        ws = getattr(self, "_right_workspace", None)
+        if ws is None:
+            return False
+        for panel in (
+            getattr(ws, "terminal_panel", None),
+            getattr(ws, "remote_terminal", None),
+            getattr(ws, "file_viewer", None),
+        ):
+            if panel is not None and self._widget_within(widget, panel):
+                return True
+        return False
+
+    def _maybe_focus_input(self):
+        """Return focus to the composer after a turn unless the user is typing
+        in the workspace Terminal or File viewer."""
+        from PyQt6.QtWidgets import QApplication
+        fw = QApplication.focusWidget()
+        if self._workspace_preserves_focus(fw):
+            return
+        try:
+            self.input.setFocus()
+        except Exception:
+            pass
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -4046,6 +4081,15 @@ class ChatWindow(QWidget):
                 self._thread.stopped.disconnect(self._on_stopped)
             except (TypeError, RuntimeError):
                 pass
+            # round_started is per-WINDOW too: left connected, the backgrounded
+            # thread's next model round fires _on_stream_round_start against the
+            # conversation shown NEXT — sealing/resetting its live buffer and
+            # injecting this turn's narration into the wrong transcript. Detach it
+            # like chunk/finished; the bg buffer below keeps accumulating raw text.
+            try:
+                self._thread.round_started.disconnect(self._on_stream_round_start)
+            except (TypeError, RuntimeError):
+                pass
             self.agent._tool_callback = None
             self.agent._tool_batch_callback = None
             # Wire up a background finisher
@@ -4139,6 +4183,13 @@ class ChatWindow(QWidget):
             self._thread.finished.connect(self._on_response)
             self._thread.errored.connect(self._on_error)
             self._thread.stopped.connect(self._on_stopped)
+            # Re-arm round_started (detached in _snapshot_current) so resumed
+            # rounds paint into THIS conversation again.
+            try:
+                self._thread.round_started.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self._thread.round_started.connect(self._on_stream_round_start)
             self.agent._tool_callback = lambda n, a: self.tool_activity.emit(n, a)
             self.agent._tool_batch_callback = lambda ns: self.tool_batch.emit(ns)
 
@@ -5077,6 +5128,63 @@ class ChatWindow(QWidget):
         tl = meta.setdefault("_stream_timeline", [])
         tl.append({"type": "text", "content": text})
 
+    def _schedule_plan_resurface(self):
+        """Debounce: collapse a burst of step updates into one re-surface."""
+        t = getattr(self, "_plan_resurface_timer", None)
+        if t is None:
+            t = self._plan_resurface_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._resurface_live_plan)
+        t.start(350)
+
+    def _resurface_live_plan(self):
+        """Re-show the live checklist beside the latest work.
+
+        If tool rows / narration have landed in the timeline *below* the live
+        plan card since it was last rendered, freeze that card on the state the
+        user saw and append a fresh live one at the bottom. The agent then
+        watches the same plan tick off step-by-step as work proceeds, instead
+        of a single card stranded near the top of the turn. No new work beneath
+        it → nothing to do (avoids a wall of duplicate cards on rapid edits).
+        """
+        ref = getattr(self, "_live_plan_timeline_ref", None)
+        if not ref or not self._stream_in_chat():
+            return
+        meta_idx, tl_idx = ref
+        if meta_idx >= len(self._message_meta):
+            return
+        meta = self._message_meta[meta_idx]
+        tl = meta.get("_stream_timeline")
+        if not isinstance(tl, list) or tl_idx >= len(tl):
+            return
+        # Has anything other than the plan card itself been appended after it?
+        tail = tl[tl_idx + 1:]
+        has_new_work = any(
+            it.get("type") in ("text", "tools", "tool", "subagent", "diff",
+                               "screenshot", "chart")
+            and (it.get("content", "").strip() if it.get("type") == "text" else True)
+            for it in tail
+        )
+        if not has_new_work:
+            return
+        # Fold any in-flight narration in first, so the frozen card sits above it.
+        self._seal_stream_text_to_timeline(meta)
+        # Freeze the old card on the last-shown state (render path stored it).
+        try:
+            from tools.plan import get_current_plan
+            import copy
+            cur = get_current_plan()
+            if cur:
+                tl[tl_idx]["plan_data"] = copy.deepcopy(cur)
+        except Exception:
+            pass
+        tl[tl_idx]["live"] = False
+        # Append a fresh live card at the bottom and re-point the live ref to it.
+        tl.append({"type": "plan", "live": True, "plan_data": {}})
+        self._live_plan_timeline_ref = (meta_idx, len(tl) - 1)
+        self._refresh_live_stream_display(show_ellipsis=self._stream_active)
+        QTimer.singleShot(50, self._scroll_to_bottom)
+
     def _timeline_tool_names(self, meta: dict) -> list[str]:
         names: list[str] = []
         for item in meta.get("_stream_timeline", []):
@@ -5176,7 +5284,15 @@ class ChatWindow(QWidget):
                 # in-flight state directly so the card shows the actual plan.
                 try:
                     from tools.plan import get_current_plan
-                    pd = get_current_plan() or pd
+                    live_pd = get_current_plan()
+                    if live_pd:
+                        pd = live_pd
+                        # Remember the state we actually showed. When this card
+                        # is later frozen (a fresh checklist surfaces below it),
+                        # it keeps the snapshot the user last saw instead of
+                        # reverting to an older state or duplicating the new one.
+                        import copy
+                        item["plan_data"] = copy.deepcopy(live_pd)
                 except Exception:
                     pass
             try:
@@ -6162,9 +6278,21 @@ class ChatWindow(QWidget):
         meta.pop("_html_theme_key", None)
         widget = self._idx_to_widget.get(idx)
         if isinstance(widget, ChatMessageWidget):
+            # Text must update every tick, but the height re-measure
+            # (a second full QTextDocument parse of the whole bubble) is the
+            # per-tick O(turn-length) cost. During live streaming we pin to the
+            # bottom anyway and finalize measures exactly, so throttle the
+            # measure to ~4/sec — text stays current, the double-parse stops
+            # dominating long multi-tool turns.
+            import time as _t
+            now = _t.monotonic()
+            measure = (now - getattr(self, "_stream_measure_last", 0.0)) >= 0.25
+            if measure:
+                self._stream_measure_last = now
             widget.update_content(
                 meta["content"], body_html,
                 tool_names=[], inline_timeline=True,
+                measure_height=measure,
             )
         else:
             self._recalc_and_sync(immediate=True)
@@ -7530,15 +7658,24 @@ class ChatWindow(QWidget):
                     self._live_plan_widget = pw
                 QTimer.singleShot(50, self._scroll_to_bottom)
             elif action in ("update", "add_step", "remove_step"):
-                # Inline timeline plan cards re-render from get_current_plan();
-                # nudge a refresh shortly after the tool runs so step status
-                # flips live (the widget path covers itself by polling).
+                # A step changed. Two jobs: (1) flip the existing card's status
+                # live, and (2) if real work (tool rows / narration) has piled up
+                # beneath the checklist since it was last shown, re-surface a
+                # fresh copy next to that new work — so the user watches it tick
+                # off over time (the Claude/Cursor behaviour) instead of it
+                # scrolling out of view and freezing near the top.
                 if (getattr(self, "_live_plan_timeline_ref", None)
                         and self._stream_in_chat()):
                     QTimer.singleShot(200, lambda: self._refresh_live_stream_display(
                         show_ellipsis=self._stream_active))
+                    # Coalesce a burst of rapid step flips into one re-surface.
+                    self._schedule_plan_resurface()
             elif action == "finish":
                 from tools.plan import get_current_plan, get_last_finished_plan
+                # Cancel any pending re-surface so it can't fire after close.
+                _rt = getattr(self, "_plan_resurface_timer", None)
+                if _rt is not None:
+                    _rt.stop()
                 # The tool may have already executed (queued cross-thread
                 # signal) and cleared the live plan — fall back to the
                 # finished snapshot so the persisted card keeps its steps.
@@ -8011,6 +8148,82 @@ class ChatWindow(QWidget):
         self._auto_save()
         self._finish_inference()
 
+    @staticmethod
+    def _wait_qthread(thread: QThread | None, wait_ms: int = 2500) -> None:
+        """Block until a worker QThread exits so Qt can tear down thread-local storage.
+
+        Destroying a QThread (or letting it GC) while ``run()`` is still active
+        prints the ``QThreadStorage: entry N destroyed before end of thread`` spam
+        on stderr at process exit.
+        """
+        if thread is None:
+            return
+        try:
+            if thread.isRunning():
+                if not thread.wait(max(0, int(wait_ms))):
+                    thread.terminate()
+                    thread.wait(500)
+            else:
+                thread.wait(100)
+        except RuntimeError:
+            pass
+
+    def _shutdown_workers(self, wait_ms: int = 2500) -> None:
+        """Join every chat-owned QThread before the GUI is torn down."""
+        self._shutting_down = True
+        try:
+            self.agent._stop_requested = True
+        except Exception:
+            pass
+        try:
+            from core.tool_context import trigger_abort
+            trigger_abort()
+        except Exception:
+            pass
+        for name in (
+            "_auto_save_timer", "_sync_debounce_timer", "_stream_flush_timer",
+            "_composer_draft_timer", "_viewer_state_save_timer",
+            "_inference_watchdog", "_input_blink_timer",
+        ):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+        try:
+            self._interrupt_voice()
+        except Exception:
+            pass
+
+        threads: list[QThread] = []
+        if self._thread is not None:
+            threads.append(self._thread)
+        if self._conv_load_thread is not None:
+            threads.append(self._conv_load_thread)
+        for snap in list(getattr(self, "_conv_threads", {}).values()):
+            bg = snap.get("thread")
+            if bg is not None:
+                threads.append(bg)
+        threads.extend(list(getattr(self, "_task_threads", [])))
+
+        seen: set[int] = set()
+        for th in threads:
+            if th is None or id(th) in seen:
+                continue
+            seen.add(id(th))
+            try:
+                th.finished.disconnect()
+            except Exception:
+                pass
+            self._wait_qthread(th, wait_ms)
+
+        self._thread = None
+        self._conv_load_thread = None
+        self._conv_threads.clear()
+        if hasattr(self, "_task_threads"):
+            self._task_threads.clear()
+
     def _stop_inference(self):
         """User hit STOP — signal agent to abort. Force-kill if it doesn't exit."""
         if self._thread is None:
@@ -8187,6 +8400,8 @@ class ChatWindow(QWidget):
             self.input._apply_styles()
 
     def _finish_inference(self):
+        if self._thread is not None:
+            self._wait_qthread(self._thread, 100)
         self._thread = None
         # Clear any leftover interrupt state so a force-terminated turn can't
         # make the NEXT turn (incl. a queued message) stop the instant it starts.
@@ -8204,7 +8419,7 @@ class ChatWindow(QWidget):
             daemon=True,
             name="summarizer-save",
         ).start()
-        self.input.setFocus()
+        self._maybe_focus_input()
         # Send anything the user queued while this turn was running.
         self._drain_queued_message()
         # A theme change during the turn deferred its transcript rebuild (it would
@@ -9318,7 +9533,7 @@ class ChatWindow(QWidget):
 
         Because it no longer blocks, the post-accept refresh runs from the
         dialog's `accepted` signal rather than a return value. `on_accept`
-        (passed by main.py) lets the host window refresh theme/CRT too.
+        (passed by main.py) lets the host window refresh theme too.
         """
         from ui.settings_dialog import SettingsDialog
         # Reuse an already-open instance instead of stacking duplicates.
