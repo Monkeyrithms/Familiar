@@ -1085,6 +1085,13 @@ class PtyTerminalView(QWidget):
         if seq:
             self.key_input.emit(seq)
 
+    def focusNextPrevChild(self, _next: bool) -> bool:
+        # Qt eats Tab / Shift+Tab for focus traversal before keyPressEvent ever
+        # sees them. A terminal needs both keys raw (Tab = completion, Shift+Tab
+        # = reverse-cycle, e.g. Claude's "shift+tab to cycle"). Returning False
+        # tells Qt we handle them ourselves, so they fall through to the PTY.
+        return False
+
     def _capture_submitted_command(self):
         try:
             line = self._screen.display[self._screen.cursor.y]
