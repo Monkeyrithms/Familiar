@@ -199,6 +199,7 @@ def _spawn_daemon() -> Tuple[Optional[subprocess.Popen], Optional[str]]:
             [inst.venv_python(), "-u", str(WORKER), "--daemon"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env, text=True, bufsize=1,
+            encoding="utf-8", errors="replace",
             creationflags=creation_flags,
         )
     except Exception as e:

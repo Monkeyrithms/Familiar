@@ -235,6 +235,7 @@ def _run_ruff(path: str) -> list[dict]:
         result = subprocess.run(
             _tool_argv("ruff") + ["check", "--output-format=json", "--exit-zero", str(path)],
             capture_output=True, text=True, timeout=TIMEOUT,
+            encoding="utf-8", errors="replace",
             creationflags=_NO_WINDOW,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -269,6 +270,7 @@ def _run_pyflakes(path: str) -> list[dict]:
         result = subprocess.run(
             _tool_argv("pyflakes") + [str(path)],
             capture_output=True, text=True, timeout=TIMEOUT,
+            encoding="utf-8", errors="replace",
             creationflags=_NO_WINDOW,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -304,6 +306,7 @@ def _check_generic(path: str, cmd_template: list[str]) -> dict:
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=TIMEOUT,
+            encoding="utf-8", errors="replace",
             creationflags=_NO_WINDOW,
         )
     except subprocess.TimeoutExpired:

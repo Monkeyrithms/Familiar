@@ -57,6 +57,7 @@ def has_gpu() -> tuple:
     try:
         out = subprocess.check_output(["nvidia-smi", "--query-gpu=name",
                                        "--format=csv,noheader"], timeout=1, text=True,
+                                      encoding="utf-8", errors="replace",
                                       creationflags=_NO_WINDOW)
         name = out.strip().splitlines()[0] if out.strip() else ""
         return bool(name), name
@@ -136,6 +137,7 @@ class ChatterboxInstaller(QObject):
             if not Path(venv_python()).exists():
                 r = subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)],
                                    capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace",
                                    creationflags=_NO_WINDOW)
                 if r.returncode != 0:
                     self._emit_done(False, f"venv creation failed: {r.stderr}")
@@ -199,6 +201,7 @@ class ChatterboxInstaller(QObject):
                     [venv_python(), "-u", str(WORKER)],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, env=env, text=True,
+                    encoding="utf-8", errors="replace",
                     bufsize=1, creationflags=_NO_WINDOW,
                 )
                 assert p.stdin and p.stdout
@@ -230,6 +233,7 @@ class ChatterboxInstaller(QObject):
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, bufsize=0, env=env,
+                                 encoding="utf-8", errors="replace",
                                  creationflags=_NO_WINDOW)
         except Exception as e:
             self._emit_log(f"[launch error] {e}")

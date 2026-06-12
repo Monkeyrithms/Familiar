@@ -51,6 +51,7 @@ def workspace(action: str, name: str = None, path: str = None,
             result = subprocess.run(
                 [sys.executable, "-m", "venv", venv_path],
                 capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace",
                 creationflags=NO_WINDOW)  # no console flash on Windows
             if result.returncode == 0:
                 ws_entry["venv"] = to_config_workspace_path(venv_path)

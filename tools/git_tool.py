@@ -18,6 +18,8 @@ def _run_git(args: list[str], cwd: str, timeout: int = 30) -> dict:
             cwd=cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             creationflags=NO_WINDOW,  # no console flash on Windows
         )

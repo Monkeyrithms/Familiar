@@ -27,6 +27,7 @@ def _run_git(args: list[str], cwd: str, timeout: int = _TIMEOUT) -> dict:
         r = subprocess.run(
             ["git"] + args, cwd=cwd,
             capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
             creationflags=NO_WINDOW,  # no console flash on Windows
         )
         return {"stdout": r.stdout, "stderr": r.stderr, "returncode": r.returncode}
