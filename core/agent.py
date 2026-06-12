@@ -45,8 +45,9 @@ NO_TIMEOUT_TOOLS = {"ask_user_question"}
 TOOL_ROUND_WARN = 50  # Gentle nudge to wrap up
 TOOL_ROUND_HARD_STOP = 200  # absolute ceiling — bails out runaway loops
 TOOL_LOOP_STUCK_LIMIT = 5  # consecutive rounds with every tool call skipped as loop → force stop
-API_MAX_RETRIES = 4
+API_MAX_RETRIES = 7
 API_BASE_DELAY = 0.75
+API_MAX_DELAY = 20.0  # cap per-attempt backoff so 7 attempts stay bounded
 REFLECT_MAX_LOOPS = 3  # post-review draft→critique→rewrite cycles (hard cap)
 
 # Two-pass tool routing: group tool names into broad categories.
@@ -234,6 +235,41 @@ def _is_transient_error(text: str) -> bool:
         "incomplete chunked read", "peer closed", "econnreset",
     )
     return any(t in lower for t in tokens)
+
+
+def _is_context_overflow(text: str) -> bool:
+    """Request rejected because the conversation no longer fits the model's
+    context window. NOT transient — retrying the same payload always fails;
+    the fix is shrinking the payload (emergency compaction) and retrying."""
+    if not text:
+        return False
+    lower = text.lower()
+    tokens = (
+        "prompt is too long", "context_length_exceeded",
+        "maximum context length", "input is too long",
+        "request too large", "request_too_large",
+        "input length and `max_tokens` exceed",
+        "exceeds the maximum number of tokens",
+    )
+    return any(t in lower for t in tokens)
+
+
+def _emergency_compact(working_messages: list, head: int, tail: int) -> int:
+    """In-place last-resort shrink when the API rejects the payload as too
+    large: re-truncate every tool result in this turn's working set down to
+    head+tail chars. Returns how many messages were shrunk. Only `working_
+    messages` is touched — self.context keeps short metadata tags already."""
+    from core.truncate import truncate_tool_result
+    shrunk = 0
+    limit = head + tail
+    for m in working_messages:
+        if m.get("role") != "tool":
+            continue
+        content = m.get("content") or ""
+        if len(content) > limit + 500:
+            m["content"] = truncate_tool_result(content, limit)
+            shrunk += 1
+    return shrunk
 
 
 def _strip_none_for_json(obj):
@@ -1498,7 +1534,7 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                         _log("Request too large — shrunk inline images, retrying...")
                         continue
                 if _is_transient_error(err_str) and attempt < API_MAX_RETRIES - 1:
-                    delay = API_BASE_DELAY * (2 ** attempt)
+                    delay = min(API_BASE_DELAY * (2 ** attempt), API_MAX_DELAY)
                     _log(f"Transient error (attempt {attempt+1}/{API_MAX_RETRIES}): {err_str[:300]}. Retrying in {delay:.1f}s...")
                     time.sleep(delay)
                     # The failed attempt may have already streamed partial text
@@ -1751,6 +1787,8 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
 
         round_num = 0
         empty_streak = 0
+        self._overflow_passes = 0  # emergency-compaction passes used this turn
+        self._continue_passes = 0  # max_tokens auto-continuations used this turn
         _error_streak: dict[str, int] = {}
         stale_notes: dict[str, str] = {}  # tc.id -> stale-edit advisory (captured pre-edit)
         self._turn_usage = {"prompt_tokens": 0, "completion_tokens": 0,
@@ -1890,6 +1928,22 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                                           self._with_context_note(working_messages),
                                           tools_list)
             except Exception as e:
+                # Context overflow is recoverable: the request was REJECTED (not
+                # partially processed), so shrink this turn's tool payloads and
+                # retry the same round. Two passes: 4K+2K, then a brutal 1K+500.
+                if _is_context_overflow(str(e)):
+                    overflow_passes = getattr(self, "_overflow_passes", 0)
+                    caps = [(4000, 2000), (1000, 500)]
+                    if overflow_passes < len(caps):
+                        head, tail = caps[overflow_passes]
+                        self._overflow_passes = overflow_passes + 1
+                        n = _emergency_compact(working_messages, head, tail)
+                        _log(f"Context overflow — emergency-compacted {n} tool "
+                             f"results to {head + tail} chars (pass "
+                             f"{self._overflow_passes}/{len(caps)}). Retrying round.")
+                        if n:
+                            round_num -= 1  # retry, don't burn a round
+                            continue
                 _log(f"ERROR: API call failed after retries: {e}")
                 debug_recorder.finalize_turn(_debug_turn_id, error=f"{type(e).__name__}: {e}")
                 raise  # propagate so InferenceThread emits errored → UI rolls back
@@ -1941,6 +1995,28 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
             # ── No tool calls: text response ──
             if not msg.tool_calls:
                 reply = msg.content or ""
+
+                # Output clipped at the max_tokens ceiling mid-work. Treating
+                # the fragment as a final answer is the "agent just stopped"
+                # stall — the model never chose to end its turn. Append the
+                # fragment and ask it to continue (bounded; Claude Code parity).
+                finish = getattr(response.choices[0], "finish_reason", None)
+                if (finish in ("length", "max_tokens")
+                        and reply.strip()
+                        and getattr(self, "_continue_passes", 0) < 3):
+                    self._continue_passes = getattr(self, "_continue_passes", 0) + 1
+                    _log(f"Response clipped at max_tokens — auto-continuing "
+                         f"(pass {self._continue_passes}/3).")
+                    cont = {"role": "assistant", "content": reply}
+                    working_messages.append(cont)
+                    self.context.append(cont)
+                    nudge = {"role": "user", "content":
+                             "[Your previous message hit the output-length limit "
+                             "mid-thought. Continue exactly where you left off — "
+                             "do not repeat what you already wrote.]"}
+                    working_messages.append(nudge)
+                    self.context.append(nudge)
+                    continue
 
                 # Empty response retry
                 if not reply.strip():

@@ -64,41 +64,6 @@ def verify(secret: str, body: bytes, ts: str, sig: str, *, window: int = 30) -> 
     return hmac.compare_digest(sign(secret, body, ts), sig)
 
 
-# ── ngrok detection ──────────────────────────────────────────────────────
-# ngrok runs a local web API (default 127.0.0.1:4040) listing active tunnels.
-# We read it so a machine already fronted by ngrok can reuse that tunnel as its
-# public address instead of starting cloudflared.
-
-def detect_ngrok(prefer_port: int | None = None,
-                 api: str = "http://127.0.0.1:4040") -> tuple[str | None, int | None]:
-    """Find a running ngrok https tunnel. Returns (public_url, local_port) — the
-    port being the local address ngrok forwards to — or (None, None) if ngrok
-    isn't running / has no https tunnel. When ``prefer_port`` is given, a tunnel
-    forwarding to that port wins; otherwise the first https tunnel is used."""
-    def _addr_port(t: dict) -> int | None:
-        addr = (t.get("config") or {}).get("addr", "") or ""
-        tail = addr.rsplit(":", 1)[-1]
-        try:
-            return int(tail)
-        except (TypeError, ValueError):
-            return None
-    try:
-        with urllib.request.urlopen(api.rstrip("/") + "/api/tunnels", timeout=3) as r:
-            data = json.loads(r.read().decode() or "{}")
-    except Exception:
-        return None, None
-    https = [t for t in data.get("tunnels", [])
-             if str(t.get("public_url", "")).startswith("https://")]
-    if not https:
-        return None, None
-    if prefer_port is not None:
-        for t in https:
-            if _addr_port(t) == prefer_port:
-                return t["public_url"].rstrip("/"), prefer_port
-    t = https[0]
-    return t["public_url"].rstrip("/"), _addr_port(t)
-
-
 # ── cloudflared quick-tunnel ─────────────────────────────────────────────
 
 def _cloudflared_exe() -> str | None:
@@ -663,8 +628,9 @@ class _Handler(BaseHTTPRequestHandler):
         # ── File share ──
         elif self.path == "/files/manifest":
             try:
-                from core.file_share import local_manifest
-                self._reply(200, {"ok": True, "files": local_manifest()})
+                from core.file_share import local_manifest, load_tombstones
+                self._reply(200, {"ok": True, "files": local_manifest(),
+                                  "tombstones": load_tombstones()})
             except Exception as e:
                 self._reply(500, {"error": str(e)})
         elif self.path == "/files/get":
@@ -694,8 +660,8 @@ class NetworkManager:
         self.peers: list[dict] = []
         self.public_url: str = ""
         # When set, Familiar uses THIS as its public address instead of starting
-        # cloudflared — for machines already fronted by ngrok / a named tunnel /
-        # a reverse proxy that forwards to the inbound port.
+        # cloudflared — for machines already fronted by any tunnel or reverse
+        # proxy that forwards to the inbound port.
         self._public_url_override: str = ""
         self.on_sync = None                 # callback(dict) — inbound chat message
         self.on_remote_input = None         # callback(conv_id, text, reply_url) — a
@@ -761,8 +727,8 @@ class NetworkManager:
                     self._log(f"inbound server failed: {e}")
             url = ""
             if self._public_url_override:
-                # External tunnel (ngrok / named tunnel / proxy) already fronts
-                # the inbound port — use its URL and don't start cloudflared.
+                # An external tunnel/proxy already fronts the inbound port —
+                # use its URL and don't start cloudflared.
                 url = self._public_url_override
                 self._log(f"using external public address: {url}")
             elif inbound and auto_tunnel:

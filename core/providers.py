@@ -178,8 +178,11 @@ REASONING_LEVEL_LABELS = {
 
 def _claude_reasoning_levels(m: str) -> list[str]:
     import re
-    # Reasoning-capable Claude families (effort param OR extended-thinking budget).
-    if not re.search(r"(opus-4|sonnet-4|haiku-4-5|3-7-sonnet|claude-3\.7)", m):
+    # Every Claude from 3.7 on reasons (effort param OR extended-thinking
+    # budget). Blocklist the known legacy non-reasoning families instead of
+    # whitelisting new ones — a whitelist silently locks the UI to "None" the
+    # day a new model family ships.
+    if re.search(r"claude-(instant|2|3-(5-)?(haiku|sonnet|opus))(?!\d)", m):
         return ["off"]
     lv = ["off", "low", "medium", "high"]
     # The GA effort param (low|medium|high|max, +xhigh on Opus 4.7+) is supported
