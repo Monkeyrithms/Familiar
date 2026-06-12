@@ -15,6 +15,10 @@ from tools.registry import registry
 
 # Live plan state — keyed by conversation (only one active at a time)
 _current_plan: dict | None = None
+# Snapshot of the most recently finished plan. The UI's tool signal crosses
+# threads, so by the time it handles 'finish' the live plan may already be
+# cleared — this keeps the final state readable for the persisted card.
+_last_finished_plan: dict | None = None
 
 
 def get_current_plan() -> dict | None:
@@ -22,16 +26,22 @@ def get_current_plan() -> dict | None:
     return _current_plan
 
 
+def get_last_finished_plan() -> dict | None:
+    """Final state of the most recently finished plan (UI persistence)."""
+    return _last_finished_plan
+
+
 def clear_plan():
     """Clear the current plan (called on conversation switch)."""
-    global _current_plan
+    global _current_plan, _last_finished_plan
     _current_plan = None
+    _last_finished_plan = None
 
 
 def plan(action: str, title: str = "", steps: list = None,
          step_index: int = -1, status: str = "", label: str = "") -> str:
     """Manage an in-flight work plan."""
-    global _current_plan
+    global _current_plan, _last_finished_plan
 
     if action == "create":
         if not title:
@@ -84,6 +94,7 @@ def plan(action: str, title: str = "", steps: list = None,
         title = _current_plan["title"]
         done = sum(1 for s in _current_plan["steps"] if s["status"] == "done")
         total = len(_current_plan["steps"])
+        _last_finished_plan = _current_plan
         _current_plan = None
         return json.dumps({"finished": title, "completed": done, "total": total})
 
