@@ -59,6 +59,7 @@ def _git(args: list, shadow: Path, working_dir: str,
         r = subprocess.run(
             ["git"] + args,
             capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
             env=_git_env(shadow, working_dir),
             cwd=str(Path(working_dir).resolve()),
             creationflags=NO_WINDOW,  # no console flash on Windows
@@ -256,7 +257,10 @@ class CheckpointManager:
         ok, hash_out, _ = _git(["rev-parse", "HEAD"], shadow, working_dir)
         commit_hash = hash_out.strip() if ok else None
 
-        print(f"[Checkpoint] {working_dir}: {reason} ({commit_hash[:8] if commit_hash else '?'})")
+        try:
+            print(f"[Checkpoint] {working_dir}: {reason} ({commit_hash[:8] if commit_hash else '?'})")
+        except UnicodeEncodeError:
+            pass  # cp1252 console can't render the reason; the commit itself is fine
         return commit_hash
 
 

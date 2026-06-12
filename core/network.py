@@ -196,6 +196,7 @@ class _Cloudflared:
             if sys.platform == "win32":
                 out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                                      capture_output=True, text=True, timeout=5,
+                                     encoding="utf-8", errors="replace",
                                      creationflags=subprocess.CREATE_NO_WINDOW).stdout
                 return str(pid) in out
             os.kill(pid, 0)
