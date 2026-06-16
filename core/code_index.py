@@ -416,6 +416,28 @@ def _tokenize_query(query: str) -> list[str]:
     return [t for t in toks if len(t) > 1 and t.lower() not in stop]
 
 
+def _chunk_header(rel: str, chunk: Chunk) -> str:
+    """A one-line locator prepended to chunk text before embedding/indexing.
+
+    A bare function body embeds worse than the same body carrying its address:
+    file path, kind, and symbol name. "core/code_index.py > method _fuse_results"
+    pulls the chunk toward natural-language queries that mention the file, the
+    class, or the operation by name — same embedding model, richer input. It
+    also makes the path/symbol FTS-searchable, which feeds the symbol ranker.
+    Cheap: a few dozen chars of high-signal context per chunk."""
+    head = rel
+    if chunk.name:
+        head = f"{rel} \u203a {chunk.kind} {chunk.name}"
+    elif chunk.kind and chunk.kind != "text":
+        head = f"{rel} \u203a {chunk.kind}"
+    return head
+
+
+def _enrich_chunk_text(rel: str, chunk: Chunk) -> str:
+    """Header + body — what actually gets embedded, FTS-indexed, and stored."""
+    return f"# {_chunk_header(rel, chunk)}\n{chunk.text}"
+
+
 # ── The index itself ────────────────────────────────────────────────────
 
 # Default glob patterns — favor code + docs, skip binaries and dep trees.
@@ -609,7 +631,9 @@ class CodeIndex:
             def flush_batch():
                 if not batch_buf:
                     return
-                texts = [c.text for _, c in batch_buf]
+                # Embed header-enriched text (file > kind name + body) for better
+                # semantic recall; chunks.text stays raw for display + FTS.
+                texts = [_enrich_chunk_text(rel, c) for rel, c in batch_buf]
                 embeddings = embed_batch(texts)
                 for (rel, chunk), emb in zip(batch_buf, embeddings):
                     cur = conn.execute(
@@ -732,7 +756,8 @@ class CodeIndex:
                 (rel, mtime, content_hash, lang, time.time()),
             )
 
-            texts = [c.text for c in chunks]
+            # Enriched text for embeddings (see reindex.flush_batch); raw stored.
+            texts = [_enrich_chunk_text(rel, c) for c in chunks]
             embeddings = embed_batch(texts)
             embedded = 0
             for chunk, emb in zip(chunks, embeddings):
@@ -773,7 +798,7 @@ class CodeIndex:
 
     def search(self, query: str, limit: int = 10,
                kind_filter: str | None = None,
-               mode: str = "hybrid") -> list[dict]:
+               mode: str = "hybrid", rerank: bool | None = None) -> list[dict]:
         """Search indexed chunks. Modes:
 
             hybrid   — BM25 keyword + vector, fused via Reciprocal Rank Fusion.
@@ -783,13 +808,22 @@ class CodeIndex:
             keyword  — pure BM25. Best when you know an exact identifier.
 
         `kind_filter` restricts to functions / classes / etc.
+
+        `rerank`: run the cross-encoder precision stage over the fused pool
+        before trimming to `limit`. None (default) = on for hybrid/vector, since
+        that's where reordering helps; explicit True/False overrides. Pure
+        keyword mode skips it (nothing semantic to re-judge).
         """
         mode = (mode or "hybrid").lower()
+        if rerank is None:
+            rerank = mode in ("hybrid", "vector")
         conn = self._connect()
         try:
             conn.row_factory = sqlite3.Row
             # Pull a wider pool from each ranker before fusing, then trim to limit.
-            pool = max(limit * 4, 20)
+            # Reranking wants a wide recall net (cheap to pull, the cross-encoder
+            # re-judges it), so widen the pool when reranking is on.
+            pool = max(limit * 8, 50) if rerank else max(limit * 4, 20)
 
             vec_rows = (
                 self._vector_search(conn, query, pool, kind_filter)
@@ -799,10 +833,23 @@ class CodeIndex:
                 self._keyword_search(conn, query, pool, kind_filter)
                 if mode in ("hybrid", "keyword") else []
             )
+            sym_rows = (
+                self._symbol_search(conn, query, pool, kind_filter)
+                if mode in ("hybrid", "keyword") else []
+            )
         finally:
             conn.close()
 
-        return self._fuse_results(vec_rows, fts_rows, mode, limit)
+        # Fuse a wider pool when reranking, so the cross-encoder has real choice.
+        fuse_limit = max(pool, limit) if rerank else limit
+        fused = self._fuse_results(vec_rows, fts_rows, sym_rows, mode, fuse_limit)
+        if not rerank or len(fused) <= 1:
+            return fused[:limit]
+        try:
+            from core.reranker import rerank as _rerank
+            return _rerank(query, fused, limit)
+        except Exception:
+            return fused[:limit]
 
     @staticmethod
     def _vector_search(conn: sqlite3.Connection, query: str, pool: int,
@@ -857,12 +904,58 @@ class CodeIndex:
             return []
 
     @staticmethod
-    def _fuse_results(vec_rows: list, fts_rows: list, mode: str,
+    def _symbol_search(conn: sqlite3.Connection, query: str, pool: int,
+                       kind_filter: str | None) -> list[sqlite3.Row]:
+        """Match query tokens directly against chunk SYMBOL NAMES — the signal
+        pure semantic search throws away. "where is set_workspace defined" should
+        deterministically surface the chunk literally named `set_workspace`, not
+        hope cosine ranks it. Exact name match ranks above prefix match, which
+        ranks above substring; that ordering becomes the symbol ranker's rank
+        for RRF. Code-specific precision a prose embedder can't give you."""
+        tokens = [t for t in _tokenize_query(query) if len(t) > 2]
+        if not tokens:
+            return []
+        # Build a CASE so exact identifier hits sort before partial ones.
+        params = []
+        for t in tokens:
+            params.append(t)            # exact (case-insensitive via COLLATE)
+        exact_clause = " OR ".join(["c.name = ? COLLATE NOCASE"] * len(tokens))
+        like_params = []
+        like_clause_parts = []
+        for t in tokens:
+            like_clause_parts.append("c.name LIKE ? COLLATE NOCASE")
+            like_params.append(f"%{t}%")
+        like_clause = " OR ".join(like_clause_parts)
+        sql = f"""
+            SELECT c.id, c.file_path, c.text, c.line_start, c.line_end,
+                   c.kind, c.name,
+                   CASE WHEN {exact_clause} THEN 2 ELSE 1 END AS sym_rank
+            FROM chunks c
+            WHERE c.name IS NOT NULL AND c.name != ''
+              AND ({like_clause})
+        """
+        all_params: list = params + like_params
+        if kind_filter:
+            sql += " AND c.kind = ?"
+            all_params.append(kind_filter)
+        sql += " ORDER BY sym_rank DESC, LENGTH(c.name) ASC LIMIT ?"
+        all_params.append(pool)
+        try:
+            return conn.execute(sql, all_params).fetchall()
+        except Exception:
+            return []
+
+    @staticmethod
+    def _fuse_results(vec_rows: list, fts_rows: list, sym_rows: list, mode: str,
                       limit: int) -> list[dict]:
         """Reciprocal Rank Fusion: score = sum(1 / (k + rank_i)) across rankers.
         k=60 is the canonical RRF constant from the original paper. Works well
-        without needing to normalize vector cosine vs BM25 scales."""
+        without needing to normalize vector cosine vs BM25 vs symbol scales —
+        each ranker contributes by RANK, not raw score, so the three never need
+        a shared unit. Symbol matches get a weight >1 so a literal name hit
+        outranks a merely-similar chunk, which is what you want for "where is X"."""
         K_RRF = 60
+        SYM_WEIGHT = 2.0   # a literal symbol-name hit is strong evidence
 
         combined: dict[int, dict] = {}
 
@@ -870,7 +963,12 @@ class CodeIndex:
             cid = row["id"]
             entry = combined.setdefault(cid, {
                 "row": row, "rrf": 0.0,
-                "vec_score": round(1 - row["distance"], 4),
+                # sqlite-vec vec0 defaults to L2 (Euclidean) distance, and our
+                # embeddings are unit-normalized, so true cosine similarity is
+                # 1 - d^2/2 (NOT 1 - d). This is an absolute 0..1 relevance
+                # signal — unlike the relative RRF score — so callers can gate
+                # on it (see core/code_context pre-injection).
+                "vec_score": round(1 - (row["distance"] ** 2) / 2, 4),
                 "bm25_score": None,
             })
             entry["rrf"] += 1.0 / (K_RRF + rank + 1)
@@ -885,6 +983,15 @@ class CodeIndex:
             entry["rrf"] += 1.0 / (K_RRF + rank + 1)
             if entry["bm25_score"] is None:
                 entry["bm25_score"] = round(-row["bm25_score"], 4)
+
+        for rank, row in enumerate(sym_rows):
+            cid = row["id"]
+            entry = combined.setdefault(cid, {
+                "row": row, "rrf": 0.0,
+                "vec_score": None, "bm25_score": None,
+            })
+            entry["rrf"] += SYM_WEIGHT / (K_RRF + rank + 1)
+            entry["symbol_hit"] = True
 
         ranked = sorted(
             combined.values(), key=lambda e: e["rrf"], reverse=True
@@ -903,6 +1010,7 @@ class CodeIndex:
                 "score": round(entry["rrf"], 4),
                 "vec_score": entry["vec_score"],
                 "bm25_score": entry["bm25_score"],
+                "symbol_hit": entry.get("symbol_hit", False),
                 "mode": mode,
             })
         return out
@@ -928,6 +1036,20 @@ class CodeIndex:
             "db_size_mb": round(size_bytes / (1024 * 1024), 2),
         }
 
+    def indexed_files(self) -> set[str]:
+        """Return the set of absolute file paths currently in this index.
+        Used by the explore_files vector pre-pass to skip fanning out cheap
+        summarizers over files the index already covers."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT path FROM files").fetchall()
+        except Exception:
+            return set()
+        finally:
+            conn.close()
+        root = Path(self.root)
+        return {str((root / r[0]).resolve()) for r in rows}
+
     def delete(self) -> None:
         """Remove the index database file and the registry entry."""
         registry.delete(self.name)
@@ -943,6 +1065,51 @@ def open_index(name: str) -> CodeIndex | None:
         if ws["name"] == name:
             return CodeIndex(name, ws["root_path"])
     return None
+
+
+# ── Auto-index a workspace on first entry ──────────────────────────────
+
+_autoindex_lock = threading.Lock()
+_autoindexing: set[str] = set()
+
+
+def ensure_workspace_indexed(name: str, root: str) -> bool:
+    """Build a workspace's code index in the background if it has never been
+    indexed. Returns True if a build was kicked off, False if one already
+    exists (or is already running). Non-blocking: the actual reindex runs on
+    a daemon thread. Idempotent and safe to call on every workspace switch.
+
+    Freshness after the first build is maintained by the file.changed event
+    bus (see schedule_autoindex), so this only fires for missing indexes."""
+    if not name or not root:
+        return False
+    abs_root = os.path.abspath(root)
+    if not os.path.isdir(abs_root):
+        return False
+
+    # Already indexed? registry stamps last_indexed on every reindex().
+    for ws in registry.list_all():
+        if ws["name"] == name and ws.get("last_indexed"):
+            return False
+
+    with _autoindex_lock:
+        if name in _autoindexing:
+            return False
+        _autoindexing.add(name)
+
+    def _build() -> None:
+        try:
+            registry.register(name, abs_root)
+            CodeIndex(name, abs_root).reindex()
+        except Exception as e:
+            print(f"[code_index] auto-index of {name!r} failed: {e}")
+        finally:
+            with _autoindex_lock:
+                _autoindexing.discard(name)
+
+    t = threading.Thread(target=_build, daemon=True)
+    t.start()
+    return True
 
 
 # ── Auto-index on file.changed (event-bus subscriber) ──────────────────

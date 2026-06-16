@@ -199,6 +199,12 @@ def init_conversations_db():
         )
     except Exception:
         pass
+    try:
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN composer_pastes_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    except Exception:
+        pass
     # prompt_replace: when 1, the conversation prompt REPLACES the base system
     # prompt instead of layering on top of it (per-conversation total control).
     try:
@@ -838,8 +844,8 @@ def load_conversation(conv_id: str) -> dict | None:
     # turned a sub-millisecond row fetch into a ~500ms stall on every switch.
     row = conn.execute(
         "SELECT name, workspace, model, provider, system_prompt, streams_json, "
-        "include_timestamps, conversation_cwd, composer_draft, reflect_json, "
-        "stream_live, context_note, prompt_replace, reasoning_effort "
+        "include_timestamps, conversation_cwd, composer_draft, composer_pastes_json, "
+        "reflect_json, stream_live, context_note, prompt_replace, reasoning_effort "
         "FROM conversations WHERE id=?", (conv_id,)).fetchone()
     if not row:
         conn.close()
@@ -936,6 +942,13 @@ def load_conversation(conv_id: str) -> dict | None:
     except (KeyError, IndexError):
         composer_draft = ""
     try:
+        composer_pastes_raw = row["composer_pastes_json"] or "[]"
+        composer_pastes = json.loads(composer_pastes_raw) if composer_pastes_raw else []
+        if not isinstance(composer_pastes, list):
+            composer_pastes = []
+    except (KeyError, IndexError, json.JSONDecodeError, ValueError, TypeError):
+        composer_pastes = []
+    try:
         reflect_raw = row["reflect_json"] if "reflect_json" in row.keys() else ""
         reflect = json.loads(reflect_raw) if reflect_raw else {}
     except (KeyError, IndexError, json.JSONDecodeError, ValueError):
@@ -965,6 +978,7 @@ def load_conversation(conv_id: str) -> dict | None:
                          if "context_note" in row.keys() else "") or "",
         "conversation_cwd": conv_cwd,
         "composer_draft": composer_draft,
+        "composer_pastes": composer_pastes,
         "reflect": reflect,
         "stream_live": stream_live,
         "reasoning_effort": reasoning_effort,
@@ -1160,6 +1174,7 @@ def set_conversation_composer_draft(conv_id: str, text: str) -> None:
 import threading as _threading
 
 _draft_latest: dict[str, str] = {}
+_pastes_latest: dict[str, str] = {}
 _draft_lock = _threading.Lock()
 _draft_wake = _threading.Event()
 _draft_worker_started = False
@@ -1171,13 +1186,20 @@ def _draft_save_worker() -> None:
         _draft_wake.wait()
         _draft_wake.clear()
         with _draft_lock:
-            snapshot = dict(_draft_latest)
+            draft_snapshot = dict(_draft_latest)
+            pastes_snapshot = dict(_pastes_latest)
             _draft_latest.clear()
-        for conv_id, text in snapshot.items():
+            _pastes_latest.clear()
+        for conv_id, text in draft_snapshot.items():
             try:
                 set_conversation_composer_draft(conv_id, text)
             except Exception as e:
                 print(f"[draft worker] {conv_id}: {e}")
+        for conv_id, payload in pastes_snapshot.items():
+            try:
+                set_conversation_composer_pastes(conv_id, json.loads(payload))
+            except Exception as e:
+                print(f"[pastes worker] {conv_id}: {e}")
 
 
 def _ensure_draft_worker() -> None:
@@ -1200,6 +1222,50 @@ def enqueue_composer_draft_save(conv_id: str, text: str) -> None:
     _ensure_draft_worker()
     with _draft_lock:
         _draft_latest[conv_id] = text
+    _draft_wake.set()
+
+
+def get_conversation_composer_pastes(conv_id: str) -> list:
+    """Return saved pending paste blocks for *conv_id*, or []."""
+    if not conv_id:
+        return []
+    conn = _conv_conn()
+    row = conn.execute(
+        "SELECT composer_pastes_json FROM conversations WHERE id=?", (conv_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return []
+    try:
+        raw = row["composer_pastes_json"] or "[]"
+        pastes = json.loads(raw) if raw else []
+        return pastes if isinstance(pastes, list) else []
+    except (KeyError, IndexError, json.JSONDecodeError, ValueError, TypeError):
+        return []
+
+
+def set_conversation_composer_pastes(conv_id: str, pastes: list) -> None:
+    """Persist pending paste blocks for *conv_id* (per-conversation composer)."""
+    if not conv_id:
+        return
+    payload = json.dumps(pastes or [])
+    with _conv_write_lock:
+        conn = _conv_conn()
+        conn.execute(
+            "UPDATE conversations SET composer_pastes_json=? WHERE id=?",
+            (payload, conv_id),
+        )
+        conn.commit()
+        conn.close()
+
+
+def enqueue_composer_pastes_save(conv_id: str, pastes: list) -> None:
+    """Non-blocking save of pending paste blocks (coalesced on the draft worker)."""
+    if not conv_id:
+        return
+    _ensure_draft_worker()
+    with _draft_lock:
+        _pastes_latest[conv_id] = json.dumps(pastes or [])
     _draft_wake.set()
 
 

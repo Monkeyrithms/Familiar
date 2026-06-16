@@ -24,6 +24,21 @@ _DEFAULT_DIMS = 1536  # text-embedding-3-small default
 _EMBED_CACHE: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
 _EMBED_CACHE_MAX = 2048
 
+# Active retrieval policy, resolved from the conversation's subscribed memory
+# stream(s) by the agent. When set, it OVERRIDES the disk-config kill switch:
+# the stream is the authority over whether embeddings run. None => use disk
+# config (the original behavior). Keys: vector_enabled (bool),
+# conversation_embeddings (bool).
+_ACTIVE_POLICY: "Optional[dict]" = None
+
+
+def set_active_retrieval_policy(policy: "Optional[dict]") -> None:
+    """Install (or clear, with None) the per-conversation retrieval policy that
+    the embedding kill switch honors. Called by the agent whenever the
+    conversation's stream subscription changes."""
+    global _ACTIVE_POLICY
+    _ACTIVE_POLICY = policy
+
 
 def _cache_get(model: str, text: str):
     key = (model, text)
@@ -138,6 +153,16 @@ def _embeddings_enabled(purpose: str = "general") -> bool:
 
     Code index calls (purpose='code') are always allowed unless the master
     is off — they only fire on actual file edits, not every turn."""
+    # Active-stream override takes precedence over disk config: the subscribed
+    # memory stream(s) are the authority over whether we embed at all and
+    # whether per-turn conversation embeddings run. Set by the agent whenever
+    # the conversation's stream subscription changes; None => fall back to disk.
+    if _ACTIVE_POLICY is not None:
+        if not _ACTIVE_POLICY.get("vector_enabled", True):
+            return False
+        if purpose == "conversation":
+            return bool(_ACTIVE_POLICY.get("conversation_embeddings", False))
+        return True
     try:
         if CONFIG_PATH.exists():
             cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))

@@ -661,6 +661,17 @@ class Agent:
 
     def set_workspace(self, name: str):
         self._workspace_name = name
+        # Kick off a one-time background code-index build the first time we
+        # enter a workspace, so semantic search / vector-first explore have a
+        # warm index without the user asking. No-op if already indexed; the
+        # file.changed event bus keeps it fresh afterward.
+        # Gated by the active stream's retrieval policy (auto_index).
+        try:
+            if self._resolve_retrieval_policy().get("auto_index", True):
+                from core.code_index import ensure_workspace_indexed
+                ensure_workspace_indexed(name, self.workspace_path)
+        except Exception as e:
+            _log(f"auto-index on workspace switch failed: {e}")
 
     def set_conv_id(self, conv_id: str):
         """Identify which conversation the agent is operating in — required so
@@ -759,6 +770,36 @@ class Agent:
         self.set_conversation_cwd(p)
         _log(f"Pinned conversation cwd -> {p}")
 
+    def _mark_retrieval_outcome(self, tool_name: str, args: dict):
+        """Close the retrieval feedback loop: when the agent actually reads or
+        edits a file, flip the `used` flag on any chunk we pre-injected from
+        that file this turn. Retrieved-AND-used = a positive training pair;
+        retrieved-but-ignored = a soft negative. Best-effort telemetry only —
+        never raises, never affects the turn."""
+        turn_id = getattr(self, "_last_retrieval_turn_id", "")
+        if not turn_id:
+            return
+        if tool_name not in ("file_read", "file_edit", "file_write",
+                             "file_show", "apply_patch", "multi_file_write"):
+            return
+        paths: list[str] = []
+        for key in ("path", "file_path", "file"):
+            v = args.get(key)
+            if isinstance(v, str) and v:
+                paths.append(v)
+        # multi_file_write carries a list of {path, content}
+        if isinstance(args.get("files"), list):
+            for f in args["files"]:
+                if isinstance(f, dict) and isinstance(f.get("path"), str):
+                    paths.append(f["path"])
+        if not paths:
+            return
+        try:
+            from core.retrieval_feedback import mark_used
+            mark_used(turn_id, set(paths))
+        except Exception:
+            pass
+
     def set_provider(self, provider: str):
         self._provider_override = provider
 
@@ -786,6 +827,73 @@ class Agent:
         """Set which memory streams this conversation is subscribed to.
         Accepts list of strings (legacy) or list of dicts with read/write flags."""
         self._conversation_streams = streams
+        # The subscribed stream(s) are the authority over retrieval. Resolve the
+        # effective policy now and push the embeddings half down to the kill
+        # switch so per-turn memory/message embedding honors the stream.
+        try:
+            from core.embeddings import set_active_retrieval_policy
+            pol = self._resolve_retrieval_policy()
+            set_active_retrieval_policy({
+                "vector_enabled": pol["vector_enabled"],
+                "conversation_embeddings": pol["conversation_embeddings"],
+            })
+        except Exception as e:
+            _log(f"set_active_retrieval_policy failed: {e}")
+
+    # Capability keys carried per-stream under memory_streams[i]["retrieval"].
+    _RETRIEVAL_DEFAULTS = {
+        "vector_enabled": True,           # use vector/semantic search at all
+        "conversation_embeddings": False, # per-turn message/memory embedding
+        "code_preinject": False,          # proactive Cursor-style injection
+        "code_preinject_threshold": 0.42,
+        "auto_index": True,               # index workspace on entry
+        "expand_calls": False,            # call-graph neighbors around hits
+        "hyde": False,                    # hypothetical-answer query rewrite
+    }
+
+    def _resolve_retrieval_policy(self) -> dict:
+        """Fold the conversation's READABLE subscribed streams into one effective
+        retrieval policy. Semantics: a capability is ON if ANY readable stream
+        enables it (most-permissive wins); the pre-inject threshold is the MIN
+        across streams that enable pre-injection (most eager). Streams with no
+        explicit 'retrieval' block fall back to global config so existing setups
+        keep working unchanged."""
+        cfg = load_config()
+        glob = {
+            "vector_enabled": bool(cfg.get("embeddings_enabled", True)),
+            "conversation_embeddings": bool(cfg.get("conversation_embeddings_enabled", False)),
+            "code_preinject": bool(cfg.get("code_preinject_enabled", False)),
+            "code_preinject_threshold": float(cfg.get("code_preinject_threshold", 0.42)),
+            "auto_index": bool(cfg.get("auto_index_on_open", True)),
+            "expand_calls": bool(cfg.get("code_expand_calls", False)),
+            "hyde": bool(cfg.get("code_hyde", False)),
+        }
+        stream_map = {s["name"]: s for s in cfg.get("memory_streams", [])}
+        readable = self.get_readable_streams()
+        policies = []
+        for name in readable:
+            s = stream_map.get(name)
+            if s and isinstance(s.get("retrieval"), dict):
+                policies.append(s["retrieval"])
+        if not policies:
+            return glob
+
+        def _any(key, default):
+            return any(bool(p.get(key, default)) for p in policies)
+
+        thresholds = [
+            float(p.get("code_preinject_threshold", glob["code_preinject_threshold"]))
+            for p in policies if bool(p.get("code_preinject", False))
+        ]
+        return {
+            "vector_enabled": _any("vector_enabled", glob["vector_enabled"]),
+            "conversation_embeddings": _any("conversation_embeddings", glob["conversation_embeddings"]),
+            "code_preinject": _any("code_preinject", glob["code_preinject"]),
+            "code_preinject_threshold": min(thresholds) if thresholds else glob["code_preinject_threshold"],
+            "auto_index": _any("auto_index", glob["auto_index"]),
+            "expand_calls": _any("expand_calls", glob["expand_calls"]),
+            "hyde": _any("hyde", glob["hyde"]),
+        }
 
     def _get_stream_configs(self) -> list[dict]:
         """Resolve full stream configs for the current conversation's subscribed streams.
@@ -1822,6 +1930,52 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                 "content": _wrap_fragment("recall_notes", recall_body),
             })
 
+        # Proactive code-context pre-injection (Cursor-style). Runs a vector
+        # query over the active workspace index and injects the most relevant
+        # chunks ONLY when the top cosine similarity clears a threshold — so
+        # off-topic turns pay nothing. Off by default (code_preinject_enabled);
+        # transient, fragment-wrapped so it never enters summaries/memory.
+        try:
+            from core.code_context import gather as _gather_code_ctx
+            from core.fragments import wrap as _wrap_fragment
+            _pol = self._resolve_retrieval_policy()
+            # HyDE uses the cheap summary model/provider, lazily — only built if
+            # the policy turns it on. Fail-safe inside gather() on any error.
+            _hyde_client, _hyde_model = None, ""
+            if _pol.get("hyde"):
+                try:
+                    routes = self._get_summary_routes()
+                    if routes:
+                        _hyde_model = routes[0].get("model", "")
+                        _hyde_client = get_client(routes[0].get("provider", self.provider))
+                except Exception:
+                    _hyde_client, _hyde_model = None, ""
+            # Turn id correlates this turn's retrievals with their later usage
+            # (retrieval_feedback). Stable within a turn, unique across turns.
+            _turn_id = f"{self._workspace_name}:{len(self.context)}:{int(time.time())}"
+            self._last_retrieval_turn_id = _turn_id
+            _code_ctx = _gather_code_ctx(
+                user_message or "", self.workspace_path,
+                enabled=_pol["code_preinject"],
+                threshold=_pol["code_preinject_threshold"],
+                limit=int(load_config().get("code_preinject_limit", 5)),
+                vector_enabled=_pol["vector_enabled"],
+                expand_calls=_pol.get("expand_calls", False),
+                hyde=_pol.get("hyde", False),
+                hyde_client=_hyde_client, hyde_model=_hyde_model,
+                turn_id=_turn_id,
+                log=_log,
+            )
+            if _code_ctx:
+                safe_ctx = _accept_recall("code_context", _code_ctx)
+                if safe_ctx is not None:
+                    working_messages.insert(-1, {
+                        "role": "system",
+                        "content": _wrap_fragment("code_context", safe_ctx),
+                    })
+        except Exception as e:
+            _log(f"code-preinject error: {e}")
+
         # Context-aware clarification mode. When the user opens with a
         # non-trivial coding task, inject a one-shot interview prompt
         # telling the model to lock down scope/success/constraints/edges
@@ -2147,6 +2301,10 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
                 # write-type ops outside workspace-root. Runs AFTER path
                 # normalization so we pin the resolved absolute path.
                 self._maybe_pin_conversation_cwd(name, args)
+                # Retrieval feedback outcome: if the agent reads/edits a file
+                # this turn, mark any chunk we pre-injected from that file as
+                # "used" — the positive signal for future fine-tuning.
+                self._mark_retrieval_outcome(name, args)
                 # For glob — if the path doesn't exist, fall back to workspace.
                 # Models sometimes pass a workspace NAME or partial path.
                 if name == "glob" and "path" in args:

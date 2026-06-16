@@ -26,6 +26,7 @@ FRAGMENTS: dict[str, tuple[str, str]] = {
     "project_survey":    ("<<<PROJECT_SURVEY>>>",    "<<<END_PROJECT_SURVEY>>>"),
     "clarification":     ("<<<CLARIFICATION>>>",     "<<<END_CLARIFICATION>>>"),
     "reflection":        ("<<<REFLECTION>>>",        "<<<END_REFLECTION>>>"),
+    "code_context":      ("<<<CODE_CONTEXT>>>",      "<<<END_CODE_CONTEXT>>>"),
 }
 
 # Pre-compiled regex that matches any fragment block (DOTALL for newlines)
