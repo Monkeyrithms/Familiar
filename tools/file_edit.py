@@ -11,29 +11,40 @@ from pathlib import Path
 from tools.registry import registry
 
 
-# ── Levenshtein distance (standard DP matrix) ──────────────────────────
+# ── Levenshtein distance ───────────────────────────────────────────────
+# Prefer rapidfuzz's C++/SIMD implementation (orders of magnitude faster on
+# the per-line comparisons the block-anchor strategy makes); fall back to a
+# pure-Python two-row DP when rapidfuzz isn't installed.
 
-def _levenshtein(a: str, b: str) -> int:
-    """Compute the Levenshtein edit distance between two strings."""
-    la, lb = len(a), len(b)
-    if la == 0:
-        return lb
-    if lb == 0:
-        return la
-    # Use two-row optimization to save memory
-    prev = list(range(lb + 1))
-    curr = [0] * (lb + 1)
-    for i in range(1, la + 1):
-        curr[0] = i
-        for j in range(1, lb + 1):
-            cost = 0 if a[i - 1] == b[j - 1] else 1
-            curr[j] = min(
-                prev[j] + 1,       # deletion
-                curr[j - 1] + 1,   # insertion
-                prev[j - 1] + cost  # substitution
-            )
-        prev, curr = curr, prev
-    return prev[lb]
+try:
+    from rapidfuzz.distance import Levenshtein as _rf_levenshtein
+
+    def _levenshtein(a: str, b: str) -> int:
+        """Levenshtein edit distance (rapidfuzz-backed)."""
+        return _rf_levenshtein.distance(a, b)
+
+except ImportError:  # pragma: no cover - depends on environment
+
+    def _levenshtein(a: str, b: str) -> int:
+        """Levenshtein edit distance (pure-Python two-row DP)."""
+        la, lb = len(a), len(b)
+        if la == 0:
+            return lb
+        if lb == 0:
+            return la
+        prev = list(range(lb + 1))
+        curr = [0] * (lb + 1)
+        for i in range(1, la + 1):
+            curr[0] = i
+            for j in range(1, lb + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                curr[j] = min(
+                    prev[j] + 1,        # deletion
+                    curr[j - 1] + 1,    # insertion
+                    prev[j - 1] + cost  # substitution
+                )
+            prev, curr = curr, prev
+        return prev[lb]
 
 
 # ── Replacement strategies (generators yielding candidate match strings) ─

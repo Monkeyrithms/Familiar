@@ -15,11 +15,23 @@ import json
 import os
 import subprocess
 import shutil
+import time
 from pathlib import Path
 from tools.registry import registry
 from core.proc import NO_WINDOW
 
 DEFAULT_MAX_RESULTS = 300
+
+# Dependency / build / cache dirs to skip by default. ripgrep already honors
+# .gitignore, but a virtualenv's site-packages is usually NOT gitignored, and
+# searching it floods stdout with tens of thousands of matches — the pure-Python
+# JSON parse below then holds the GIL long enough to stutter the GUI. Excluding
+# these keeps grep fast and consistent with the glob tool's IGNORE_DIRS.
+_DEFAULT_EXCLUDES = (
+    "node_modules", "site-packages", "site-packages64", "__pycache__",
+    "dist", "build", ".next", ".nuxt", "coverage", ".pytest_cache",
+    ".cache", ".tox", ".mypy_cache",
+)
 # Default cap on MATCHES reported per file — keeps one busy file from eating the
 # whole result budget so matches stay spread across files. Unlike the old hard
 # 15, this is adjustable AND surfaced when hit (see the "+N more" notes).
@@ -98,6 +110,10 @@ def grep(pattern: str, path: str = None, glob: str = None,
         cmd.extend(["-U", "--multiline-dotall"])
     if context > 0:
         cmd.extend(["-C", str(context)])
+    # Default excludes (exclusive globs — they prune without forcing
+    # "include-only" mode, so a user-supplied `glob` still works on top).
+    for _ex in _DEFAULT_EXCLUDES:
+        cmd.extend(["--glob", f"!**/{_ex}/**"])
     if glob:
         cmd.extend(["--glob", glob])
     cmd.extend([pattern, search_path])
@@ -127,7 +143,11 @@ def grep(pattern: str, path: str = None, glob: str = None,
     # context lines can be interleaved with their matches per file.
     matches_by_file: dict[str, list[dict]] = {}
     match_count_by_file: dict[str, int] = {}
-    for line in result.stdout.splitlines():
+    for _i, line in enumerate(result.stdout.splitlines()):
+        # A large search yields a lot of JSON; parsing it is pure-Python and
+        # holds the GIL. Breathe periodically so the GUI thread isn't starved.
+        if _i % 4000 == 0:
+            time.sleep(0)
         if not line.strip():
             continue
         try:

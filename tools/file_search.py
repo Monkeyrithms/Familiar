@@ -16,6 +16,8 @@ import json
 import os
 from pathlib import Path
 from tools.registry import registry
+from tools.fast_walk import list_files
+from tools._json import dumps as _fast_dumps
 
 DEFAULT_MAX_RESULTS = 30
 IGNORE_DIRS = {
@@ -104,26 +106,17 @@ def file_search(query: str, path: str = None, max_results: int = None,
     if case_sensitive is None:
         case_sensitive = any(c.isupper() for c in query)
 
-    # Collect candidates
-    candidates: list[str] = []
-    hit_cap = False
-    for dirpath, dirnames, filenames in os.walk(search_root):
-        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS and not d.startswith(".")]
-        for fname in filenames:
-            ext = os.path.splitext(fname)[1].lower()
-            if ext in IGNORE_EXTS:
-                continue
-            full = os.path.join(dirpath, fname)
-            try:
-                rel = os.path.relpath(full, search_root).replace("\\", "/")
-            except ValueError:
-                rel = full
-            candidates.append(rel)
-            if len(candidates) >= MAX_CANDIDATES:
-                hit_cap = True
-                break
-        if len(candidates) >= MAX_CANDIDATES:
-            break
+    # Collect candidates via ripgrep's fast, gitignore-aware walk (runs in a
+    # subprocess, so it releases the GIL instead of stalling the GUI thread the
+    # way a large pure-Python os.walk does). Falls back to os.walk if rg is
+    # absent. Hidden dirs/files are skipped, matching the prior behavior.
+    all_files = list_files(search_root, ignore_dirs=IGNORE_DIRS, hidden=False,
+                           max_files=MAX_CANDIDATES)
+    hit_cap = len(all_files) >= MAX_CANDIDATES
+    candidates: list[str] = [
+        rel for rel in all_files
+        if os.path.splitext(rel)[1].lower() not in IGNORE_EXTS
+    ]
 
     # Score and sort
     scored: list[tuple[float, str]] = []
@@ -149,14 +142,14 @@ def file_search(query: str, path: str = None, max_results: int = None,
     if len(scored) > max_results:
         output += f"\n\n(showing top {max_results} of {len(scored)} matches)"
 
-    return json.dumps({
+    return _fast_dumps({
         "results": output,
         "count": len(top),
         "total_matched": len(scored),
         "searched": len(candidates),
         "truncated": hit_cap,
         "root": str(search_root),
-    }, ensure_ascii=False)
+    })
 
 
 registry.register(

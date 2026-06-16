@@ -4,8 +4,38 @@ Supports GET/POST/PUT/DELETE/PATCH with headers, auth, and JSON body.
 """
 
 import json
+import re
 import httpx
 from tools.registry import registry
+
+try:
+    from selectolax.parser import HTMLParser as _HTMLParser
+    _HAVE_SELECTOLAX = True
+except ImportError:  # pragma: no cover - depends on environment
+    _HAVE_SELECTOLAX = False
+
+
+def _html_to_text(html: str) -> str:
+    """Strip HTML to readable text.
+
+    Prefers selectolax (a fast C/Lexbor parser that walks the real DOM and
+    drops script/style/nav cleanly); falls back to regex stripping when it
+    isn't installed.
+    """
+    if _HAVE_SELECTOLAX:
+        try:
+            tree = _HTMLParser(html)
+            for tag in tree.css("script, style, noscript, template, svg"):
+                tag.decompose()
+            body = tree.body or tree.root
+            text = body.text(separator=" ", strip=True) if body else ""
+            return re.sub(r"\s+", " ", text).strip()
+        except Exception:
+            pass  # fall through to regex
+    text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def http_request(method: str, url: str, headers: dict = None,
@@ -43,12 +73,7 @@ def http_request(method: str, url: str, headers: dict = None,
 
         # Extract clean text from HTML (replaces old web_fetch behavior)
         if extract_text:
-            import re
-            html = resp.text
-            text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
-            text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'\s+', ' ', text).strip()
+            text = _html_to_text(resp.text)
             return redact(json.dumps({
                 "status": resp.status_code,
                 "text": text[:15000],

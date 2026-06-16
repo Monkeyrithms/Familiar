@@ -22,15 +22,27 @@ from pathlib import Path
 
 # Subprocess linters for non-Python languages. {file} is replaced with the path.
 # Python is handled separately by _check_python so we can use ast + ruff/pyflakes.
+# JS/TS is handled separately by _check_js_ts (Rust-tool cascade).
 LINTERS = {
-    ".js":   ["node", "--check", "{file}"],
-    ".ts":   ["npx", "tsc", "--noEmit", "--pretty", "{file}"],
-    ".tsx":  ["npx", "tsc", "--noEmit", "--pretty", "--jsx", "react-jsx", "{file}"],
     ".go":   ["go", "vet", "{file}"],
     ".rs":   ["rustfmt", "--check", "{file}"],
     ".rb":   ["ruby", "-c", "{file}"],
     ".sh":   ["bash", "-n", "{file}"],
 }
+
+# JS/TS extensions, checked via a fastest-available cascade.
+_JS_TS_EXTS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}
+
+# Shared cascade: prefer the Rust-based linters (biome, oxlint) which are ~100x
+# faster than spinning up Node per file. First binary found on PATH wins.
+_JS_TS_FAST = [
+    ["biome", "lint", "--colors=off", "--max-diagnostics=20", "{file}"],
+    ["oxlint", "--no-ignore", "{file}"],
+]
+# Type-aware fallback for TypeScript (slow: Node startup + typecheck per file).
+_TS_FALLBACK = ["npx", "tsc", "--noEmit", "--pretty", "false", "{file}"]
+# Syntax-only fallback for plain JS.
+_JS_FALLBACK = ["node", "--check", "{file}"]
 
 TIMEOUT = 30  # seconds
 
@@ -337,6 +349,30 @@ def _check_generic(path: str, cmd_template: list[str]) -> dict:
     }]}
 
 
+# ── JS / TS cascade ─────────────────────────────────────────────────────
+
+def _check_js_ts(path: str, ext: str) -> dict:
+    """Lint a JS/TS file with the fastest available tool.
+
+    Tries biome → oxlint (Rust, millisecond-class) first, then falls back to
+    `tsc` (TS) or `node --check` (JS). Returns a skipped result if nothing is
+    installed rather than a hard error — JS/TS tooling is optional.
+    """
+    cascade = list(_JS_TS_FAST)
+    cascade.append(_TS_FALLBACK if ext in {".ts", ".tsx", ".mts", ".cts"}
+                   else _JS_FALLBACK)
+
+    for cmd in cascade:
+        if _is_available(cmd[0]):
+            return _check_generic(path, cmd)
+
+    return {
+        "ok": True, "diagnostics": [], "skipped": True,
+        "reason": ("No JS/TS linter found. Install biome or oxlint for fast "
+                   "checks (npm i -g @biomejs/biome), or tsc/node."),
+    }
+
+
 # ── Public API ──────────────────────────────────────────────────────────
 
 def lint_file(path: str) -> dict | None:
@@ -353,6 +389,8 @@ def lint_file(path: str) -> dict | None:
     ext = Path(path).suffix.lower()
     if ext in {".py", ".pyi"}:
         return _check_python(path)
+    if ext in _JS_TS_EXTS:
+        return _check_js_ts(path, ext)
     cmd_template = LINTERS.get(ext)
     if not cmd_template:
         return None
@@ -610,7 +648,8 @@ try:
         description=(
             "Syntax + semantic check.\n"
             "- .py: ast.parse → ruff (preferred) | pyflakes (fallback). Catches missing imports, undefined names, indent errors.\n"
-            "- .js/.ts/.tsx/.go/.rs/.rb/.sh: language-native check.\n"
+            "- .js/.ts/.tsx: biome|oxlint (fast) → tsc|node fallback.\n"
+            "- .go/.rs/.rb/.sh: language-native check.\n"
             "- → {ok, diagnostics:[{source,severity,line,code,message}]} | {skipped:true}."
         ),
         parameters={

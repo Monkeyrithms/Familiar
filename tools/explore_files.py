@@ -192,6 +192,46 @@ def _parse_delimited(raw: str, expected_paths: list) -> dict:
     return results
 
 
+def _vector_prepass(query: str, files: list, ctx) -> tuple:
+    """Vector-first retrieval over the active workspace's code index.
+
+    Returns (index_hits, residual_files):
+      index_hits     — list of chunk dicts the semantic index already answered
+                       (file/lines/kind/name/text), or [] if no index.
+      residual_files — the subset of *files* NOT covered by the index, i.e. the
+                       only ones worth fanning cheap summarizers out over.
+
+    Cursor's trick: answer from the pre-built index first, fan out only over
+    the long tail. On a miss (no index / embeddings off / error) this degrades
+    cleanly to "every file is residual" — identical to the old behavior.
+    """
+    try:
+        from core.code_index import registry as ws_registry, open_index
+    except Exception:
+        return [], files
+
+    root = getattr(ctx, "cwd", "") if ctx else ""
+    if not root:
+        return [], files
+    ws = ws_registry.find_for_file(root)
+    if not ws or not ws.get("last_indexed"):
+        return [], files
+    idx = open_index(ws["name"])
+    if not idx:
+        return [], files
+
+    try:
+        index_hits = idx.search(query, limit=12)
+    except Exception:
+        return [], files
+
+    covered = idx.indexed_files()
+    if not covered:
+        return index_hits, files
+    residual = [f for f in files if str(f.resolve()) not in covered]
+    return index_hits, residual
+
+
 def explore_files(action: str, patterns: list = None, query: str = "",
                    batch_tokens: int = 20000, ignore: list = None,
                    job_id: str = "", ctx=None) -> str:
@@ -213,7 +253,32 @@ def explore_files(action: str, patterns: list = None, query: str = "",
                 "hint": "Default ignores: __pycache__, .git, node_modules, .venv, *.pyc, lockfiles, binaries, images.",
             })
 
-        batches = _pack_batches(files, budget_tokens=max(1000, batch_tokens))
+        # Vector-first: let the pre-built workspace index answer what it can,
+        # then only fan summarizers out over files it doesn't already cover.
+        index_hits, residual = _vector_prepass(query, files, ctx)
+        prepass = {
+            "index_hits": len(index_hits),
+            "files_total": len(files),
+            "files_fanned_out": len(residual),
+        }
+
+        # Index already covers every matched file — no fan-out needed. Return
+        # the semantic hits directly as a completed job.
+        if index_hits and not residual:
+            return json.dumps({
+                "status": "completed",
+                "source": "vector_index",
+                "files_summarized": 0,
+                "prepass": prepass,
+                "index_hits": index_hits,
+                "message": (
+                    f"Answered from the workspace index ({len(index_hits)} "
+                    f"chunks) — all {len(files)} matched files were already "
+                    f"indexed, so no summarizer fan-out was needed."
+                ),
+            }, ensure_ascii=False)
+
+        batches = _pack_batches(residual, budget_tokens=max(1000, batch_tokens))
 
         orch = get_orchestrator()
         orch._workspace = ctx.cwd if ctx else ""
@@ -243,14 +308,29 @@ def explore_files(action: str, patterns: list = None, query: str = "",
 
         threading.Thread(target=_run, daemon=True).start()
 
+        # Stash the semantic hits on the orchestrator so action='wait' can fold
+        # them into the final result alongside the summarizer output.
+        try:
+            orch._index_hits = index_hits
+            orch._prepass = prepass
+        except Exception:
+            pass
+
+        hit_msg = (
+            f" {len(index_hits)} chunks pre-answered from the workspace index;"
+            if index_hits else ""
+        )
         return json.dumps({
             "job_id": orch._job_id,
             "status": "dispatched",
             "files_total": len(files),
             "batches": len(batches),
             "model": orch._model,
+            "prepass": prepass,
+            "index_hits": index_hits,
             "message": (
-                f"Exploring {len(files)} files in {len(batches)} parallel workers "
+                f"Vector-first explore:{hit_msg} fanning out over "
+                f"{len(residual)} un-indexed file(s) in {len(batches)} parallel workers "
                 f"using {orch._model}. Returns immediately — call "
                 f"action='wait' job_id='{orch._job_id}' when you need the "
                 f"summaries. Continue with other independent work meanwhile."
@@ -307,6 +387,14 @@ def explore_files(action: str, patterns: list = None, query: str = "",
             "failed_batches": len(failures),
             "results": flat,
         }
+        # Fold in the vector pre-pass hits stashed at start time, if any.
+        index_hits = getattr(orch, "_index_hits", None)
+        if index_hits:
+            out["source"] = "vector_index + summarizers"
+            out["index_hits"] = index_hits
+        prepass = getattr(orch, "_prepass", None)
+        if prepass:
+            out["prepass"] = prepass
         if failures:
             out["failures"] = failures
         return json.dumps(out, ensure_ascii=False)
