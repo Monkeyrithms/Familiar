@@ -49,6 +49,15 @@ tree-sitter
 tree-sitter-language-pack
 sqlite-vec
 
+# ── Tool performance (optional — tools fall back gracefully if absent) ────
+orjson          # fast JSON for large tool results (file_search, diff)
+rapidfuzz       # C++/SIMD edit distance for file_edit block matching
+selectolax      # fast Lexbor HTML→text for http extract_text (vs regex)
+# ripgrep (rg) on PATH powers grep + file_search traversal:
+#   winget install BurntSushi.ripgrep.MSVC   (or: pip install ripgrep)
+# Optional fast JS/TS linters (lint tool prefers these over Node/tsc):
+#   npm i -g @biomejs/biome   OR   npm i -g oxlint
+
 # ── Scheduler / MCP ──────────────────────────────────────────────────────
 croniter        # cron parsing for scheduled tasks
 mcp             # Model Context Protocol client

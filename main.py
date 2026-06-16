@@ -533,8 +533,19 @@ class MainWindow(QMainWindow):
     # Dialog handlers
     def _open_help(self):
         """Show help dialog."""
-        dlg = HelpDialog(self)
+        dlg = HelpDialog(self, on_take_tour=lambda: self._start_tour(replay=True))
         dlg.exec()
+
+    def _start_tour(self, replay: bool = True):
+        """Launch (or replay) the first-run tour: fold the app down to the chat
+        card and unfold it again. Forced — runs regardless of saved tour_state."""
+        try:
+            from ui.tour import TourDirector
+            self._tour_director = TourDirector(self)
+            self._tour_director.prepare_genesis()
+            QTimer.singleShot(200, self._tour_director.begin)
+        except Exception as e:
+            print(f"[Familiar] start tour failed: {e}", flush=True)
     
     def _open_settings(self):
         """Open Settings via the focused chat column (non-modal). The column
@@ -751,7 +762,23 @@ def main():
     # Main window
     try:
         window = MainWindow(agent)
+        # First-run "digital origami" tour: the app boots as a bare chat card
+        # and unfolds itself, narrated by the agent. Hardcoded, zero-cost,
+        # replayable from ? → Take Tour. Genesis is set up BEFORE show so the
+        # window appears already folded down.
+        try:
+            from ui.tour import TourDirector
+            import ui.tour.director as _tour_dir
+            if "--tour" in sys.argv:
+                _tour_dir.FORCE_TOUR = True
+            if TourDirector.needed():
+                window._tour_director = TourDirector(window)
+                window._tour_director.prepare_genesis()
+        except Exception as e:
+            print(f"[Familiar] tour init failed: {e}", flush=True)
         window.show()
+        if getattr(window, "_tour_director", None) is not None:
+            QTimer.singleShot(250, window._tour_director.begin)
     except Exception as e:
         print(f"[Familiar] Failed to create MainWindow: {e}", flush=True)
         sys.exit(1)
