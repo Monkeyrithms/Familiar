@@ -231,7 +231,7 @@ Use this guide to configure providers, workspaces, and tools. Changes in
 class HelpDialog(GlassDialog):
     """Non-modal setup guide; stays readable while Settings is open."""
 
-    def __init__(self, parent=None, on_open_settings=None):
+    def __init__(self, parent=None, on_open_settings=None, on_take_tour=None):
         super().__init__(
             title="Help", parent=parent, width=700, height=760,
             # No geometry_key: saved positions can restore the dialog onto
@@ -241,6 +241,7 @@ class HelpDialog(GlassDialog):
         self.setModal(False)
         self.setWindowModality(Qt.WindowModality.NonModal)
         self._on_open_settings = on_open_settings
+        self._on_take_tour = on_take_tour
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -277,6 +278,18 @@ class HelpDialog(GlassDialog):
         top_btn.clicked.connect(lambda: self._body.scrollToAnchor("checklist"))
         btn_row.addWidget(top_btn)
         btn_row.addStretch()
+        # Centered: re-run the guided first-run tour (folds the app back down to
+        # the chat card and unfolds it again).
+        tour_btn = QPushButton("Take Tour")
+        tour_btn.setToolTip("Replay the guided walkthrough of Familiar")
+        tour_btn.clicked.connect(self._take_tour)
+        accent = p.get("accent", "#00fff7")
+        tour_btn.setStyleSheet(
+            f"QPushButton {{ color: #000; background: {accent};"
+            f" border: 1px solid {accent}; padding: 4px 14px; font-weight: bold; }}"
+            f"QPushButton:hover {{ background: {p.get('accent_bright', accent)}; }}")
+        btn_row.addWidget(tour_btn)
+        btn_row.addStretch()
         if self._on_open_settings is not None:
             settings_btn = QPushButton("Open Settings…")
             settings_btn.setToolTip("Open Settings (non-modal)")
@@ -286,6 +299,15 @@ class HelpDialog(GlassDialog):
         close_btn.clicked.connect(self.close)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
+
+    def _take_tour(self):
+        """Close Help, then hand off to the tour (deferred so the dialog is gone
+        before the window starts folding down)."""
+        from PyQt6.QtCore import QTimer
+        cb = self._on_take_tour
+        self.close()
+        if cb is not None:
+            QTimer.singleShot(150, cb)
 
     def showEvent(self, event):
         super().showEvent(event)

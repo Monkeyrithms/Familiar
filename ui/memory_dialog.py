@@ -25,6 +25,17 @@ from core.agent import load_config, save_config
 
 
 class MemoryDialog(GlassDialog):
+    # Mirrors agent._RETRIEVAL_DEFAULTS — per-stream retrieval policy defaults.
+    _RETRIEVAL_DEFAULTS = {
+        "vector_enabled": True,
+        "conversation_embeddings": False,
+        "code_preinject": False,
+        "code_preinject_threshold": 0.42,
+        "auto_index": True,
+        "expand_calls": False,
+        "hyde": False,
+    }
+
     def __init__(self, parent=None, initial_stream: str = ""):
         super().__init__(title="Memory", parent=parent, width=950, height=880)
         self._initial_stream = initial_stream
@@ -94,6 +105,96 @@ class MemoryDialog(GlassDialog):
 
         streams_layout.addLayout(detail)
         layout.addWidget(streams_group)
+
+        # ── Per-stream Retrieval policy ──
+        # The subscribed memory stream is the authority over retrieval: whether
+        # we embed/vector-search at all, embed every turn, pre-inject code
+        # context, and auto-index workspaces. Stored under the stream's
+        # "retrieval" block; resolved at runtime by agent._resolve_retrieval_policy.
+        retr_group = QGroupBox("Retrieval (this stream)")
+        retr_layout = QVBoxLayout(retr_group)
+        retr_layout.setSpacing(4)
+        retr_layout.setContentsMargins(6, 12, 6, 6)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(12)
+        self._retr_vector = QCheckBox("Vector search")
+        self._retr_vector.setFont(small_font)
+        self._retr_vector.setToolTip(
+            "Use semantic/vector search at all. Off = keyword-only (FTS5) "
+            "everywhere for this stream.")
+        self._retr_vector.stateChanged.connect(self._on_retrieval_changed)
+        row1.addWidget(self._retr_vector)
+        self._retr_conv = QCheckBox("Embed every turn")
+        self._retr_conv.setFont(small_font)
+        self._retr_conv.setToolTip(
+            "Embed each message/memory note per turn for semantic recall. "
+            "Off = recall runs on keyword search alone (cheaper).")
+        self._retr_conv.stateChanged.connect(self._on_retrieval_changed)
+        row1.addWidget(self._retr_conv)
+        self._retr_autoindex = QCheckBox("Auto-index workspace")
+        self._retr_autoindex.setFont(small_font)
+        self._retr_autoindex.setToolTip(
+            "Build a code index in the background when a workspace is opened.")
+        self._retr_autoindex.stateChanged.connect(self._on_retrieval_changed)
+        row1.addWidget(self._retr_autoindex)
+        row1.addStretch()
+        retr_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        self._retr_preinject = QCheckBox("Pre-inject code context")
+        self._retr_preinject.setFont(small_font)
+        self._retr_preinject.setToolTip(
+            "Proactively paste relevant code chunks into context before the "
+            "model answers, when similarity clears the threshold.")
+        self._retr_preinject.stateChanged.connect(self._on_retrieval_changed)
+        row2.addWidget(self._retr_preinject)
+        row2.addSpacing(12)
+        thr_label = QLabel("Threshold")
+        thr_label.setFont(small_font)
+        row2.addWidget(thr_label)
+        self._retr_threshold = QLineEdit()
+        self._retr_threshold.setFont(mono9)
+        self._retr_threshold.setFixedWidth(56)
+        self._retr_threshold.setToolTip(
+            "Cosine-similarity cutoff for pre-injection (0-1). Higher = stricter. "
+            "~0.42 separates on-topic from off-topic on a typical code repo.")
+        self._retr_threshold.textChanged.connect(self._on_retrieval_changed)
+        row2.addWidget(self._retr_threshold)
+        row2.addStretch()
+        retr_layout.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        self._retr_expand = QCheckBox("Expand call-graph")
+        self._retr_expand.setFont(small_font)
+        self._retr_expand.setToolTip(
+            "After a relevant hit, also pull one hop of callers/callees so the "
+            "model sees the surrounding code, not just the single best chunk.")
+        self._retr_expand.stateChanged.connect(self._on_retrieval_changed)
+        row3.addWidget(self._retr_expand)
+        self._retr_hyde = QCheckBox("HyDE query rewrite")
+        self._retr_hyde.setFont(small_font)
+        self._retr_hyde.setToolTip(
+            "Rewrite the question into a hypothetical answer before searching, "
+            "so it lands nearer the code that answers it. Adds one cheap LLM "
+            "call per gated turn.")
+        self._retr_hyde.stateChanged.connect(self._on_retrieval_changed)
+        row3.addWidget(self._retr_hyde)
+        row3.addStretch()
+        retr_layout.addLayout(row3)
+
+        retr_hint = QLabel(
+            "These settings are the authority for conversations subscribed to "
+            "this stream. When several streams are subscribed, a capability is "
+            "ON if any of them enables it (most-permissive wins)."
+        )
+        retr_hint.setWordWrap(True)
+        retr_hint.setFont(small_font)
+        retr_hint.setStyleSheet(muted)
+        retr_layout.addWidget(retr_hint)
+        layout.addWidget(retr_group)
 
         # ═══════════════════════════════════════════════════════════════
         # Section 2: Notes — tree above, detail editor below (Hybrid-style)
@@ -378,6 +479,7 @@ class MemoryDialog(GlassDialog):
         self._stream_desc_edit.blockSignals(False)
         self._stream_guidance_edit.blockSignals(False)
         self._stream_auto_check.blockSignals(False)
+        self._load_retrieval_into_widgets(s)
         self._stream_remove_btn.setEnabled(row != 0)
         self._refresh_notes_tree()
         self._refresh_summary_combo()
@@ -404,6 +506,45 @@ class MemoryDialog(GlassDialog):
         self._streams_data[row]["description"] = self._stream_desc_edit.text().strip()
         self._streams_data[row]["summary_guidance"] = self._stream_guidance_edit.toPlainText().strip()
         self._streams_data[row]["auto_subscribe"] = self._stream_auto_check.isChecked()
+
+    def _load_retrieval_into_widgets(self, stream: dict):
+        """Populate the per-stream Retrieval widgets from the stream's policy,
+        falling back to defaults for missing keys."""
+        r = {**self._RETRIEVAL_DEFAULTS, **(stream.get("retrieval") or {})}
+        for w in (self._retr_vector, self._retr_conv, self._retr_autoindex,
+                  self._retr_preinject, self._retr_threshold,
+                  self._retr_expand, self._retr_hyde):
+            w.blockSignals(True)
+        self._retr_vector.setChecked(bool(r["vector_enabled"]))
+        self._retr_conv.setChecked(bool(r["conversation_embeddings"]))
+        self._retr_autoindex.setChecked(bool(r["auto_index"]))
+        self._retr_preinject.setChecked(bool(r["code_preinject"]))
+        self._retr_threshold.setText(str(r["code_preinject_threshold"]))
+        self._retr_expand.setChecked(bool(r["expand_calls"]))
+        self._retr_hyde.setChecked(bool(r["hyde"]))
+        for w in (self._retr_vector, self._retr_conv, self._retr_autoindex,
+                  self._retr_preinject, self._retr_threshold,
+                  self._retr_expand, self._retr_hyde):
+            w.blockSignals(False)
+
+    def _on_retrieval_changed(self):
+        row = self._stream_list.currentRow()
+        if row < 0 or row >= len(self._streams_data):
+            return
+        try:
+            thr = float(self._retr_threshold.text())
+        except ValueError:
+            thr = self._RETRIEVAL_DEFAULTS["code_preinject_threshold"]
+        thr = min(1.0, max(0.0, thr))
+        self._streams_data[row]["retrieval"] = {
+            "vector_enabled": self._retr_vector.isChecked(),
+            "conversation_embeddings": self._retr_conv.isChecked(),
+            "auto_index": self._retr_autoindex.isChecked(),
+            "code_preinject": self._retr_preinject.isChecked(),
+            "code_preinject_threshold": thr,
+            "expand_calls": self._retr_expand.isChecked(),
+            "hyde": self._retr_hyde.isChecked(),
+        }
 
     def _add_stream(self):
         self._streams_data.append({

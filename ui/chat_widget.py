@@ -111,6 +111,8 @@ from core.database import (
     get_conversation_composer_draft,
     set_conversation_composer_draft,
     enqueue_composer_draft_save,
+    get_conversation_composer_pastes,
+    enqueue_composer_pastes_save,
     enqueue_conversation_save,
 )
 
@@ -826,6 +828,69 @@ class ChatMessageWidget(QFrame):
         self._build()
         self._apply_base_style()
 
+    def _add_image_card(self, layout):
+        """Build the attached-image card (rounded preview + filename, centered,
+        click to expand) and add it to ``layout``. Shared by fancy AND plain so a
+        submitted image lands in the transcript in BOTH modes — plain previously
+        rendered no image at all. No-op when there's no valid image."""
+        if not (self.image_path and os.path.isfile(self.image_path)):
+            return
+        pixmap = self._load_image_pixmap(self.image_path)
+        if not pixmap or pixmap.isNull():
+            return
+        p = PALETTE
+        self._full_pixmap = pixmap  # keep for expand
+
+        max_preview = 500
+        if pixmap.width() > max_preview:
+            scaled = pixmap.scaledToWidth(
+                max_preview, Qt.TransformationMode.SmoothTransformation)
+        else:
+            scaled = pixmap
+
+        # Round the corners
+        rounded = QPixmap(scaled.size())
+        rounded.fill(QColor("transparent"))
+        rp = QPainter(rounded)
+        rp.setRenderHint(QPainter.RenderHint.Antialiasing)
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(0, 0, scaled.width(), scaled.height(), 6, 6)
+        rp.setClipPath(clip_path)
+        rp.drawPixmap(0, 0, scaled)
+        rp.end()
+
+        img_card = QFrame()
+        img_card.setStyleSheet(
+            f"background: {p['panel_alt']}; border: 1px solid {p['border']};"
+            f"border-radius: 6px; padding: 4px;")
+        img_card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        img_card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card_layout = QVBoxLayout(img_card)
+        card_layout.setContentsMargins(4, 4, 4, 4)
+        card_layout.setSpacing(2)
+
+        img_label = QLabel()
+        img_label.setPixmap(rounded)
+        img_label.setStyleSheet("background:transparent; border:none;")
+        card_layout.addWidget(img_label)
+
+        fname_label = QLabel(os.path.basename(self.image_path))
+        fname_label.setFont(QFont("Consolas", 7))
+        fname_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        fname_label.setStyleSheet(f"color: {p['muted_text']}; background:transparent; border:none;")
+        card_layout.addWidget(fname_label)
+
+        # Click to show full-size overlay
+        img_card.mousePressEvent = self._toggle_image_expand
+
+        # Center the card
+        center_row = QHBoxLayout()
+        center_row.setContentsMargins(0, 0, 0, 0)
+        center_row.addStretch()
+        center_row.addWidget(img_card)
+        center_row.addStretch()
+        layout.addLayout(center_row)
+
     def _build(self):
 
         # If plain mode, render as simple text
@@ -850,61 +915,8 @@ class ChatMessageWidget(QFrame):
             header_color = p["glow_hot"]
             text_color = p["text"]
 
-        # Attached image card (above the text block) — centered, click to expand
-        if self.image_path and os.path.isfile(self.image_path):
-            pixmap = self._load_image_pixmap(self.image_path)
-            if pixmap and not pixmap.isNull():
-                self._full_pixmap = pixmap  # keep for expand
-
-                max_preview = 500
-                if pixmap.width() > max_preview:
-                    scaled = pixmap.scaledToWidth(
-                        max_preview, Qt.TransformationMode.SmoothTransformation)
-                else:
-                    scaled = pixmap
-
-                # Round the corners
-                rounded = QPixmap(scaled.size())
-                rounded.fill(QColor("transparent"))
-                rp = QPainter(rounded)
-                rp.setRenderHint(QPainter.RenderHint.Antialiasing)
-                clip_path = QPainterPath()
-                clip_path.addRoundedRect(0, 0, scaled.width(), scaled.height(), 6, 6)
-                rp.setClipPath(clip_path)
-                rp.drawPixmap(0, 0, scaled)
-                rp.end()
-
-                img_card = QFrame()
-                img_card.setStyleSheet(
-                    f"background: {p['panel_alt']}; border: 1px solid {p['border']};"
-                    f"border-radius: 6px; padding: 4px;")
-                img_card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-                img_card.setCursor(Qt.CursorShape.PointingHandCursor)
-                card_layout = QVBoxLayout(img_card)
-                card_layout.setContentsMargins(4, 4, 4, 4)
-                card_layout.setSpacing(2)
-
-                img_label = QLabel()
-                img_label.setPixmap(rounded)
-                img_label.setStyleSheet("background:transparent; border:none;")
-                card_layout.addWidget(img_label)
-
-                fname_label = QLabel(os.path.basename(self.image_path))
-                fname_label.setFont(QFont("Consolas", 7))
-                fname_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                fname_label.setStyleSheet(f"color: {p['muted_text']}; background:transparent; border:none;")
-                card_layout.addWidget(fname_label)
-
-                # Click to show full-size overlay
-                img_card.mousePressEvent = self._toggle_image_expand
-
-                # Center the card
-                center_row = QHBoxLayout()
-                center_row.setContentsMargins(0, 0, 0, 0)
-                center_row.addStretch()
-                center_row.addWidget(img_card)
-                center_row.addStretch()
-                layout.addLayout(center_row)
+        # Attached image card (above the text block) — centered, click to expand.
+        self._add_image_card(layout)
 
         # Build bubbles HTML if tool calls present
         fs = self._font_size
@@ -1330,8 +1342,18 @@ class ChatMessageWidget(QFrame):
         panel, no height cap. Mirrors the vispy_dashboard transcript model:
         text flows into the shared scroll surface and grows freely."""
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 2, 8, 2)
+        # Inter-message breathing room: a new message (one that shows its sender
+        # header) gets a line-break worth of space ABOVE it so it doesn't butt
+        # straight against the previous message; a continuation chunk (no header)
+        # stays tight so it flows as one message. Plain mode was rendering with a
+        # flat 2px gap, so distinct messages ran together — fancy gets this from
+        # its body padding, plain didn't.
+        top = 2 if getattr(self, "_continuation", False) else 11
+        layout.setContentsMargins(8, top, 8, 2)
         layout.setSpacing(0)
+        # Attached image (above the text), so a submitted image lands in history
+        # in plain mode too — matches fancy's ordering.
+        self._add_image_card(layout)
         body = QLabel()
         body.setWordWrap(True)
         body.setTextFormat(Qt.TextFormat.RichText)
@@ -2946,6 +2968,7 @@ class ChatWindow(QWidget):
         self._stream_live_meta_idx: int | None = None
         self._inferring = False
         self._composer_draft_cache: dict[str, str] = {}
+        self._composer_pastes_cache: dict[str, list] = {}
         self._conv_load_generation = 0
         self._conv_load_thread: ConversationLoadThread | None = None
         self._message_widget_pool: list[ChatMessageWidget] = []
@@ -3109,19 +3132,41 @@ class ChatWindow(QWidget):
                 return False
         return False
 
-    def _on_app_focus_changed(self, _old, now):
-        """Route focus to a single selected target: composer or terminal."""
-        if now is None:
+    def _on_app_focus_changed(self, _old, _now):
+        """focusChanged fired — recompute the selection highlight from the live
+        focus widget + app activation state."""
+        self._refresh_selection_highlight()
+
+    def _refresh_selection_highlight(self):
+        """Show the 'selected' border only when Familiar is the ACTIVE app AND
+        the specific widget holds focus. The moment focus leaves Familiar
+        entirely (the user tabs to another program) every highlight — the
+        composer border and the terminal's selected cell — drops, so nothing
+        reads as selected in the background. It restores when the user returns
+        to whichever widget Qt re-focuses.
+
+        QApplication.focusWidget() is the key: it returns a widget only while
+        this application is active, and None whenever no widget in the app holds
+        keyboard focus (i.e. the app is deactivated)."""
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is None:
             return
+        ws = getattr(self, "_right_workspace", None)
+        term_panel = getattr(ws, "terminal_panel", None)
         try:
-            if self._widget_within(now, self.input):
+            fw = app.focusWidget()
+            if fw is None:
+                # Focus is off Familiar entirely — de-select everything.
+                self.set_input_focus_highlight(False)
+                if term_panel is not None:
+                    term_panel.clear_active_highlight()
+                return
+            if self._widget_within(fw, self.input):
                 self.set_input_focus_highlight(True)
-                try:
-                    self._right_workspace.terminal_panel.clear_active_highlight()
-                except Exception:
-                    pass
-            elif self._widget_within(
-                    now, getattr(self._right_workspace, "terminal_panel", None)):
+                if term_panel is not None:
+                    term_panel.clear_active_highlight()
+            elif self._widget_within(fw, term_panel):
                 # Terminal took focus — it lights its own cell; just dim the composer.
                 self.set_input_focus_highlight(False)
         except RuntimeError:
@@ -3357,8 +3402,17 @@ class ChatWindow(QWidget):
         self._paste_bar.setObjectName("pasteBar")
         self._paste_bar_layout = QHBoxLayout(self._paste_bar)
         self._paste_bar_layout.setContentsMargins(8, 0, 8, 2)
-        self._paste_bar_layout.setSpacing(4)
-        self._paste_bar_layout.addStretch()  # pills pack left, before the stretch
+        self._paste_bar_layout.setSpacing(0)
+        self._paste_bar_layout.addStretch()
+        self._paste_pills_host = QWidget()
+        self._paste_pills_host.setObjectName("pastePillsHost")
+        self._paste_pills_host.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self._paste_pills_layout = QHBoxLayout(self._paste_pills_host)
+        self._paste_pills_layout.setContentsMargins(0, 0, 0, 0)
+        self._paste_pills_layout.setSpacing(4)
+        self._paste_bar_layout.addWidget(self._paste_pills_host)
+        self._paste_bar_layout.addStretch()
         self._paste_bar.hide()
         chat_left_layout.addWidget(self._paste_bar)
 
@@ -3375,6 +3429,11 @@ class ChatWindow(QWidget):
         _app = _QApp.instance()
         if _app is not None:
             _app.focusChanged.connect(self._on_app_focus_changed)
+            # Also recompute when the whole app activates/deactivates: alt-tabbing
+            # away must drop every highlight even if focusChanged(None) doesn't
+            # fire on this platform; returning restores it.
+            _app.applicationStateChanged.connect(
+                lambda _state: self._refresh_selection_highlight())
 
         # Bottom button row: CLEAR ... ← ✕ | ▣ →
         bottom = QHBoxLayout()
@@ -3406,6 +3465,16 @@ class ChatWindow(QWidget):
         p_t = PALETTE
         self._typing_label.setStyleSheet(f"color: transparent; background: transparent; border: none;")
         self._typing_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # The status sits in the stretchy gap between Copy and the right cluster.
+        # As a plain QLabel its minimum width = the full text width, so a long
+        # "Familiar is reviewing the response…" would shove the whole row (and the
+        # window) wider, then pull it back when it cleared — the jitter the user
+        # hit. Ignored h-policy + 0 minimum lets it shrink to nothing; _paint_typing
+        # then abbreviates to a centered animated ellipsis when the phrase can't
+        # fit, and restores the real phrase once the window has room again.
+        self._typing_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._typing_label.setMinimumWidth(0)
         bottom.addWidget(self._typing_label, stretch=1)
 
         self.undo_btn = QPushButton("\u2190")  # ←
@@ -3444,6 +3513,11 @@ class ChatWindow(QWidget):
         super().resizeEvent(event)
         if hasattr(self, "_file_viewer_layout_timer"):
             self._start_layout_settle_cycle()
+        # Re-fit the status: a widen may now have room for the full phrase, a
+        # narrow falls back to the animated ellipsis. Cheap; the dot timer also
+        # corrects within a tick if the label width hasn't settled yet.
+        if getattr(self, "_thinking", False) and hasattr(self, "_typing_label"):
+            self._paint_typing()
 
     def _start_layout_settle_cycle(self):
         """Skip expensive chat rewrap + file-viewer wrap reflow until motion stops (~100ms idle)."""
@@ -3919,6 +3993,8 @@ class ChatWindow(QWidget):
     def _new_conversation(self):
         self._composer_draft_timer.stop()
         self._persist_current_composer_draft()
+        self._persist_pending_pastes_for_conv()
+        self._clear_pending_pastes(persist=False)
         self._snapshot_current()
         # Save current before switching
         self._auto_save()
@@ -3966,6 +4042,7 @@ class ChatWindow(QWidget):
         self._sync_file_explorer_root()
         self._collapse_workspace()
         self._apply_composer_draft_for_conv(self._current_conv_id)
+        self._restore_pending_pastes_for_conv(self._current_conv_id, specs=[])
 
     def _persist_active_conv(self):
         """Write the active conversation ID to config so it survives restart."""
@@ -3980,11 +4057,13 @@ class ChatWindow(QWidget):
     def _switch_conversation(self, conv_id: str):
         if conv_id == self._current_conv_id:
             return
+        old_cid = self._current_conv_id
         # Remote conversation chosen → open a live mirror, not a local load.
         if self._is_remote_id(conv_id):
             self._composer_draft_timer.stop()
             self._persist_current_composer_draft()
-            self._clear_pending_pastes()
+            self._persist_pending_pastes_for_conv(old_cid)
+            self._clear_pending_pastes(persist=False)
             self._snapshot_current()
             self._enter_remote_mirror(conv_id)
             return
@@ -3994,7 +4073,8 @@ class ChatWindow(QWidget):
             self._conv_bar.set_hint("")
         self._composer_draft_timer.stop()
         self._persist_current_composer_draft()
-        self._clear_pending_pastes()  # pending pills belong to this compose session
+        self._persist_pending_pastes_for_conv(old_cid)
+        self._clear_pending_pastes(persist=False)
         self._snapshot_current()
         self._auto_save()
         self._current_conv_id = conv_id
@@ -4224,6 +4304,7 @@ class ChatWindow(QWidget):
             self._set_inferring(True)
             self._conv_threads.pop(conv_id, None)
             self._apply_composer_draft_for_conv(conv_id)
+            self._restore_pending_pastes_for_conv(conv_id)
             QTimer.singleShot(100, self._restore_viewer_state)
         else:
             # No active thread — load from disk normally
@@ -4354,6 +4435,8 @@ class ChatWindow(QWidget):
     def _apply_loaded_conv_data(self, conv_id: str, data: dict):
         """Main-thread hydration after background SQLite load."""
         self._apply_composer_draft_for_conv(conv_id, text=data.get("composer_draft", ""))
+        self._restore_pending_pastes_for_conv(
+            conv_id, specs=data.get("composer_pastes"))
         threading.Thread(
             target=self.agent.summarizer.save_state,
             daemon=True,
@@ -6083,6 +6166,16 @@ class ChatWindow(QWidget):
         self._animate_typing()  # show immediately
 
     def _animate_typing(self):
+        # Timer tick: advance the dot phase, then repaint.
+        self._thinking_dots_state += 1
+        self._paint_typing()
+
+    def _paint_typing(self):
+        """Render the bottom-bar status. Shows '{AGENT} is {verb}…' when it fits
+        in the gap between Copy and the right buttons; when it doesn't (small
+        window / long phrase) it abbreviates to a centered animated ellipsis so it
+        never pushes the window wider, and the real phrase returns the moment the
+        window has room. Safe to call on a resize as well as on the dot timer."""
         # Waiting on the user (ask_user_question board open) is NOT working —
         # show no "is typing…" dots until they answer.
         if getattr(self, "_awaiting_user_answer", False):
@@ -6097,20 +6190,27 @@ class ChatWindow(QWidget):
             self._typing_label.setText("")
             return
         p = PALETTE
-        dots = "." * (self._thinking_dots_state % 3 + 1)
-        pad = " " * (3 - len(dots))  # reserve space
+        n = self._thinking_dots_state % 3 + 1
+        dots = "." * n
         prefix = getattr(self, "_typing_prefix", f"{AGENT_LABEL} is typing")
-        self._typing_label.setText(f"{prefix}{dots}{pad}")
+        # Decide against the WIDEST form ("{prefix}...") so the choice doesn't
+        # flicker between full and abbreviated as the dots cycle.
+        fm = self._typing_label.fontMetrics()
+        avail = self._typing_label.width()
+        if avail > 0 and fm.horizontalAdvance(f"{prefix}...") <= avail:
+            text = f"{prefix}{dots}{' ' * (3 - n)}"   # pad keeps the width steady
+        else:
+            text = dots                                # animated ellipsis only
+        self._typing_label.setText(text)
         self._typing_label.setStyleSheet(
             f"color: {p['accent_muted']}; background: transparent; border: none;"
             f" font-style: italic;")
-        self._thinking_dots_state += 1
 
     def _set_typing_prefix(self, prefix: str):
         """Update the 'Agent is ...' phrase and repaint immediately (if revealed)."""
         self._typing_prefix = prefix
         if self._thinking and self._thinking_timer.isActive():
-            self._animate_typing()
+            self._paint_typing()
 
     def _hide_thinking(self):
         self._active_tool_verb = ""
@@ -7318,20 +7418,62 @@ class ChatWindow(QWidget):
         return (len(text) >= self._PASTE_MIN_CHARS
                 or text.count("\n") + 1 >= self._PASTE_MIN_LINES)
 
-    def _capture_pasted_text(self, text: str) -> None:
-        """Stash a big paste as a removable pill above the composer (keeping the
-        composer clean). On send the full text is appended to the message for the
-        model, while the bubble shows a collapsed card."""
-        lines = text.count("\n") + 1
-        entry = {"text": text, "lines": lines, "chars": len(text), "pill": None}
-        pill = self._make_paste_pill(entry)
-        entry["pill"] = pill
-        # Insert before the trailing stretch so pills stay left-packed.
-        self._paste_bar_layout.insertWidget(self._paste_bar_layout.count() - 1, pill)
-        self._pending_pastes.append(entry)
-        self._paste_bar.show()
+    def _paste_specs(self) -> list[dict]:
+        return [{"text": e["text"], "lines": e["lines"], "chars": e["chars"]}
+                for e in self._pending_pastes]
 
-    def _make_paste_pill(self, entry: dict) -> QFrame:
+    def _persist_pending_pastes_for_conv(self, conv_id: str | None = None) -> None:
+        cid = conv_id or self._current_conv_id
+        if not cid or self._is_remote_id(cid):
+            return
+        specs = self._paste_specs()
+        self._composer_pastes_cache[cid] = specs
+        enqueue_composer_pastes_save(cid, specs)
+
+    def _paste_pill_label(self, index: int, entry: dict) -> str:
+        return f"Paste {index} · {entry['lines']:,} lines"
+
+    def _renumber_paste_pills(self) -> None:
+        for i, entry in enumerate(self._pending_pastes, 1):
+            label = entry.get("label")
+            if label is not None:
+                label.setText(self._paste_pill_label(i, entry))
+                label.setToolTip(
+                    f"{entry['lines']:,} lines · {entry['chars']:,} chars")
+
+    def _restore_pending_pastes_for_conv(self, conv_id: str,
+                                         specs: list | None = None) -> None:
+        """Rebuild pending paste pills for *conv_id* (from cache, disk, or *specs*)."""
+        self._clear_pending_pastes(persist=False)
+        if not conv_id or self._is_remote_id(conv_id):
+            return
+        if specs is None:
+            specs = self._composer_pastes_cache.get(conv_id)
+            if specs is None:
+                specs = get_conversation_composer_pastes(conv_id)
+                self._composer_pastes_cache[conv_id] = specs
+        for spec in specs or []:
+            text = spec.get("text", "")
+            if text:
+                self._capture_pasted_text(text, persist=False)
+
+    def _capture_pasted_text(self, text: str, *, persist: bool = True) -> None:
+        """Stash a big paste as a removable pill above the composer (keeping the
+        composer clean). Multiple pastes stack side-by-side; each is removable.
+        On send the full text is appended to the message for the model, while the
+        bubble shows a collapsed card per paste."""
+        lines = text.count("\n") + 1
+        entry = {"text": text, "lines": lines, "chars": len(text), "pill": None, "label": None}
+        pill = self._make_paste_pill(entry, len(self._pending_pastes) + 1)
+        entry["pill"] = pill
+        self._paste_pills_layout.addWidget(pill)
+        self._pending_pastes.append(entry)
+        self._renumber_paste_pills()
+        self._paste_bar.show()
+        if persist:
+            self._persist_pending_pastes_for_conv()
+
+    def _make_paste_pill(self, entry: dict, index: int) -> QFrame:
         p = PALETTE
         accent = QColor(p["accent"])
         pill = QFrame()
@@ -7342,19 +7484,18 @@ class ChatWindow(QWidget):
         lay = QHBoxLayout(pill)
         lay.setContentsMargins(10, 2, 5, 2)
         lay.setSpacing(5)
-        label = QLabel(f"Pasted text · {entry['lines']:,} lines")
+        label = QLabel(self._paste_pill_label(index, entry))
+        entry["label"] = label
         label.setFont(QFont("Consolas", 8))
         label.setStyleSheet(f"color: {p['accent']}; background: transparent; border: none;")
         label.setToolTip(f"{entry['lines']:,} lines · {entry['chars']:,} chars")
         lay.addWidget(label)
-        x = QPushButton("✕")
+        x = QPushButton("\u2715")
+        x.setObjectName("pastePillRemoveBtn")
         x.setFixedSize(16, 16)
         x.setCursor(Qt.CursorShape.PointingHandCursor)
         x.setFont(QFont("Consolas", 8))
         x.setToolTip("Remove pasted text")
-        x.setStyleSheet(
-            f"QPushButton {{ color: {p['muted_text']}; background: transparent; border: none; }}"
-            f"QPushButton:hover {{ color: {p.get('accent_bright', p['accent'])}; }}")
         x.clicked.connect(lambda _=False, e=entry: self._remove_paste(e))
         lay.addWidget(x)
         return pill
@@ -7363,27 +7504,31 @@ class ChatWindow(QWidget):
         pill = entry.get("pill")
         if pill is not None:
             try:
-                self._paste_bar_layout.removeWidget(pill)
+                self._paste_pills_layout.removeWidget(pill)
                 pill.deleteLater()
             except RuntimeError:
                 pass
         if entry in self._pending_pastes:
             self._pending_pastes.remove(entry)
+        self._renumber_paste_pills()
         if not self._pending_pastes:
             self._paste_bar.hide()
+        self._persist_pending_pastes_for_conv()
 
-    def _clear_pending_pastes(self) -> None:
+    def _clear_pending_pastes(self, *, persist: bool = True) -> None:
         for e in list(getattr(self, "_pending_pastes", [])):
             pill = e.get("pill")
             if pill is not None:
                 try:
-                    self._paste_bar_layout.removeWidget(pill)
+                    self._paste_pills_layout.removeWidget(pill)
                     pill.deleteLater()
                 except RuntimeError:
                     pass
         self._pending_pastes = []
         if hasattr(self, "_paste_bar"):
             self._paste_bar.hide()
+        if persist:
+            self._persist_pending_pastes_for_conv()
 
     def _extract_pastes(self, raw: str):
         """Build (full_for_model, typed_for_display, pastes) from the composer
@@ -7404,6 +7549,16 @@ class ChatWindow(QWidget):
         return full.strip(), typed, pastes
 
     def send_message(self):
+        # During the first-run tour the agent is "on rails": route typed input
+        # to the director (keyword/intro routing) instead of the live agent.
+        if getattr(self, "_tour", None) is not None and getattr(self._tour, "active", False):
+            txt = self.input.toPlainText()
+            self.input.clear()
+            try:
+                self._tour.handle_user_text(txt)
+            except Exception as e:
+                print(f"[tour] handle_user_text failed: {e}")
+            return
         # Expand any captured paste placeholders: the model sees the full text
         # (`content`), the bubble shows the typed text + collapsed paste cards.
         raw_input = self.input.toPlainText()
@@ -7443,14 +7598,26 @@ class ChatWindow(QWidget):
                 # Merge with anything already queued so an earlier mid-job
                 # submit isn't silently clobbered.
                 prev = getattr(self, "_queued_message", None) or {}
-                if prev.get("text") and text:
-                    text = prev["text"] + "\n\n" + text
+                merged_typed = typed_text
+                if prev.get("typed") and merged_typed:
+                    merged_typed = prev["typed"] + "\n\n" + merged_typed
+                elif prev.get("typed"):
+                    merged_typed = prev["typed"]
+                merged_pastes = list(prev.get("pastes") or []) + list(sent_pastes)
+                if merged_pastes:
+                    blocks = "\n\n".join(p["text"] for p in merged_pastes)
+                    merged_full = ((merged_typed + "\n\n" + blocks) if merged_typed
+                                   else blocks).strip()
+                else:
+                    merged_full = merged_typed.strip()
                 self._queued_message = {
-                    "text": text or prev.get("text", ""),
+                    "typed": merged_typed,
+                    "pastes": merged_pastes,
+                    "text": merged_full,
                     "image": pending_img or prev.get("image"),
                 }
                 self._clear_pending_image()
-                self._clear_pending_pastes()  # pastes are folded into queued text
+                self._clear_pending_pastes(persist=False)
                 self.input.clear()
                 try:
                     self.input.setPlaceholderText(
@@ -8098,10 +8265,22 @@ class ChatWindow(QWidget):
         if old_name != new_name:
             self._refresh_conv_bar()  # name changed, rebuild bricks
 
-        # Play response sound + any deferred sounds queued by play_sound tool
+        # Agent finished the turn — distinct "task complete" cue (the send sound
+        # stays message.mp3). The completion_sound setting gates it:
+        #   always    → ring every time
+        #   off_focus → ring only when Familiar isn't the focused window
+        #   off       → never
+        # When unfocused, optionally flash the taskbar button too. isActiveWindow()
+        # on the top-level window is False whenever the user is in another app.
         try:
-            from core.sounds import play_ui
-            play_ui("message.mp3")
+            unfocused = not self.window().isActiveWindow()
+            mode = (self.agent.config.get("completion_sound") or "always").lower()
+            if mode == "always" or (mode == "off_focus" and unfocused):
+                from core.sounds import play_ui
+                play_ui("complete.mp3")
+            if unfocused and self.agent.config.get("taskbar_blink_on_done", True):
+                from PyQt6.QtWidgets import QApplication
+                QApplication.alert(self.window())
         except Exception:
             pass
         from core.sounds import drain_deferred
@@ -8455,14 +8634,16 @@ class ChatWindow(QWidget):
         except Exception:
             pass
         # If the user typed something new after queuing, that newer text wins —
-        # don't clobber it. Otherwise restore the queued message + image.
+        # don't clobber it. Otherwise restore the queued message + image + pastes.
         if not self.input.toPlainText().strip():
             if q.get("image"):
                 try:
                     self._show_pending_image(q["image"], "Queued image")
                 except Exception:
                     pass
-            self.input.setPlainText(q.get("text", "") or "")
+            self._restore_pending_pastes_for_conv(
+                self._current_conv_id, specs=q.get("pastes"))
+            self.input.setPlainText(q.get("typed", "") or "")
         # Defer so the just-finished turn fully tears down before the next starts.
         QTimer.singleShot(0, self.send_message)
 
@@ -9391,6 +9572,181 @@ class ChatWindow(QWidget):
             except Exception:
                 break
 
+    # ── First-run tour hooks (driven by ui/tour) ──────────────────────
+    # All additive; none touch the normal streaming/virtualization paths.
+    def enter_tour_mode(self, director):
+        """Genesis mode: stash the tour director and mount a host above the
+        composer for the tour's transient widgets (key gate, CONTINUE buttons).
+        The chat itself IS the genesis card — nothing here is hidden."""
+        self._tour = director
+        try:
+            self._hide_intro_hint()
+        except Exception:
+            pass
+        if getattr(self, "_tour_host", None) is None:
+            host = QWidget(self._chat_left)
+            hv = QVBoxLayout(host)
+            hv.setContentsMargins(8, 4, 8, 6)
+            hv.setSpacing(6)
+            self._tour_host = host
+            self._tour_host_layout = hv
+            lay = self._chat_left.layout()
+            idx = lay.indexOf(self.input)
+            lay.insertWidget(max(0, idx), host)
+        self._tour_host.show()
+
+    def exit_tour_mode(self):
+        self._tour = None
+        self.tour_discard_line()
+        self.tour_clear_choices()
+        host = getattr(self, "_tour_host", None)
+        if host is not None:
+            host.hide()
+
+    def tour_mount_widget(self, w):
+        """Mount a transient tour widget (e.g. the key gate) above the composer."""
+        if getattr(self, "_tour_host_layout", None) is None:
+            return
+        w.setParent(self._tour_host)
+        self._tour_host_layout.addWidget(w)
+        self._tour_host.show()
+        w.show()
+
+    def tour_unmount_widget(self, w):
+        try:
+            self._tour_host_layout.removeWidget(w)
+        except Exception:
+            pass
+        w.setParent(None)
+        w.hide()
+
+    # narration line, typed into the transcript then committed to a real bubble
+    def tour_open_line(self):
+        self.tour_discard_line()
+        try:
+            from ui.theme import chat_message_colors
+            _header, body = chat_message_colors(AGENT_LABEL)
+        except Exception:
+            body = PALETTE.get("text", "#e6e6e6")
+        lbl = QLabel(self._messages_container)
+        lbl.setObjectName("tourLine")
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)
+        lbl.setText("")
+        lbl.setStyleSheet(
+            f"color:{body}; background:transparent; border:none; padding:10px 14px;")
+        lbl.setFont(QFont("Consolas", 10))
+        self._tour_line = lbl
+        self._messages_layout.addWidget(lbl)
+        lbl.show()
+        try:
+            self._hide_intro_hint()
+        except Exception:
+            pass
+        QTimer.singleShot(0, lambda: self._scroll_to_bottom(force=True))
+
+    def tour_set_line(self, html):
+        lbl = getattr(self, "_tour_line", None)
+        if lbl is None:
+            return
+        try:
+            lbl.setText(html)
+            self._scroll_to_bottom(force=True)
+        except RuntimeError:
+            self._tour_line = None
+
+    def tour_discard_line(self):
+        lbl = getattr(self, "_tour_line", None)
+        if lbl is not None:
+            try:
+                self._messages_layout.removeWidget(lbl)
+                lbl.setParent(None)
+                lbl.deleteLater()
+            except RuntimeError:
+                pass
+            self._tour_line = None
+
+    def tour_commit_line(self, text):
+        """Replace the transient line with a real, persistent agent bubble.
+
+        Render with the tour's own self-contained markdown so the committed
+        bubble matches the typed line exactly and never leaks raw ``**`` (the
+        normal path's markdown2 is bypassed via precomputed_assistant_html)."""
+        self.tour_discard_line()
+        try:
+            from ui.tour.markup import render_markdown
+            html = render_markdown(text)
+        except Exception:
+            html = ""
+        try:
+            self._add_message(AGENT_LABEL, text,
+                              precomputed_assistant_html=html)
+        except Exception as e:
+            print(f"[tour] commit line failed: {e}")
+
+    # inline CONTINUE / choice buttons under the composer (chat-narrated beats)
+    def tour_choices(self, choices):
+        self.tour_clear_choices()
+        if getattr(self, "_tour_host_layout", None) is None:
+            return
+        row = QWidget(self._tour_host)
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(8)
+        rl.addStretch(1)
+        p = PALETTE
+        for label, cmd in choices:
+            b = QPushButton(label)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton {{ color:#000; background:{p['accent']};"
+                f" border:1px solid {p['accent']}; padding:5px 12px;"
+                f" font-family:Consolas; font-size:9pt; font-weight:bold;"
+                f" letter-spacing:1px; }}"
+                f"QPushButton:hover {{ background:{p['text']}; }}")
+            b.clicked.connect(
+                lambda _=False, c=cmd: self._tour.handle_command(c)
+                if getattr(self, "_tour", None) is not None else None)
+            rl.addWidget(b)
+        rl.addStretch(1)
+        self._tour_choice_row = row
+        self._tour_host_layout.addWidget(row)
+        self._tour_host.show()
+        row.show()
+
+    def tour_clear_choices(self):
+        row = getattr(self, "_tour_choice_row", None)
+        if row is not None:
+            try:
+                self._tour_host_layout.removeWidget(row)
+            except Exception:
+                pass
+            row.setParent(None)
+            row.deleteLater()
+            self._tour_choice_row = None
+
+    def tour_reveal_extras(self):
+        """Nothing inside the chat is hidden for genesis; just make sure the
+        composer and conversation bar are visible (defensive)."""
+        try:
+            self.input.show()
+            self._conv_bar.show()
+        except Exception:
+            pass
+
+    def tour_seed_suggestions(self, text):
+        """Leave a friendly 'here's what to ask' message at the end of the tour.
+
+        NON-destructive by design: the tour can run (via ? -> Take Tour) inside
+        a real, in-progress conversation, so it must NEVER clear history — it
+        only appends. (Familiar differs from Brikwerx here on purpose.)"""
+        self.tour_discard_line()
+        self.tour_clear_choices()
+        try:
+            self._add_message(AGENT_LABEL, text)
+        except Exception as e:
+            print(f"[tour] seed suggestions failed: {e}")
+
     def clear_chat(self):
         """
         Confirm before wiping the conversation. The dialog previews each
@@ -9881,6 +10237,25 @@ class ChatWindow(QWidget):
                 color: {p['background']};
             }}
             QPushButton#imageRemoveBtn:pressed {{
+                background: {p['accent_bright']};
+                color: {p['background']};
+            }}
+            QPushButton#pastePillRemoveBtn {{
+                color: {p['background']};
+                background: {p['accent_muted']};
+                border: 1px solid {p['accent']};
+                border-radius: 8px;
+                font-size: 8pt;
+                font-weight: bold;
+                min-width: 16px; max-width: 16px;
+                min-height: 16px; max-height: 16px;
+                padding: 0;
+            }}
+            QPushButton#pastePillRemoveBtn:hover {{
+                background: {p['accent']};
+                color: {p['background']};
+            }}
+            QPushButton#pastePillRemoveBtn:pressed {{
                 background: {p['accent_bright']};
                 color: {p['background']};
             }}

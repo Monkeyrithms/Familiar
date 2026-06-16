@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QGroupBox, QSlider, QColorDialog,
     QSpinBox, QCheckBox, QSizePolicy, QSpacerItem, QCompleter,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QPlainTextEdit, QApplication, QMenu,
+    QPlainTextEdit, QApplication, QMenu, QRadioButton, QButtonGroup,
 )
 from PyQt6.QtCore import Qt, QStringListModel, QObject, pyqtSignal
 
@@ -225,6 +225,29 @@ class SettingsDialog(GlassDialog):
             }}
         """
         
+        # QRadioButton (Task completion sound) — mirror the checkbox look but round.
+        radio_style = f"""
+            QRadioButton {{
+                color: {p['text']};
+                spacing: 6px;
+            }}
+            QRadioButton::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid {p['border']};
+                border-radius: 7px;
+                background-color: {p['panel_alt']};
+            }}
+            QRadioButton::indicator:hover {{
+                border-color: {p['accent']};
+                background-color: {p['panel']};
+            }}
+            QRadioButton::indicator:checked {{
+                background-color: {p['accent']};
+                border-color: {p['accent']};
+            }}
+        """
+
         # QSlider (Brightness, TTS Speed, CRT Speed, etc.)
         slider_style = f"""
             QSlider::groove:horizontal {{
@@ -258,6 +281,8 @@ class SettingsDialog(GlassDialog):
             widget.setStyleSheet(textedit_style)
         for widget in self.findChildren(QCheckBox):
             widget.setStyleSheet(checkbox_style)
+        for widget in self.findChildren(QRadioButton):
+            widget.setStyleSheet(radio_style)
         for widget in self.findChildren(QSlider):
             widget.setStyleSheet(slider_style)
     def _mark_dirty(self, *_args) -> None:
@@ -287,6 +312,8 @@ class SettingsDialog(GlassDialog):
             w.currentIndexChanged.connect(self._mark_dirty)
         for w in self.findChildren(QCheckBox):
             w.toggled.connect(self._mark_dirty)
+        for w in self.findChildren(QRadioButton):
+            w.toggled.connect(self._mark_dirty)
         for w in self.findChildren(QSpinBox):
             w.valueChanged.connect(self._mark_dirty)
         for w in self.findChildren(QSlider):
@@ -313,6 +340,8 @@ class SettingsDialog(GlassDialog):
             sig.append(("cb", str(w.currentIndex())))
         for w in self.findChildren(QCheckBox):
             sig.append(("ck", str(w.isChecked())))
+        for w in self.findChildren(QRadioButton):
+            sig.append(("rb", str(w.isChecked())))
         for w in self.findChildren(QSpinBox):
             sig.append(("sp", str(w.value())))
         for w in self.findChildren(QSlider):
@@ -547,6 +576,16 @@ class SettingsDialog(GlassDialog):
         self._show_usage_check.setChecked(cfg.get("show_usage", False))
         layout.addRow("", self._show_usage_check)
 
+        # Flash the taskbar button when a turn finishes while Familiar is in the
+        # background — a visual companion to the "Off focus" completion sound.
+        self._taskbar_blink_check = QCheckBox("Blink taskbar icon when a task finishes unfocused")
+        self._taskbar_blink_check.setChecked(cfg.get("taskbar_blink_on_done", True))
+        self._taskbar_blink_check.setToolTip(
+            "When the agent finishes and Familiar is NOT the focused window, "
+            "flash its taskbar button until you switch back to it."
+        )
+        layout.addRow("", self._taskbar_blink_check)
+
         # Cyberpunk styling (monocolor)
         cyber_group = QGroupBox("Make it Cyberpunk")
         cyber_layout = QVBoxLayout(cyber_group)
@@ -721,6 +760,30 @@ class SettingsDialog(GlassDialog):
     # API Keys tab
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _reveal_row(field: QLineEdit) -> QHBoxLayout:
+        """Wrap a password QLineEdit in a row with a Show/Hide toggle button.
+
+        The button reveals the real key (echo → Normal) for quick copying and
+        flips its label to "Hide"; toggling back re-masks it (echo → Password).
+        """
+        field.setEchoMode(QLineEdit.EchoMode.Password)
+        btn = QPushButton("Show")
+        btn.setCheckable(True)
+        btn.setFixedWidth(52)
+
+        def _toggle(checked: bool):
+            field.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password)
+            btn.setText("Hide" if checked else "Show")
+
+        btn.toggled.connect(_toggle)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addWidget(field, 1)
+        row.addWidget(btn)
+        return row
+
     def _build_keys_tab(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -747,9 +810,8 @@ class SettingsDialog(GlassDialog):
                 initial = entry.get("api_key", "")
             field = QLineEdit(initial)
             field.setPlaceholderText(f"Enter {info['name']} API key...")
-            field.setEchoMode(QLineEdit.EchoMode.Password)
             self._key_fields[pid] = field
-            form.addRow(QLabel(info["name"]), field)
+            form.addRow(QLabel(info["name"]), self._reveal_row(field))
 
             if pid == "anthropic":
                 auth = QComboBox()
@@ -778,9 +840,8 @@ class SettingsDialog(GlassDialog):
         tavily_entry = keys.get("tavily", {})
         tavily_field = QLineEdit(tavily_entry.get("api_key", ""))
         tavily_field.setPlaceholderText("Enter Tavily API key (web search)...")
-        tavily_field.setEchoMode(QLineEdit.EchoMode.Password)
         self._key_fields["tavily"] = tavily_field
-        form.addRow(QLabel("Tavily"), tavily_field)
+        form.addRow(QLabel("Tavily"), self._reveal_row(tavily_field))
 
         scroll.setWidget(container)
         return scroll
@@ -1841,6 +1902,33 @@ class SettingsDialog(GlassDialog):
         self._ui_sounds_check = QCheckBox("UI Sounds")
         self._ui_sounds_check.setChecked(cfg.get("ui_sounds", True))
         top_form.addRow("", self._ui_sounds_check)
+
+        # Completion sound (complete.mp3) — plays when the agent finishes a turn.
+        # "Off focus" only rings when Familiar isn't the active window, so it
+        # nudges you when you've tabbed away but stays quiet while you're watching.
+        comp_box = QGroupBox("Task completion sound")
+        comp_layout = QVBoxLayout(comp_box)
+        comp_layout.setSpacing(6)
+        self._completion_sound_group = QButtonGroup(self)
+        self._completion_sound_radios: dict[str, QRadioButton] = {}
+        for value, label, tip in (
+            ("always", "Always",
+             "Play complete.mp3 every time the agent finishes a turn."),
+            ("off_focus", "Off focus",
+             "Only play when Familiar is NOT the focused window "
+             "(you're in another window)."),
+            ("off", "Off", "Never play the completion sound."),
+        ):
+            rb = QRadioButton(label)
+            rb.setToolTip(tip)
+            self._completion_sound_group.addButton(rb)
+            self._completion_sound_radios[value] = rb
+            comp_layout.addWidget(rb)
+        current_cs = (cfg.get("completion_sound") or "always").lower()
+        if current_cs not in self._completion_sound_radios:
+            current_cs = "always"
+        self._completion_sound_radios[current_cs].setChecked(True)
+        top_form.addRow(comp_box)
 
         ws_box = QGroupBox("Workspace sounds")
         ws_form = QFormLayout(ws_box)
@@ -3625,6 +3713,11 @@ class SettingsDialog(GlassDialog):
 
         # Audio settings
         cfg["ui_sounds"] = self._ui_sounds_check.isChecked()
+        cfg["completion_sound"] = next(
+            (v for v, rb in self._completion_sound_radios.items() if rb.isChecked()),
+            "always",
+        )
+        cfg["taskbar_blink_on_done"] = self._taskbar_blink_check.isChecked()
         cfg["workspace_edit_sounds"] = self._workspace_edit_sounds_check.isChecked()
         cfg["viewer_typing_sounds"] = self._viewer_typing_sounds_check.isChecked()
         cfg["sound_exempt_patterns"] = [
