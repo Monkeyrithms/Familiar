@@ -2,8 +2,8 @@
 LLM provider connections.
 
 All providers use the OpenAI Python SDK with different base_url values,
-except Anthropic which uses its native SDK and an adapter that maps
-responses to the OpenAI format so the rest of the codebase stays unchanged.
+except Anthropic (native SDK + adapter) and OpenAI Codex OAuth (ChatGPT
+subscription via chatgpt.com/backend-api/codex/responses).
 """
 
 import json
@@ -968,54 +968,10 @@ def _get_claude_code_oauth_token() -> str | None:
 
 
 def _get_openai_codex_oauth_token() -> str | None:
-    """Read a ChatGPT / Codex CLI access token from ``~/.codex/auth.json`` if present.
-
-    Schema varies by Codex version; we accept common shapes. Returns a string
-    suitable as ``api_key`` for ``openai.OpenAI``, or None if not found."""
-    import json
-    from pathlib import Path
-
-    path = Path.home() / ".codex" / "auth.json"
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-    def _pick_token(obj) -> str | None:
-        if isinstance(obj, str) and len(obj) > 12:
-            return obj
-        if not isinstance(obj, dict):
-            return None
-        for k in (
-            "access_token",
-            "ACCESS_TOKEN",
-            "id_token",
-            "token",
-            "OPENAI_API_KEY",
-            "api_key",
-        ):
-            v = obj.get(k)
-            if isinstance(v, str) and len(v) > 12:
-                return v
-        inner = obj.get("openai")
-        if isinstance(inner, dict):
-            for k in ("access_token", "api_key", "token"):
-                v = inner.get(k)
-                if isinstance(v, str) and len(v) > 12:
-                    return v
-        return None
-
-    tok = _pick_token(data)
-    if tok:
-        return tok
-    # Sometimes nested under "tokens" or first string leaf
-    if isinstance(data.get("tokens"), dict):
-        tok = _pick_token(data["tokens"])
-        if tok:
-            return tok
-    return None
+    """Return a fresh Codex OAuth access token from ``~/.codex/auth.json``, or None."""
+    from core.openai_codex import get_codex_credentials
+    creds = get_codex_credentials()
+    return creds.access_token if creds else None
 
 
 def _refresh_anthropic_oauth(refresh_token: str) -> dict | None:
@@ -1312,16 +1268,17 @@ def get_client(provider: str, credentials: dict | None = None, keys_path: Path |
         base_url = base_url or "http://127.0.0.1:1234/v1"
         api_key = api_key or "local"
 
-    # OpenAI: optional Codex / ChatGPT OAuth file (~/.codex/auth.json)
+    # OpenAI: Codex / ChatGPT subscription OAuth uses chatgpt.com backend, not api.openai.com.
     if provider == "openai":
         if auth_mode in ("openai_codex_oauth", "codex_oauth", "oauth"):
-            oat = _get_openai_codex_oauth_token()
-            if not oat:
+            from core.openai_codex import OpenAICodexClientWrapper, get_codex_credentials
+            creds = get_codex_credentials()
+            if not creds:
                 raise ValueError(
                     "OpenAI OAuth (Codex / ChatGPT): no token in ~/.codex/auth.json. "
                     "Run `codex login` (file-based credential store) or use an API key."
                 )
-            api_key = oat
+            return ReasoningClientWrapper(OpenAICodexClientWrapper(creds), provider)
         base_url = (base_url or "").strip() or "https://api.openai.com/v1"
 
     if not api_key:
@@ -1368,7 +1325,8 @@ def _provider_credential_ready(pid: str, entry: dict) -> bool:
     if pid == "anthropic" and auth in ("claude_code_oauth", "anthropic_oauth", "oauth"):
         return _get_claude_code_oauth_token() is not None
     if pid == "openai" and auth in ("openai_codex_oauth", "codex_oauth", "oauth"):
-        return _get_openai_codex_oauth_token() is not None
+        from core.openai_codex import codex_credentials_ready
+        return codex_credentials_ready()
     if pid == "google":
         g = entry.get("api_key", "")
         return bool(resolve_google_api_key(g))

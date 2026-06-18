@@ -294,6 +294,63 @@ def _assistant_message_to_dict(msg) -> dict:
     return {}
 
 
+def _heal_orphan_tool_calls(context: list[dict]) -> int:
+    """Repair a context where an assistant message emitted tool_calls but the
+    matching tool-result messages were never recorded.
+
+    This happens when the user interrupts (Stop / mid-job interrupt) in the
+    window AFTER the assistant tool_calls message is appended but BEFORE its
+    results are appended, or if the worker dies mid-round. The next API call
+    then carries an assistant message whose tool_call_ids have no matching
+    ``role: "tool"`` reply — which Anthropic rejects outright ("tool_use ids
+    must have corresponding tool_result blocks"), corrupting every subsequent
+    turn in the conversation.
+
+    We scan in place and, for any tool_call_id that has no following tool
+    result, splice in a synthetic result right after the assistant message
+    noting the call was interrupted. Returns the number of results injected.
+    Idempotent: a context with no orphans is left untouched.
+    """
+    if not context:
+        return 0
+    # Collect every tool_call_id that already has a matching tool result.
+    satisfied: set[str] = set()
+    for m in context:
+        if m.get("role") == "tool":
+            tcid = m.get("tool_call_id")
+            if tcid:
+                satisfied.add(tcid)
+    injected = 0
+    i = 0
+    while i < len(context):
+        m = context[i]
+        calls = m.get("tool_calls") if m.get("role") == "assistant" else None
+        if calls:
+            missing = []
+            for c in calls:
+                cid = c.get("id") if isinstance(c, dict) else getattr(c, "id", None)
+                if cid and cid not in satisfied:
+                    missing.append(cid)
+            if missing:
+                # Splice synthetic results immediately after this assistant msg,
+                # before whatever (user message, next round) follows it.
+                stub = [
+                    {"role": "tool", "tool_call_id": cid,
+                     "content": json.dumps({
+                         "error": "interrupted",
+                         "note": "This tool call was interrupted before it ran "
+                                 "or before its result was recorded. Treat it as "
+                                 "not executed; re-run if still needed."})}
+                    for cid in missing
+                ]
+                context[i + 1:i + 1] = stub
+                injected += len(stub)
+                satisfied.update(missing)
+                i += len(stub)
+        i += 1
+    return injected
+
+
 def _sanitize_messages_for_google_gemini(messages: list[dict]) -> list[dict]:
     """Gemini's OpenAI-compatible endpoint rejects JSON null where a Struct or string is required.
 
@@ -1373,6 +1430,17 @@ User says "show/display/open/let me see/pull up" a file \u2192 call file_show(pa
 
     def _build_messages(self) -> list[dict]:
         cfg = self.config
+        # Heal any orphaned tool_calls (assistant emitted calls but results were
+        # never recorded — e.g. the user interrupted mid-round). Left unrepaired,
+        # the next API call is rejected for unmatched tool_use ids, which would
+        # break every following turn. Idempotent; no-op when context is clean.
+        try:
+            healed = _heal_orphan_tool_calls(self.context)
+            if healed:
+                _log(f"[heal] injected {healed} synthetic tool result(s) for "
+                     f"interrupted call(s)")
+        except Exception as e:
+            _log(f"[heal] orphan-tool-call repair failed (non-fatal): {e}")
         char_limit = cfg.get("summary_char_limit", 15000)
         refresh_chars = cfg.get("summary_refresh_chars", 5000)
         enable_summary = cfg.get("enable_summarization", True)
