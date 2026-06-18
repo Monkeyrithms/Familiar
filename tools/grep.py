@@ -118,68 +118,118 @@ def grep(pattern: str, path: str = None, glob: str = None,
         cmd.extend(["--glob", glob])
     cmd.extend([pattern, search_path])
 
+    # STREAM ripgrep's output and stop the moment we have enough.
+    #
+    # The old code ran rg to completion with capture_output=True, buffering the
+    # ENTIRE result, then parsed every JSON line in pure Python. On a large tree
+    # (e.g. a default-path search over ~250k files) a common pattern emits tens
+    # of thousands of lines / tens of MB of JSON — and we'd parse all of it even
+    # though only `max_results` matches are ever surfaced. That pure-Python parse
+    # holds the GIL for seconds, freezing the Qt GUI thread.
+    #
+    # Instead we read rg's stdout lazily and KILL the process once we've gathered
+    # `max_results` matches. Each readline is I/O that releases the GIL, and the
+    # parse is now bounded to O(max_results) regardless of repo size — so the UI
+    # stays responsive. Small searches behave exactly as before.
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=30,
             encoding="utf-8",
             errors="replace",
             creationflags=NO_WINDOW,  # no console flash on Windows
         )
-    except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Search timed out after 30 seconds."})
     except FileNotFoundError:
         return json.dumps({"error": f"ripgrep binary not found at {_rg_path}"})
-
-    # rg exits 2 on a real error (e.g. a bad regex). Surface it instead of
-    # reporting "no matches" — a malformed pattern shouldn't look like an
-    # empty result.
-    if result.returncode == 2 and result.stderr.strip():
-        return json.dumps({"error": f"ripgrep: {result.stderr.strip()[:300]}"})
 
     # Parse JSON output lines. Collect both 'match' and 'context' entries so
     # context lines can be interleaved with their matches per file.
     matches_by_file: dict[str, list[dict]] = {}
     match_count_by_file: dict[str, int] = {}
-    for _i, line in enumerate(result.stdout.splitlines()):
-        # A large search yields a lot of JSON; parsing it is pure-Python and
-        # holds the GIL. Breathe periodically so the GUI thread isn't starved.
-        if _i % 4000 == 0:
-            time.sleep(0)
-        if not line.strip():
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    kept_matches = 0          # matches within per_file_cap (≈ output match lines)
+    hit_global_cap = False    # stopped because we reached max_results
+    timed_out = False
+    deadline = time.monotonic() + 30  # wall-clock guard (replaces run timeout)
 
-        mtype = msg.get("type")
-        if mtype not in ("match", "context"):
-            continue
-
-        data = msg.get("data", {})
-        file_path = data.get("path", {}).get("text", "")
-        line_number = data.get("line_number", 0)
-        line_text = data.get("lines", {}).get("text", "").rstrip("\n\r")
-        if not file_path:
-            continue
-
-        is_match = mtype == "match"
-        # Honor per-file cap on MATCHES only (context lines ride along free).
-        if is_match:
-            seen = match_count_by_file.get(file_path, 0)
-            if seen >= per_file_cap:
-                match_count_by_file[file_path] = seen + 1  # keep counting for note
+    try:
+        for _i, line in enumerate(proc.stdout):
+            # Re-check the clock cheaply every so often so a pathological search
+            # can't run past the deadline.
+            if _i % 1000 == 0 and time.monotonic() > deadline:
+                timed_out = True
+                break
+            if not line.strip():
                 continue
-            match_count_by_file[file_path] = seen + 1
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-        matches_by_file.setdefault(file_path, []).append({
-            "line": line_number,
-            "text": line_text,
-            "is_match": is_match,
-        })
+            mtype = msg.get("type")
+            if mtype not in ("match", "context"):
+                continue
+
+            data = msg.get("data", {})
+            file_path = data.get("path", {}).get("text", "")
+            line_number = data.get("line_number", 0)
+            line_text = data.get("lines", {}).get("text", "").rstrip("\n\r")
+            if not file_path:
+                continue
+
+            is_match = mtype == "match"
+            # Honor per-file cap on MATCHES only (context lines ride along free).
+            if is_match:
+                seen = match_count_by_file.get(file_path, 0)
+                if seen >= per_file_cap:
+                    match_count_by_file[file_path] = seen + 1  # keep counting for note
+                    continue
+                match_count_by_file[file_path] = seen + 1
+
+            matches_by_file.setdefault(file_path, []).append({
+                "line": line_number,
+                "text": line_text,
+                "is_match": is_match,
+            })
+
+            # Stop once we've kept enough matches to fill the output budget.
+            # We give a little headroom so the mtime sort below still has a few
+            # files to choose "newest first" from.
+            if is_match:
+                kept_matches += 1
+                if kept_matches >= max_results + per_file_cap:
+                    hit_global_cap = True
+                    break
+    finally:
+        # If we stopped early, terminate rg and reap it so no process leaks.
+        # Drain stderr (small) for error reporting before waiting.
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+        try:
+            stderr_text = (proc.stderr.read() or "") if proc.stderr else ""
+        except Exception:
+            stderr_text = ""
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    if timed_out and not matches_by_file:
+        return json.dumps({"error": "Search timed out after 30 seconds."})
+
+    # rg exits 2 on a real error (e.g. a bad regex). Surface it instead of
+    # reporting "no matches" — a malformed pattern shouldn't look like an empty
+    # result. (Only meaningful when we let rg finish; an early kill won't be 2.)
+    if (not hit_global_cap and not timed_out
+            and proc.returncode == 2 and stderr_text.strip()):
+        return json.dumps({"error": f"ripgrep: {stderr_text.strip()[:300]}"})
 
     if not matches_by_file:
         return json.dumps({"results": "No matches found."})
@@ -222,12 +272,17 @@ def grep(pattern: str, path: str = None, glob: str = None,
             capped_note_added = True
 
     output = "\n".join(output_lines)
-    if total >= max_results:
-        remaining = sum(
-            c for c in match_count_by_file.values()) - total
-        if remaining > 0:
-            output += (f"\n\n(showing {total} of {total + remaining}+ matches, "
-                       f"capped at max_results={max_results})")
+    # `hit_global_cap` means we stopped reading rg early (there were more matches
+    # we never parsed), so we can only report a lower bound. `total >= max_results`
+    # means we filled the output budget from what we did parse. Either way the
+    # honest signal is "N+ matches, narrow the pattern or path".
+    if total >= max_results or hit_global_cap:
+        output += (f"\n\n(showing {total} matches; more exist - "
+                   f"narrow the pattern or pass a `path` to scope the search "
+                   f"(max_results={max_results}))")
+    elif timed_out:
+        output += ("\n\n(search hit the 30s limit — results are partial; "
+                   "pass a narrower `path` to scope it)")
     elif capped_note_added:
         output += ("\n\n(some files had more matches than per_file_cap="
                    f"{per_file_cap}; raise it or narrow the pattern)")

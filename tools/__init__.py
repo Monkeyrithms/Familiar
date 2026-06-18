@@ -51,6 +51,7 @@ import tools.multi_file      # noqa: F401
 import tools.file_watcher    # noqa: F401
 import tools.project_loader  # noqa: F401
 import tools.notify          # noqa: F401
+import tools.send_message    # noqa: F401
 import tools.ocr             # noqa: F401
 import tools.data_extract    # noqa: F401
 import tools.ssh_tool        # noqa: F401
@@ -72,6 +73,7 @@ import tools.ask_user            # noqa: F401
 import tools.reflect             # noqa: F401
 import tools.notes               # noqa: F401
 import tools.network_tool        # noqa: F401
+import tools.inapp_browser        # noqa: F401  (in-app browser bridge — main-thread QObject)
 try:
     import tools.mcp_tool          # noqa: F401
 except Exception as _e:
