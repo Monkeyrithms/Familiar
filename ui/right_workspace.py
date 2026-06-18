@@ -582,6 +582,214 @@ class BrowserWorkspacePanel(QFrame):
         self._add_tab_with_url(url, title="Agent")
         return True
 
+    # ── Agent automation: drive a dedicated "Agent" tab from the browser tool ──
+    # All methods below run on the GUI main thread (invoked via the in-app signal
+    # bridge in tools/inapp_browser.py) so they can touch QWebEngine safely.
+
+    _AGENT_ELEMENTS_JS = r"""
+    (() => {
+      const pick = (el) => {
+        if (el.id) return '#' + CSS.escape(el.id);
+        const tag = el.tagName.toLowerCase();
+        if (el.name) return tag + '[name="' + el.name + '"]';
+        const ph = el.getAttribute && el.getAttribute('placeholder');
+        if (ph) return tag + '[placeholder="' + ph.replace(/"/g, '\\"') + '"]';
+        const al = el.getAttribute && el.getAttribute('aria-label');
+        if (al) return tag + '[aria-label="' + al.replace(/"/g, '\\"') + '"]';
+        const t = el.getAttribute && el.getAttribute('type');
+        if (t) return tag + '[type="' + t + '"]';
+        return tag;
+      };
+      const els = [...document.querySelectorAll(
+        'input,textarea,select,button,a[href],[role="button"],[contenteditable="true"]')]
+        .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; })
+        .slice(0, 60)
+        .map(el => ({tag: el.tagName.toLowerCase(), type: el.getAttribute('type') || '',
+                     name: el.getAttribute('name') || '', id: el.id || '',
+                     placeholder: el.getAttribute('placeholder') || '',
+                     text: (el.innerText || el.value || '').trim().slice(0, 60),
+                     selector: pick(el)}));
+      return {elements: els, text: (document.body ? document.body.innerText.slice(0, 6000) : '')};
+    })()
+    """
+
+    def _agent_view(self, create: bool = False):
+        """Find (or create) the dedicated 'Agent' tab's QWebEngineView."""
+        if not self._webengine:
+            return None
+        for i in range(self._tab_widget.count()):
+            if self._tab_widget.tabText(i) == "Agent" and i < len(self._tabs):
+                self._tab_widget.setCurrentIndex(i)
+                return self._tabs[i].get("view")
+        if create:
+            self._add_tab_with_url("about:blank", title="Agent")
+            return self._current_view()
+        return None
+
+    def _run_js(self, page, js: str, timeout_ms: int = 6000):
+        """Synchronously run JS on *page* (spins a nested event loop for the result)."""
+        from PyQt6.QtCore import QEventLoop, QTimer
+        loop = QEventLoop()
+        holder, done = {}, {"v": False}
+
+        def _cb(res):
+            holder["r"] = res
+            if not done["v"]:
+                done["v"] = True
+                loop.quit()
+        page.runJavaScript(js, _cb)
+        t = QTimer(); t.setSingleShot(True); t.timeout.connect(loop.quit); t.start(timeout_ms)
+        loop.exec()
+        return holder.get("r")
+
+    def _load_sync(self, view, url: str, timeout_ms: int = 20000) -> bool:
+        """setUrl and block until loadFinished (or timeout)."""
+        from PyQt6.QtCore import QEventLoop, QTimer
+        loop = QEventLoop()
+        res = {"ok": None}
+
+        def _fin(ok):
+            res["ok"] = ok
+            loop.quit()
+        view.loadFinished.connect(_fin)
+        view.setUrl(QUrl(url))
+        t = QTimer(); t.setSingleShot(True); t.timeout.connect(loop.quit); t.start(timeout_ms)
+        loop.exec()
+        try:
+            view.loadFinished.disconnect(_fin)
+        except Exception:
+            pass
+        return bool(res["ok"])
+
+    def _settle(self, ms: int = 600):
+        from PyQt6.QtCore import QEventLoop, QTimer
+        loop = QEventLoop()
+        t = QTimer(); t.setSingleShot(True); t.timeout.connect(loop.quit); t.start(ms)
+        loop.exec()
+
+    def _agent_report(self, view) -> dict:
+        out = self._run_js(view.page(), self._AGENT_ELEMENTS_JS) or {}
+        return {"backend": "inapp", "url": view.url().toString(), "title": view.title() or "",
+                "elements": out.get("elements", []) if isinstance(out, dict) else [],
+                "text": out.get("text", "") if isinstance(out, dict) else ""}
+
+    def run_agent_action(self, req: dict) -> dict:
+        """Entry point for the browser tool's in-app mode. Returns a JSON-able dict."""
+        if not self._webengine:
+            return {"error": "WebEngine not available in this build"}
+        import json as _json
+        action = (req.get("action") or "navigate").strip().lower()
+        selector = req.get("selector") or ""
+        text = req.get("text") or ""
+        try:
+            if action == "status":
+                return {"backend": "inapp", "tab": "Agent",
+                        "have_tab": self._agent_view(create=False) is not None}
+
+            if action == "navigate":
+                url = self._normalize_url(req.get("url") or "")
+                if not url:
+                    return {"error": "url required for navigate"}
+                view = self._agent_view(create=True)
+                if view is None:
+                    return {"error": "could not open Agent tab (WebEngine profile unavailable)"}
+                self._url_edit.setText(url)
+                ok = self._load_sync(view, url)
+                self._sync_nav_buttons()
+                self._settle(400)
+                rep = self._agent_report(view)
+                rep["loaded"] = ok
+                return rep
+
+            view = self._agent_view(create=True)
+            if view is None:
+                return {"error": "no Agent tab; call navigate first"}
+            page = view.page()
+
+            if action == "snapshot":
+                return self._agent_report(view)
+
+            if action == "screenshot":
+                import os, tempfile
+                pm = view.grab()
+                path = req.get("screenshot_path") or os.path.join(
+                    tempfile.gettempdir(), "inapp_agent_browser.png")
+                pm.save(path, "PNG")
+                return {"screenshot": path, "url": view.url().toString()}
+
+            if action == "click":
+                if not selector:
+                    return {"error": "selector required for click"}
+                js = ("(()=>{const el=document.querySelector(%s);if(!el)return{error:'not found'};"
+                      "el.scrollIntoView({block:'center'});el.click();return{clicked:true};})()"
+                      % _json.dumps(selector))
+                r = self._run_js(page, js) or {}
+                self._settle(500)
+                self._url_edit.setText(view.url().toString())
+                self._sync_nav_buttons()
+                rep = self._agent_report(view)
+                rep["click"] = r
+                return rep
+
+            if action in ("type", "fill"):
+                if not selector:
+                    return {"error": "selector required for type"}
+                js = ("(()=>{const el=document.querySelector(%s);if(!el)return{error:'selector not found'};"
+                      "el.focus();const proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
+                      "try{const s=Object.getOwnPropertyDescriptor(proto,'value').set;s.call(el,%s);}"
+                      "catch(e){el.value=%s;}"
+                      "el.dispatchEvent(new Event('input',{bubbles:true}));"
+                      "el.dispatchEvent(new Event('change',{bubbles:true}));"
+                      "return{verified:el.value===%s,value:el.value};})()"
+                      % (_json.dumps(selector), _json.dumps(text), _json.dumps(text), _json.dumps(text)))
+                r = self._run_js(page, js) or {}
+                if isinstance(r, dict):
+                    r.setdefault("into", selector)
+                    r["backend"] = "inapp"
+                return r if isinstance(r, dict) else {"error": "type failed"}
+
+            if action == "press":
+                key = req.get("key") or text or "Enter"
+                js = ("(()=>{const el=document.activeElement||document.body;"
+                      "for(const ty of ['keydown','keypress','keyup'])"
+                      "el.dispatchEvent(new KeyboardEvent(ty,{key:%s,bubbles:true}));"
+                      "if(%s==='Enter'&&el.form){try{el.form.requestSubmit?el.form.requestSubmit():el.form.submit();}catch(e){}}"
+                      "return{pressed:%s};})()" % (_json.dumps(key), _json.dumps(key), _json.dumps(key)))
+                self._run_js(page, js)
+                self._settle(700)
+                self._sync_nav_buttons()
+                return self._agent_report(view)
+
+            if action == "scroll":
+                d = (req.get("direction") or text or "down").lower()
+                self._run_js(page, "window.scrollBy(0, %d)" % (-600 if d == "up" else 600))
+                self._settle(300)
+                return self._agent_report(view)
+
+            if action == "back":
+                view.back()
+                self._settle(700)
+                self._sync_nav_buttons()
+                return self._agent_report(view)
+
+            if action == "scrape":
+                if selector:
+                    js = ("(()=>[...document.querySelectorAll(%s)].slice(0,50)"
+                          ".map(e=>(e.innerText||'').trim()))()" % _json.dumps(selector))
+                    return {"selector": selector, "results": self._run_js(page, js) or []}
+                return {"text": self._run_js(
+                    page, "document.body?document.body.innerText.slice(0,15000):''") or ""}
+
+            if action == "run_script":
+                return {"result": self._run_js(page, req.get("script") or "")}
+
+            if action == "close":
+                return {"closed": True, "note": "Agent tab left open for the user"}
+
+            return {"error": f"unknown action: {action}"}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
     def _request_collapse(self):
         if self._collapse_cb:
             self._collapse_cb()

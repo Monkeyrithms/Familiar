@@ -4074,9 +4074,10 @@ class FileViewer(QFrame):
                 widget.setStyleSheet(self._code_editor_stylesheet(p))
                 widget.refresh_palette()
             elif isinstance(widget, MediaViewer):
-                # MediaViewer manages its own palette; just re-load so any
-                # theme-dependent info bar text refreshes.
-                self._reload_tab(tab)
+                # MediaViewer caches PALETTE at construction, so rebuild its
+                # chrome stylesheets (info bar, Fit button, header) on theme
+                # change — otherwise they keep the old accent color.
+                widget.refresh_palette()
             else:
                 widget.setStyleSheet(self._text_browser_stylesheet(p))
                 self._reload_tab(tab)

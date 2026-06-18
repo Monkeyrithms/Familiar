@@ -348,6 +348,38 @@ class MediaViewer(QWidget):
         self._stop_media()
         self._image_pane._stop_movie()
 
+    def refresh_palette(self):
+        """Re-apply palette-dependent stylesheets after a theme change.
+
+        The constructor captures PALETTE once, so chrome (info bar, Fit
+        button, header) keeps the old accent when the user switches theme
+        color. FileViewer calls this on every theme change.
+        """
+        p = PALETTE
+        self.setStyleSheet(f"background: {p['panel_alt']};")
+        self._info.setStyleSheet(
+            f"color: {p['muted_text']}; background: {p['panel']}; "
+            f"padding: 4px 10px; font-family: Consolas; font-size: 9pt; "
+            f"border-bottom: 1px solid {p['border']};"
+        )
+        self._zoom_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {p['border']}; "
+            f"color: {p['accent']}; padding: 1px 8px; border-radius: 3px; font-family: Consolas; font-size: 9pt; }}"
+            f"QPushButton:hover {{ border-color: {p['accent']}; }}"
+        )
+        self._header_row.setStyleSheet(
+            f"background: {p['panel']}; border-bottom: 1px solid {p['border']};"
+        )
+        self._image_pane.setStyleSheet(
+            f"QScrollArea {{ background: {p['panel_alt']}; border: none; }}"
+        )
+        if self._audio_pane is not None:
+            self._audio_pane.setStyleSheet(f"background: {p['panel_alt']};")
+        if getattr(self, "_audio_title", None) is not None:
+            self._audio_title.setStyleSheet(
+                f"color: {p['text']}; font-family: Consolas; font-size: 11pt; background: transparent;"
+            )
+
     # ── images / gif / svg ─────────────────────────────────────────
 
     def _load_image_like(self, path: str, ext: str):

@@ -3045,6 +3045,10 @@ class ChatWindow(QWidget):
         from tools.workspace_browser import set_context_provider, set_grab_handler
         set_context_provider(self._right_workspace.browser_panel.get_current_page_context)
         set_grab_handler(self._right_workspace.browser_panel.grab_current_view)
+        # In-app browser automation: let the `browser` tool drive a visible "Agent"
+        # tab (user's session) instead of a separate popup Chromium.
+        from tools.inapp_browser import set_inapp_handler
+        set_inapp_handler(self._right_workspace.browser_panel.run_agent_action)
 
         # Sub-agent bridge — live cards + per-agent terminals
         from tools.subagent_tool import get_bridge as _get_sa_bridge
@@ -8277,7 +8281,9 @@ class ChatWindow(QWidget):
             mode = (self.agent.config.get("completion_sound") or "always").lower()
             if mode == "always" or (mode == "off_focus" and unfocused):
                 from core.sounds import play_ui
-                play_ui("complete.mp3")
+                # Half volume — the completion chime should be a soft cue, not a
+                # full-blast notification (per-play level, see sounds.play()).
+                play_ui("complete.mp3", volume=0.5)
             if unfocused and self.agent.config.get("taskbar_blink_on_done", True):
                 from PyQt6.QtWidgets import QApplication
                 QApplication.alert(self.window())

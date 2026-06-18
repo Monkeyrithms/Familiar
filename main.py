@@ -715,6 +715,13 @@ def main():
             pass
 
     # Qt app
+    # The embedded Browser (QtWebEngine) requires AA_ShareOpenGLContexts to be
+    # set BEFORE the QApplication is created. The workspace panel imports
+    # QtWebEngineWidgets lazily during window construction (after this point), so
+    # without this attribute that import raises "QtWebEngineWidgets must be
+    # imported ... before a QCoreApplication instance is created" and the Browser
+    # tab silently falls back to "needs PyQt6 WebEngine" even though it's installed.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     # Force Fusion. Qt 6's default "windows11" native style ignores QSS borders
     # on QAbstractScrollArea frames (QTextEdit, QGraphicsView, QScrollArea), so

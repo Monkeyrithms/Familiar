@@ -387,6 +387,13 @@ class PtyTerminalView(QWidget):
         # the UI stays responsive while the terminal catches up.
         self._feed_pending: list[str] = []
         self._MAX_FEED_PER_TICK = 65536  # chars of pyte parsing per drain pass
+        # Scroll-lock. pyte.HistoryScreen snaps the view back to the live bottom
+        # on ANY draw (its before_event hook), so feeding new output while the
+        # user has paged up would yank them straight back down — making it
+        # impossible to read/copy scrollback. While `_following` is False we HOLD
+        # incoming output (bounded) and flush it only when the user returns to the
+        # bottom or types. True = view tracks the live bottom (the normal state).
+        self._following = True
         self._feed_timer = QTimer(self)
         self._feed_timer.setSingleShot(True)
         self._feed_timer.timeout.connect(self._drain_feed)
@@ -429,6 +436,12 @@ class PtyTerminalView(QWidget):
 
     def _drain_feed(self):
         if not self._feed_pending:
+            return
+        # Scroll-lock: while paged up, hold output instead of feeding pyte (which
+        # would snap the view to the bottom). We keep buffering — bounded — and
+        # flush once the user scrolls back down or types.
+        if not self._following:
+            self._cap_held_output()
             return
         blob = "".join(self._feed_pending)
         self._feed_pending.clear()
@@ -474,6 +487,47 @@ class PtyTerminalView(QWidget):
         if not text:
             return
         self.feed(text.replace("\r\n", "\n").replace("\n", "\r\n"))
+
+    # ── Scroll-lock helpers ─────────────────────────────────────────
+    _MAX_HELD_OUTPUT = 4_000_000  # chars of output retained while scroll-locked
+
+    def _at_bottom(self) -> bool:
+        """True when pyte's view sits at the live bottom of the history buffer."""
+        try:
+            h = self._screen.history
+            return h.position >= h.size
+        except Exception:
+            return True
+
+    def _cap_held_output(self):
+        """Bound the output buffered while the user is scrolled up, dropping the
+        OLDEST so a noisy process can't grow it without limit. pyte's own history
+        caps at 5000 lines anyway, so trimming ancient held output is harmless."""
+        total = sum(len(s) for s in self._feed_pending)
+        if total <= self._MAX_HELD_OUTPUT:
+            return
+        blob = "".join(self._feed_pending)
+        self._feed_pending = [blob[-self._MAX_HELD_OUTPUT:]]
+
+    def _scroll_to_bottom_and_drain(self):
+        """Return to following the live bottom and flush any held output. Called
+        when the user pages back down to the bottom or types into the terminal."""
+        self._following = True
+        # Snap pyte's own view to the end of history (no-op if already there).
+        try:
+            guard = 0
+            while not self._at_bottom() and guard < 10000:
+                self._screen.next_page()
+                guard += 1
+        except Exception:
+            pass
+        # Flush whatever we buffered while locked; pyte appends it and the view
+        # is now at the live bottom so the user sees the latest output.
+        self._color_cache_dirty = True
+        if self._feed_pending:
+            self._drain_feed()
+        else:
+            self.update()
 
     def _schedule_paint(self):
         if self._paint_pending:
@@ -673,25 +727,49 @@ class PtyTerminalView(QWidget):
         self.update()
 
     # ── Reading scrollback (agent / read_terminal) ──────────────────
-    def toPlainText(self) -> str:
-        # Parse any buffered-but-undrained output so the reader sees the latest
-        # screen (an explicit read wants complete output, not a stale frame).
-        if self._feed_pending:
-            try:
-                self._stream.feed("".join(self._feed_pending))
-                self._feed_pending.clear()
-            except Exception:
-                pass
+    @staticmethod
+    def _render_screen_plain(scr) -> list[str]:
+        """Flatten a pyte screen's history + visible grid to plain text lines."""
         lines: list[str] = []
         try:
-            for row in self._screen.history.top:
+            for row in scr.history.top:
                 lines.append("".join(row[x].data for x in sorted(row)).rstrip())
         except Exception:
             pass
         try:
-            lines.extend(line.rstrip() for line in self._screen.display)
+            lines.extend(line.rstrip() for line in scr.display)
         except Exception:
             pass
+        return lines
+
+    def toPlainText(self) -> str:
+        if self._feed_pending:
+            if self._following:
+                # At the live bottom — flush buffered output into the real screen
+                # so the reader sees the latest frame (the view tracks it anyway).
+                try:
+                    self._stream.feed("".join(self._feed_pending))
+                    self._feed_pending.clear()
+                except Exception:
+                    pass
+            else:
+                # Scroll-locked: the reader still wants complete output, but we
+                # must NOT feed the live screen — pyte would snap the view to the
+                # bottom (its before_event hook) and undo the user's scroll. Render
+                # the held output through a THROWAWAY screen instead: zero side
+                # effects on what the user is looking at.
+                lines = self._render_screen_plain(self._screen)
+                try:
+                    scratch = pyte.HistoryScreen(
+                        self._cols, max(1, self._rows), history=20000, ratio=0.5)
+                    pyte.Stream(scratch).feed("".join(self._feed_pending))
+                    lines.extend(self._render_screen_plain(scratch))
+                except Exception:
+                    pass
+                while lines and not lines[-1]:
+                    lines.pop()
+                return "\n".join(lines)
+        lines = self._render_screen_plain(self._screen)
         # Drop trailing blank lines so callers see real content.
         while lines and not lines[-1]:
             lines.pop()
@@ -1140,6 +1218,10 @@ class PtyTerminalView(QWidget):
 
         seq = self._key_to_seq(key, ctrl, shift, ev.text())
         if seq:
+            # Typing returns you to the live bottom (as every terminal does) so
+            # you see what you type and the echoed output, releasing scroll-lock.
+            if not self._following:
+                self._scroll_to_bottom_and_drain()
             self.key_input.emit(seq)
 
     def focusNextPrevChild(self, _next: bool) -> bool:
@@ -1233,6 +1315,14 @@ class PtyTerminalView(QWidget):
             elif steps < 0:
                 for _ in range(-steps):
                     self._screen.next_page()
+            # Track whether we're still pinned to the live bottom. Paging up
+            # engages scroll-lock (HOLD new output); paging back down to the
+            # bottom releases it and flushes whatever arrived while locked.
+            if self._at_bottom():
+                if not self._following:
+                    self._scroll_to_bottom_and_drain()
+            else:
+                self._following = False
             # Wheeling mid-drag: the cursor is stationary but the text under it
             # paged, so extend the selection to the cell now under the cursor —
             # drag + wheel selects past one screenful instead of losing the
