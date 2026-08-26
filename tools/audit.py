@@ -29,15 +29,17 @@ def _agent():
 
 
 def _conv_id_from_ctx(ctx) -> str:
-    """Resolve the current conversation id from agent state."""
-    try:
-        from core.agent import Agent  # noqa: F401
-    except Exception:
+    """Resolve the current conversation id from agent state.
+
+    conv_id is authoritative; session_id is only a fallback. Never guess:
+    a wrong id would surface another conversation's recorded context.
+    """
+    if not ctx:
         return ""
-    # Walk through globals to find any active Agent instance — fall back to
-    # ctx.session_id which we set in tool dispatch.
-    sid = getattr(ctx, "session_id", "") if ctx else ""
-    return sid or ""
+    conv_id = (getattr(ctx, "conv_id", "") or "").strip()
+    if conv_id:
+        return conv_id
+    return (getattr(ctx, "session_id", "") or "").strip()
 
 
 def _msg_size(msg: dict) -> tuple[int, str]:
@@ -150,18 +152,14 @@ def audit(action: str, n: int = 5, turn_index: int = -1, top_k: int = 10,
     """Inspect per-turn tokens + tool sizes from DebugRecorder."""
     from core.debug_recorder import debug_recorder
 
-    # Best-effort conversation id resolution.
     conv_id = _conv_id_from_ctx(ctx)
-    # Final fallback: probe the singleton's most populated bucket
     if not conv_id:
-        try:
-            buckets = getattr(debug_recorder, "_by_conv", {}) or {}
-            if buckets:
-                conv_id = max(buckets.items(), key=lambda kv: len(kv[1]))[0]
-                if conv_id == "__no_conv__":
-                    conv_id = ""
-        except Exception:
-            pass
+        return json.dumps({
+            "error": (
+                "No conversation id was supplied, so no debug turns can be "
+                "attributed. Refusing to guess a conversation."
+            )
+        })
 
     if action == "summary":
         # Per-turn high-level for the last N turns

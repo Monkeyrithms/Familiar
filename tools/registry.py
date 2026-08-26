@@ -67,9 +67,11 @@ class ToolRegistry:
         return tool.get("accepts_ctx", False) if tool else False
 
     def list_tools(self) -> list[dict]:
+        # list() snapshot: MCP servers register tools from background threads,
+        # so iterating the live dict can raise "dict changed size during iteration".
         return [
             {"name": t["name"], "description": t["description"]}
-            for t in self._tools.values()
+            for t in list(self._tools.values())
         ]
 
     def get_schemas(self) -> list[dict]:
@@ -89,7 +91,7 @@ class ToolRegistry:
                     "parameters": t["parameters"],
                 },
             }
-            for t in self._tools.values()
+            for t in list(self._tools.values())
             if t["name"] not in self._disabled
         ]
 

@@ -162,6 +162,14 @@ def _start_bg_process(command: str, cwd: str = None) -> dict:
     result = bg_bridge.start_bg(command, cwd or "")
     if result.get("error"):
         return result
+    if "bg_id" not in result:
+        return {
+            "error": (
+                "Background workspace terminals are unavailable in this headless "
+                "Familiar session. Retry the command with background=false."
+            ),
+            "details": result,
+        }
     return {
         "bg_id": result["bg_id"],
         "command": result["command"],
@@ -510,6 +518,8 @@ def _try_convert_command(command: str, cwd: str | None) -> str | None:
         # Simpler: just execute it here directly
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONUTF8"] = "1"              # UTF-8 mode: child stdout isn't cp1252
+        env["PYTHONIOENCODING"] = "utf-8"
         try:
             result = subprocess.run(
                 'cmd /s /c "' + win_cmd + '"',
@@ -676,6 +686,13 @@ def terminal(command: str, timeout: int = None, cwd: str = None,
     try:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Force UTF-8 on child stdio. Without this a Python child on Windows
+        # defaults its stdout to the console codepage (cp1252), so print()-ing
+        # any non-cp1252 char (emoji, box-drawing, curly quotes) crashes the
+        # CHILD with UnicodeEncodeError before we ever decode it. We read the
+        # pipe as utf-8 (below), so pin the writer to utf-8 to match.
+        env["PYTHONUTF8"] = "1"              # UTF-8 mode for child Python procs
+        env["PYTHONIOENCODING"] = "utf-8"    # belt-and-suspenders for edge cases
 
         proc = subprocess.Popen(
             shell_cmd,

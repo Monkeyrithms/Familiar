@@ -1,5 +1,5 @@
 """
-Notification tool — send emails (SMTP) and webhook alerts.
+Notification tool — send emails (SMTP), webhook alerts, desktop notifications.
 """
 
 import json
@@ -8,7 +8,36 @@ import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
+
+from PyQt6.QtCore import QObject, pyqtSignal
 from tools.registry import registry
+
+
+class _NotifyBridge(QObject):
+    """Created at import time on the main thread. Worker threads emit
+    show_requested; the popup is built and shown on the GUI thread."""
+
+    show_requested = pyqtSignal(str, str)  # title, message
+
+    def __init__(self):
+        super().__init__()
+        self.show_requested.connect(self._show)
+        self._boxes = []  # keep refs so non-modal boxes aren't GC'd early
+
+    def _show(self, title: str, message: str):
+        try:
+            from PyQt6.QtWidgets import QMessageBox
+            box = QMessageBox(QMessageBox.Icon.Information, title, message)
+            box.setModal(False)  # never block the GUI under an agent tool
+            box.finished.connect(lambda *_ , b=box: self._boxes.remove(b)
+                                 if b in self._boxes else None)
+            self._boxes.append(box)
+            box.show()
+        except Exception:
+            pass
+
+
+_notify_bridge = _NotifyBridge()
 
 
 def _load_smtp_config() -> dict:
@@ -74,21 +103,16 @@ def notify(action: str, to: str = "", subject: str = "", body: str = "",
             return json.dumps({"error": f"Webhook failed: {e}"})
 
     elif action == "desktop":
-        # Cross-platform desktop notification
+        # Cross-platform desktop notification. This runs on a WORKER thread:
+        # Qt widgets/timers must not be created here. Marshal to the GUI
+        # thread via the bridge below (the old QTimer.singleShot-from-worker
+        # never fired reliably and was thread-unsafe).
         try:
             title = subject or "Agent"
             message = body or "Notification"
-            import sys
-            if sys.platform == "win32":
-                from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
-                from PyQt6.QtGui import QIcon
-                app = QApplication.instance()
-                if app:
-                    # Use a simple message box as fallback
-                    from PyQt6.QtWidgets import QMessageBox
-                    # Fire and forget on main thread
-                    from PyQt6.QtCore import QTimer
-                    QTimer.singleShot(0, lambda: QMessageBox.information(None, title, message))
+            from PyQt6.QtWidgets import QApplication
+            if QApplication.instance():
+                _notify_bridge.show_requested.emit(title, message)
             return json.dumps({
                 "status": "done",
                 "message": f"Desktop notification '{title}' shown to the user. "

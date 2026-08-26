@@ -144,6 +144,10 @@ def _vector_search_impl(action: str, name: str, path: str,
             conn.commit()
         finally:
             conn.close()
+        # We dropped chunks_vec + embed_dims out-of-band — make the next
+        # _connect() re-run the DDL instead of trusting its per-process cache.
+        from core.code_index import invalidate_schema_cache
+        invalidate_schema_cache(idx.db_path)
         if patterns:
             pats = tuple(p.strip() for p in patterns.split(",") if p.strip())
         else:

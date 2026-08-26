@@ -23,6 +23,7 @@ IGNORE_DIRS = {
     # of files). Walking it stalls the search and — because the traversal is
     # pure-Python and holds the GIL — starves the app's GUI thread into stutter.
     "site-packages", "site-packages64",
+    "data", "logs", "file_share", "sandbox", "Distributable",
 }
 
 # Cooperatively release the GIL every N directories so a large tree never

@@ -147,7 +147,6 @@ def memory(action: str, stream: str = "", category: str = "",
 
     elif action == "compress":
         """Compress memory: agent-driven trimming of notes to a target size."""
-        from core.database import list_note_categories
         if not category:
             # Compress entire stream
             cats = list_note_categories(stream)
@@ -211,6 +210,12 @@ registry.register(
         "Persistent memory notes. "
         "browse|read|save|delete|search|rename_category|move_category|rename_note|move_note. "
         "save: keywords (comma-sep regex) auto-inject note on msg match. "
+        "DURABILITY TEST before save: would this still matter weeks from now, after "
+        "this task is done? If it's only true 'right now', DON'T save. NEVER save "
+        "completion/status crumbs ('fixed X', 'shipped', 'needs restart', 'tested OK'), "
+        "one-turn forensic artifacts (a dump, a turn id, current scene/state), or "
+        "anything re-derivable from code/DB. Save the durable LESSON, never the event. "
+        "A fixed bug is not a note; the rule that prevents its recurrence is. "
         "save: provenance = origin/trust of the fact — 'confirmed' (user stated it), "
         "'observed' (read from a source/file), 'imported' (from a transcript), "
         "'inferred' (you deduced it). Recalled notes show this tag so trust is visible."

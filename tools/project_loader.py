@@ -12,6 +12,7 @@ from tools.registry import registry
 IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
     ".next", ".nuxt", "coverage", ".pytest_cache", ".cache", ".tox", "egg-info",
+    "data", "logs", "file_share", "sandbox", "Distributable",
 }
 IGNORE_EXTENSIONS = {".pyc", ".pyo", ".exe", ".dll", ".so", ".dylib", ".o", ".obj"}
 MAX_FILES = 5000

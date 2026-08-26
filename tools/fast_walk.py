@@ -29,6 +29,7 @@ DEFAULT_IGNORE_DIRS = {
     ".next", ".nuxt", "coverage", ".pytest_cache", ".cache", ".tox",
     "egg-info", ".mypy_cache", ".idea", ".vscode",
     "site-packages", "site-packages64",
+    "data", "logs", "file_share", "sandbox", "Distributable",
 }
 
 _HARD_CAP = 200_000

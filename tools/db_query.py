@@ -33,13 +33,16 @@ def _is_sqlite(p: Path) -> bool:
 
 
 def db_query(path: str, query: str = "", write: bool = False, limit: int = 100,
-             action: str = "query") -> str:
+             action: str = "query", backup: bool = False,
+             table: str = "", column: str = "", where: str = "") -> str:
     """
     Execute SQL queries or inspect the schema of a SQLite database.
 
     action="query"   — run a SQL statement (default)
     action="inspect" — return full schema: tables, columns, types, foreign keys,
                        indexes, and row counts. No query argument needed.
+    action="cell"    — dump ONE column value untruncated (table+column+where),
+                       bypassing inline truncation. For reading a big JSON blob.
     """
     p = Path(path)
     if not p.exists():
@@ -59,17 +62,44 @@ def db_query(path: str, query: str = "", write: bool = False, limit: int = 100,
             conn.close()
             return json.dumps(schema, ensure_ascii=False, default=str)
 
+        if action == "cell":
+            if not (table and column):
+                conn.close()
+                return json.dumps({"error": "action='cell' needs 'table' and 'column'"})
+            sql = f"SELECT [{column}] FROM [{table}]"
+            if where:
+                sql += f" WHERE {where}"
+            rows = conn.execute(sql).fetchall()
+            conn.close()
+            if not rows:
+                return json.dumps({"error": "no rows matched (check 'where')"})
+            if len(rows) > 1:
+                return json.dumps({"error": f"{len(rows)} rows matched — tighten "
+                                            "'where' to a single row."})
+            val = rows[0][0]
+            return json.dumps({"table": table, "column": column,
+                               "value": val,
+                               "length": len(val) if isinstance(val, (str, bytes)) else None},
+                              ensure_ascii=False, default=str)
+
         # --- regular query ---
         if not query:
             conn.close()
             return json.dumps({"error": "query is required for action='query'"})
 
         if write:
+            if backup:
+                conn.close()
+                bak = _backup_file(p)
+                conn = sqlite3.connect(str(p), timeout=5)
             conn.execute(query)
             conn.commit()
             changes = conn.total_changes
             conn.close()
-            return json.dumps({"success": True, "changes": changes})
+            out = {"success": True, "changes": changes}
+            if backup:
+                out["backup"] = str(bak)
+            return json.dumps(out)
         else:
             cur = conn.execute(query)
             rows = cur.fetchmany(limit)
@@ -168,22 +198,37 @@ def _inspect_schema(conn: sqlite3.Connection) -> dict:
     return schema
 
 
+def _backup_file(p: Path) -> Path:
+    """Snapshot a SQLite file next to itself before a destructive write."""
+    import shutil
+    import time
+    bak = p.with_suffix(p.suffix + f".bak_{int(time.time())}")
+    shutil.copy2(p, bak)
+    return bak
+
+
 registry.register(
     name="db_query",
     description=(
         "SQLite query | inspect.\n"
         "- action='query' (default): exec SQL. Read-only unless write=true. Capped at `limit` (default 100).\n"
-        "- action='inspect': full schema (tables, views, cols, types, PK, FK, indexes, row counts). No query needed."
+        "- action='inspect': full schema (tables, views, cols, types, PK, FK, indexes, row counts). No query needed.\n"
+        "- action='cell': dump ONE column value untruncated (table+column+where) — for big JSON blobs.\n"
+        "- write=true supports backup=true to snapshot the db file first."
     ),
     parameters={
         "type": "object",
         "properties": {
             "path":   {"type": "string",  "description": "Path to a SQLite database. Any extension (.db/.sqlite/.world/...) — detected by file content, not suffix."},
-            "action": {"type": "string",  "enum": ["query", "inspect"],
-                       "description": "'query' (SQL) | 'inspect' (schema). Default 'query'."},
+            "action": {"type": "string",  "enum": ["query", "inspect", "cell"],
+                       "description": "'query' (SQL) | 'inspect' (schema) | 'cell' (dump one column value). Default 'query'."},
             "query":  {"type": "string",  "description": "SQL (required for query)."},
             "write":  {"type": "boolean", "description": "Allow writes (default false)."},
             "limit":  {"type": "integer", "description": "Max rows (default 100)."},
+            "backup": {"type": "boolean", "description": "write mode: snapshot the db file before mutating. Default false."},
+            "table":  {"type": "string",  "description": "cell mode: table name."},
+            "column": {"type": "string",  "description": "cell mode: column to dump."},
+            "where":  {"type": "string",  "description": "cell mode: WHERE clause to select one row."},
         },
         "required": ["path"],
     },

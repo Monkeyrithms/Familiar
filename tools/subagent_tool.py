@@ -186,10 +186,11 @@ def subagent(action: str, goal: str = "", mode: str = "general",
     elif action == "status":
         if not job_id:
             # List all active jobs
-            from core.subagent import _orchestrators
-            jobs = []
-            for jid, orch in _orchestrators.items():
-                jobs.append(orch.get_status())
+            from core.subagent import _orchestrators, _orch_lock
+            # Snapshot under the lock — eviction threads pop entries concurrently.
+            with _orch_lock:
+                snapshot = list(_orchestrators.values())
+            jobs = [orch.get_status() for orch in snapshot]
             return json.dumps({"jobs": jobs})
 
         orch = get_existing(job_id)

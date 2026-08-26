@@ -24,6 +24,7 @@ IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
     ".next", ".nuxt", "coverage", ".pytest_cache", ".cache", ".tox",
     "egg-info", ".mypy_cache", ".idea", ".vscode",
+    "data", "logs", "file_share", "sandbox", "Distributable",
 }
 IGNORE_EXTS = {
     ".pyc", ".pyo", ".exe", ".dll", ".so", ".dylib", ".o", ".obj",

@@ -308,6 +308,72 @@ def _map_norm_index_to_orig(original: str, norm_idx: int):
     return None
 
 
+# ── Failure diagnostics ─────────────────────────────────────────────────
+# When a match fails, hand the model the information it would otherwise have to
+# grep for: the line numbers of every duplicate (on multi-match), and the
+# closest near-miss with a char-level hint (on not-found). This turns a "go
+# re-read and guess" dead-end into a one-shot fix.
+
+def _line_of(text: str, char_idx: int) -> int:
+    """1-based line number containing char_idx."""
+    return text.count("\n", 0, char_idx) + 1
+
+
+def _all_match_lines(content: str, needle: str) -> list[int]:
+    """Line numbers of every occurrence of needle in content."""
+    lines = []
+    start = 0
+    while True:
+        idx = content.find(needle, start)
+        if idx == -1:
+            break
+        lines.append(_line_of(content, idx))
+        start = idx + max(len(needle), 1)
+    return lines
+
+
+def _nearest_block(content: str, old_string: str):
+    """Find the content window most similar to old_string. Returns
+    (line_number, similarity_0_1, snippet) or None. Scans line-aligned windows
+    the same height as the search block, scored by Levenshtein ratio."""
+    search_lines = old_string.split("\n")
+    content_lines = content.split("\n")
+    h = len(search_lines)
+    if h == 0 or len(content_lines) < 1:
+        return None
+    target = "\n".join(search_lines)
+    best_ratio = -1.0
+    best_i = -1
+    span = max(1, len(content_lines) - h + 1)
+    # Cap work on huge files — sample is fine for a hint.
+    for i in range(span):
+        window = "\n".join(content_lines[i:i + h])
+        max_len = max(len(window), len(target), 1)
+        ratio = 1.0 - _levenshtein(window, target) / max_len
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_i = i
+    if best_i < 0:
+        return None
+    snippet = "\n".join(content_lines[best_i:best_i + h])
+    return (best_i + 1, best_ratio, snippet)
+
+
+def _char_diff_hint(a: str, b: str) -> str:
+    """First point where a and b diverge, with a tiny context window. a=expected
+    (search), b=found (file)."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    if i == n and len(a) == len(b):
+        return ""
+    ca = repr(a[i]) if i < len(a) else "<end>"
+    cb = repr(b[i]) if i < len(b) else "<end>"
+    ctx = b[max(0, i - 15):i + 5].replace("\n", "\\n")
+    return f"first differs at offset {i}: expected {ca} but file has {cb} (near …{ctx}…)"
+
+
 # ── Cascade: ordered list of strategies ─────────────────────────────────
 
 _REPLACERS = [
@@ -336,6 +402,12 @@ def file_edit(path: str, old_string: str, new_string: str,
         original = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return json.dumps({"error": f'Could not read "{path}": {e}'})
+
+    # Stamp for external-change detection and warn if another process changed
+    # this file since we last touched it (the ingest-and-delete inbox trap).
+    from tools._fsguard import check_external_change, record_write, record_read
+    ext_warn = check_external_change(path)
+    record_read(path)
 
     # Snapshot diagnostics before the edit so _build_edit_result can show only
     # the errors this edit introduced, not the file's pre-existing pile.
@@ -378,11 +450,13 @@ def file_edit(path: str, old_string: str, new_string: str,
                 write_err = safe_write_text(path, updated)
                 if write_err:
                     return json.dumps({"error": write_err})
+                record_write(path)
                 from core.event_bus import bus
                 bus.emit("file.changed", path=path, tool="file_edit", original=original)
                 return _build_edit_result(
                     path,
-                    f'Replaced {count} occurrence{"s" if count != 1 else ""} in "{path}".',
+                    f'Replaced {count} occurrence{"s" if count != 1 else ""} in "{path}".'
+                    + (("  " + ext_warn) if ext_warn else ""),
                     baseline=_baseline,
                 )
 
@@ -401,23 +475,46 @@ def file_edit(path: str, old_string: str, new_string: str,
             break
 
     if not_found:
-        return json.dumps({
+        err = {
             "error": (
                 f'The string to replace was not found in "{path}". '
-                "Make sure old_string matches the file contents (whitespace, "
-                "indentation, line endings). The fuzzy matcher tried 6 strategies "
-                "including trimmed, indentation-flexible, and whitespace-normalized "
-                "matching — none could locate your string."
+                "The fuzzy matcher tried all strategies (trimmed, indent-flexible, "
+                "whitespace-normalized, smart-punct) — none could locate it."
             )
-        })
+        }
+        near = _nearest_block(original_normalized, old_normalized)
+        if near:
+            line_no, ratio, snippet = near
+            err["nearest_match"] = {
+                "line": line_no,
+                "similarity": round(ratio, 3),
+                "hint": _char_diff_hint(old_normalized, snippet),
+            }
+            if ratio >= 0.6:
+                err["error"] += (f" Closest block is {round(ratio * 100)}% similar at "
+                                 f"line {line_no} — see nearest_match for the exact "
+                                 "char that differs.")
+        return json.dumps(err)
 
     if matched_text is None and multiple_found:
+        # Hand back the line of every duplicate so the model can disambiguate
+        # without a second grep.
+        dup_lines = []
+        for replacer in _REPLACERS:
+            for candidate in replacer(original_normalized, old_normalized):
+                if original_normalized.find(candidate) != -1:
+                    dup_lines = _all_match_lines(original_normalized, candidate)
+                    if len(dup_lines) > 1:
+                        break
+            if len(dup_lines) > 1:
+                break
         return json.dumps({
             "error": (
-                f'old_string matches multiple locations in "{path}". '
-                "Provide a more specific string to uniquely identify the section, "
-                "or set replace_all to true."
-            )
+                f'old_string matches multiple locations in "{path}"'
+                + (f" (lines {', '.join(map(str, dup_lines))})" if dup_lines else "")
+                + ". Add surrounding context to target one, or set replace_all=true."
+            ),
+            "match_lines": dup_lines,
         })
 
     if matched_text is None:
@@ -435,6 +532,7 @@ def file_edit(path: str, old_string: str, new_string: str,
     write_err = safe_write_text(path, updated)
     if write_err:
         return json.dumps({"error": write_err})
+    record_write(path)
 
     # Note which strategy was used (helps with debugging)
     strategy_note = ""
@@ -449,7 +547,8 @@ def file_edit(path: str, old_string: str, new_string: str,
 
     return _build_edit_result(
         path,
-        f'Replaced 1 occurrence in "{path}"{strategy_note}.',
+        f'Replaced 1 occurrence in "{path}"{strategy_note}.'
+        + (("  " + ext_warn) if ext_warn else ""),
         baseline=_baseline,
     )
 

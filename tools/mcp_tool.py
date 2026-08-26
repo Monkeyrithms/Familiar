@@ -29,6 +29,7 @@ Config schema (config.json):
 from __future__ import annotations
 
 import json
+import base64
 import threading
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,20 @@ from core.mcp_client import mcp_manager
 from tools.registry import registry
 
 _CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+_MAX_MCP_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+class MCPToolResult(str):
+    """Textual MCP result carrying out-of-band images for the Agent loop.
+
+    Keeping images off the string is intentional: ordinary tool-result
+    truncation and output shielding must apply to text, never to base64 pixels.
+    """
+
+    def __new__(cls, text: str, images: list[dict[str, str]] | None = None):
+        value = super().__new__(cls, text)
+        value.mcp_images = list(images or [])
+        return value
 
 
 def _safe_json_schema(schema: Any) -> dict:
@@ -67,9 +82,25 @@ def _render_content(result: dict) -> str:
 
     texts = []
     extras = []
+    images: list[dict[str, str]] = []
     for c in result.get("content") or []:
         if c.get("type") == "text":
             texts.append(c.get("text", ""))
+        elif c.get("type") == "image":
+            mime = str(c.get("mimeType") or "image/png").split(";", 1)[0]
+            data = c.get("data")
+            if (isinstance(data, str) and mime.startswith("image/")
+                    and len(data) <= ((_MAX_MCP_IMAGE_BYTES * 4) // 3 + 8)):
+                try:
+                    decoded = base64.b64decode(data, validate=True)
+                except (ValueError, TypeError):
+                    decoded = b""
+                if decoded and len(decoded) <= _MAX_MCP_IMAGE_BYTES:
+                    images.append({"mime_type": mime, "data": data})
+                else:
+                    extras.append({"type": "image", "error": "invalid or oversized image"})
+            else:
+                extras.append({"type": "image", "error": "invalid or oversized image"})
         else:
             extras.append(c)
 
@@ -83,7 +114,8 @@ def _render_content(result: dict) -> str:
         payload["structured"] = structured
     if not payload:
         payload = {"text": ""}
-    return json.dumps(payload, ensure_ascii=False, default=str)
+    return MCPToolResult(
+        json.dumps(payload, ensure_ascii=False, default=str), images=images)
 
 
 def _make_executor(server: str, tool: str):

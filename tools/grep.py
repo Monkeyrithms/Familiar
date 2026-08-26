@@ -31,6 +31,8 @@ _DEFAULT_EXCLUDES = (
     "node_modules", "site-packages", "site-packages64", "__pycache__",
     "dist", "build", ".next", ".nuxt", "coverage", ".pytest_cache",
     ".cache", ".tox", ".mypy_cache",
+    ".git", ".hg", ".svn", ".ruff_cache", ".idea", ".vscode",
+    "data", "logs", "file_share", "sandbox", "Distributable",
 )
 # Default cap on MATCHES reported per file — keeps one busy file from eating the
 # whole result budget so matches stay spread across files. Unlike the old hard
@@ -93,6 +95,7 @@ def grep(pattern: str, path: str = None, glob: str = None,
     cmd = [
         _rg_path,
         "--json",
+        "--no-messages",
         "--max-count", str(per_file_cap + 1),
         "--max-columns", "500",
     ]
@@ -203,16 +206,13 @@ def grep(pattern: str, path: str = None, glob: str = None,
                     break
     finally:
         # If we stopped early, terminate rg and reap it so no process leaks.
-        # Drain stderr (small) for error reporting before waiting.
+        # Wait before draining stderr; reading a pipe while rg is still exiting
+        # can block and leave the UI stuck on the in-flight search indicator.
         try:
             if proc.poll() is None:
                 proc.terminate()
         except Exception:
             pass
-        try:
-            stderr_text = (proc.stderr.read() or "") if proc.stderr else ""
-        except Exception:
-            stderr_text = ""
         try:
             proc.wait(timeout=5)
         except Exception:
@@ -220,6 +220,14 @@ def grep(pattern: str, path: str = None, glob: str = None,
                 proc.kill()
             except Exception:
                 pass
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+        try:
+            stderr_text = (proc.stderr.read() or "") if proc.stderr else ""
+        except Exception:
+            stderr_text = ""
 
     if timed_out and not matches_by_file:
         return json.dumps({"error": "Search timed out after 30 seconds."})

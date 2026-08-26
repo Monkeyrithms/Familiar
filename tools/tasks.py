@@ -330,11 +330,15 @@ def task_scheduler(action: str, task_id: str = "", prompt: str = "",
                    conversation_id: str = "", repeat: int = None,
                    conditions: list = None, actions: list = None,
                    deliver_to_type: str = "conversation",
-                   deliver_to_stream: str = "") -> str:
+                   deliver_to_stream: str = "", ctx=None) -> str:
     """Manage scheduled tasks."""
 
-    # Default to current conversation if none specified
-    if not conversation_id:
+    # Creation and conversation-scoped listing inherit the conversation that
+    # issued this tool call. ToolContext is authoritative and works for every
+    # chat column; the QApplication lookup only supports direct/non-agent calls.
+    if not conversation_id and action in ("create", "list_my_tasks"):
+        conversation_id = getattr(ctx, "conv_id", "") if ctx is not None else ""
+    if not conversation_id and action in ("create", "list_my_tasks"):
         try:
             from PyQt6.QtWidgets import QApplication
             app = QApplication.instance()
@@ -520,8 +524,11 @@ def task_scheduler(action: str, task_id: str = "", prompt: str = "",
     elif action == "update":
         if not task_id:
             return json.dumps({"error": "task_id is required"})
-        ok = update_task(task_id, prompt=prompt, schedule=schedule, name=name,
-                         description=description, conversation_id=conversation_id)
+        updates = {"prompt": prompt, "schedule": schedule, "name": name,
+                   "description": description}
+        if conversation_id:
+            updates["conversation_id"] = conversation_id
+        ok = update_task(task_id, **updates)
         # Update conditions/actions if provided
         if ok and (conditions or actions):
             all_tasks = load_tasks()

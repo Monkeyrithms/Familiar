@@ -35,17 +35,23 @@ class _BrowserGrabBridge(QObject):
         self._request.connect(self._handle)
 
     def _handle(self):
-        """Runs on the main thread."""
+        """Runs on the main thread. Scales + saves the pixmap HERE — QPixmap is
+        a QPaintDevice and must never be touched from the worker thread (the
+        old cross-thread scale/save corrupted the native heap). Only a plain
+        file path crosses the thread boundary."""
         self._result = None
         if self._grab_fn:
             try:
-                self._result = self._grab_fn()
+                pixmap = self._grab_fn()
+                if pixmap is not None and not pixmap.isNull():
+                    self._result = _pixmap_to_jpeg_path(pixmap)
             except Exception:
                 pass
         self._event.set()
 
     def grab(self):
-        """Block the calling thread until the main thread delivers a pixmap (or None)."""
+        """Block the calling thread until the main thread delivers a saved JPEG
+        path (or None)."""
         self._result = None
         self._event.clear()
         self._request.emit()           # queued → delivered to main thread
@@ -122,8 +128,9 @@ def read_browser(prompt: str = "") -> str:
         )
 
     # ── Step 3: text is sparse — grab a live screenshot from the main thread ─
-    pixmap = _grab_bridge.grab()
-    if pixmap is None or pixmap.isNull():
+    # (grab() returns a saved JPEG path; the pixmap never leaves the GUI thread)
+    path = _grab_bridge.grab()
+    if not path or not os.path.isfile(path):
         # Fall back to the cached screenshot if the grab failed
         cached_path = ctx.get("screenshot_path", "")
         if cached_path and os.path.isfile(cached_path):
@@ -138,12 +145,7 @@ def read_browser(prompt: str = "") -> str:
             ensure_ascii=False,
         )
 
-    # ── Step 4: save pixmap and run vision ────────────────────────────────────
-    try:
-        path = _pixmap_to_jpeg_path(pixmap)
-    except Exception as e:
-        return json.dumps({"error": f"Screenshot save failed: {e}"})
-
+    # ── Step 4: run vision on the saved screenshot ────────────────────────────
     analysis = _analyze_screenshot(path, vision_prompt)
     return json.dumps(
         {"url": url, "title": title, "source": "live_screenshot", "content": analysis},

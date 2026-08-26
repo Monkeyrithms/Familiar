@@ -42,8 +42,10 @@ import tools.session_search  # noqa: F401
 import tools.memory          # noqa: F401
 import tools.checkpoint_tool # noqa: F401
 import tools.plan            # noqa: F401
+import tools.skills          # noqa: F401  (learned reusable procedures)
 import tools.http_client     # noqa: F401
 import tools.db_query        # noqa: F401
+import tools.json_edit       # noqa: F401  (JSON-path structural editing: files + SQLite cells)
 import tools.clipboard       # noqa: F401
 import tools.archive         # noqa: F401
 import tools.diff_tool       # noqa: F401
@@ -73,7 +75,9 @@ import tools.ask_user            # noqa: F401
 import tools.reflect             # noqa: F401
 import tools.notes               # noqa: F401
 import tools.network_tool        # noqa: F401
+import tools.agent_chat          # noqa: F401
 import tools.inapp_browser        # noqa: F401  (in-app browser bridge — main-thread QObject)
+import tools.computer_use         # noqa: F401  (real-desktop mouse/keyboard control — gated)
 try:
     import tools.mcp_tool          # noqa: F401
 except Exception as _e:

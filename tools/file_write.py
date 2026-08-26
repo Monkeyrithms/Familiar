@@ -17,6 +17,11 @@ def file_write(path: str, content: str) -> str:
     p = Path(path)
     existed = p.exists()
 
+    # Warn if another process changed this path since we last touched it — the
+    # ingest-and-delete inbox trap. Advisory only; never blocks the write.
+    from tools._fsguard import check_external_change, record_write
+    ext_warn = check_external_change(path) if existed else ""
+
     # Capture original for diff before overwriting
     original = ""
     if existed:
@@ -41,6 +46,7 @@ def file_write(path: str, content: str) -> str:
     write_err = safe_write_text(path, content)
     if write_err:
         return json.dumps({"error": write_err})
+    record_write(path)
 
     line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
     byte_count = len(content.encode("utf-8"))
@@ -58,6 +64,8 @@ def file_write(path: str, content: str) -> str:
     # TOP-LEVEL `error`/`diagnostics` field so the model can't gloss past real
     # breakage, while pre-existing noise is suppressed with a note.
     status = f'{action} "{path}" ({line_count} lines, {byte_count} bytes).'
+    if ext_warn:
+        status = status + "  " + ext_warn
     result = build_validation_result(
         path, status, baseline=baseline,
         error_prefix=("File WAS written to disk, but this write introduced "
