@@ -248,6 +248,15 @@ def _count_chars(messages: list[dict]) -> int:
     total = 0
     for msg in messages:
         if not _is_chat_message(msg):
+            # Assistant tool-call messages carry their full arguments
+            # (file_write payloads can be tens of KB). Count them, or the
+            # summarization trigger never fires on tool-heavy sessions.
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                try:
+                    import json as _json
+                    total += len(_json.dumps(msg["tool_calls"], default=str))
+                except (TypeError, ValueError):
+                    pass
             continue
         content = msg.get("content", "")
         if isinstance(content, str):

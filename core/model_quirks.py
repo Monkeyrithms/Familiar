@@ -56,7 +56,10 @@ def _save() -> None:
 
 
 def strip_unsupported(kwargs: dict, provider: str, model: str) -> dict:
-    """Return kwargs with any known-unsupported params removed for this model."""
+    """Return kwargs with any known-unsupported params removed for this model.
+    `max_tokens` is CONVERTED to `max_completion_tokens` (OpenAI reasoning
+    models) rather than dropped — stripping it sent requests with no output
+    cap at all."""
     with _LOCK:
         cache = _load()
         bad = cache.get(_key(provider, model)) or []
@@ -64,7 +67,11 @@ def strip_unsupported(kwargs: dict, provider: str, model: str) -> dict:
         return kwargs
     out = dict(kwargs)
     for p in bad:
-        out.pop(p, None)
+        if p == "max_tokens" and "max_tokens" in out \
+                and "max_completion_tokens" not in out:
+            out["max_completion_tokens"] = out.pop("max_tokens")
+        else:
+            out.pop(p, None)
     return out
 
 
@@ -89,6 +96,12 @@ _REJECTION_PATTERNS = [
     re.compile(r"`(?P<param>[a-zA-Z_][a-zA-Z0-9_]*)`\s+is\s+deprecated", re.I),
     # OpenAI o-series: "Unsupported parameter: 'temperature'..."
     re.compile(r"[Uu]nsupported\s+parameter:\s*['\"](?P<param>[^'\"]+)['\"]"),
+    # OpenAI reasoning models: "Unsupported value: 'temperature' does not
+    # support 0.7 with this model."
+    re.compile(r"[Uu]nsupported\s+value:\s*['\"](?P<param>[^'\"]+)['\"]"),
+    # OpenAI: "'max_tokens' is not supported with this model. Use
+    # 'max_completion_tokens' instead." (also matches generic quoted form)
+    re.compile(r"['\"](?P<param>[a-zA-Z_][a-zA-Z0-9_]*)['\"]\s+is\s+not\s+supported\s+with\s+this\s+model", re.I),
     # Generic "X is not supported" / "X is not allowed"
     re.compile(r"`(?P<param>[a-zA-Z_][a-zA-Z0-9_]*)`\s+is\s+not\s+(supported|allowed)", re.I),
     re.compile(r"parameter\s+['\"]?(?P<param>[a-zA-Z_][a-zA-Z0-9_]*)['\"]?\s+is\s+not\s+(supported|allowed)", re.I),

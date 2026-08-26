@@ -303,7 +303,42 @@ def init_conversations_db():
     except Exception as e:
         print(f"[DB] workspace migration skipped: {e}")
 
+    _repair_known_cross_conversation_splices(conn)
+
     conn.close()
+
+
+def _repair_known_cross_conversation_splices(conn) -> int:
+    """Remove the stale queued-reply suffix produced before worker ownership checks."""
+    markers = (
+        "\n\nOkay—I’ll look into pairing the node.",
+        "\n\nLet me pull the actual conversation around that Lidiria exchange",
+    )
+    repaired = 0
+    repaired_ids = set()
+    for marker in markers:
+        rows = conn.execute(
+            "SELECT id, content FROM messages WHERE role='assistant' AND instr(content, ?) > 0",
+            (marker,),
+        ).fetchall()
+        for row in rows:
+            message_id = row["id"] if hasattr(row, "keys") else row[0]
+            if message_id in repaired_ids:
+                continue
+            content = row["content"] if hasattr(row, "keys") else row[1]
+            clean_content = content.split(marker, 1)[0].rstrip()
+            if not clean_content or clean_content == content:
+                continue
+            conn.execute(
+                "UPDATE messages SET content=? WHERE id=?",
+                (clean_content, message_id),
+            )
+            repaired_ids.add(message_id)
+            repaired += 1
+    if repaired:
+        conn.commit()
+        print(f"[DB] Repaired {repaired} stale cross-conversation reply splice(s)")
+    return repaired
 
 
 def _migrate_conversations_to_workspaces(conn) -> None:
@@ -598,14 +633,67 @@ def _chat_image_thumbnail_bytes(img_path: str) -> bytes | None:
         return None
 
 
+# Change-detection for the autosave hot path. save_conversation rewrites
+# EVERY message row (delete + reinsert) on each call; on a 1500+ message
+# conversation that's a long _conv_write_lock hold and heavy WAL churn even
+# when nothing changed (idle autosave timers, dialog closes, error paths).
+# We keep a cheap per-conversation signature of the last-persisted messages
+# and skip the rewrite when it matches — with a COUNT(*) verification and a
+# periodic full-write backstop so a signature collision or metadata-only
+# mutation can never wedge stale data for long.
+_saved_msgs_sig: dict[str, tuple] = {}
+_saved_msgs_full_at: dict[str, float] = {}
+_SAVED_SIG_FULL_EVERY = 300.0  # force a real rewrite at least every 5 min
+
+
+def _messages_signature(messages: list) -> tuple:
+    h = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content", "")
+        if isinstance(c, str):
+            clen = len(c)
+        elif isinstance(c, list):
+            clen = 0
+            for part in c:
+                if isinstance(part, dict):
+                    clen += len(part.get("text", "") or "") + 40
+                else:
+                    clen += 40
+        else:
+            clen = 40
+        tc = m.get("tool_calls")
+        h = (h * 1000003 ^ hash((
+            m.get("role", ""), clen,
+            len(tc) if isinstance(tc, list) else 0,
+            bool(m.get("_summary_snapshot")), bool(m.get("_thumb")),
+            bool(m.get("_usage")),
+        ))) & 0xFFFFFFFFFFFFFFFF
+    return (len(messages), h)
+
+
 def save_conversation(conv_id: str, name: str, messages: list[dict],
                       workspace: str = "", model: str = "",
                       system_prompt: str = "", streams: list[str] = None,
                       include_timestamps: bool = None, provider: str | None = None,
-                      prompt_replace: bool = None, context_note: str | None = None):
-    """Save or update a conversation and all its messages."""
+                      prompt_replace: bool = None, context_note: str | None = None,
+                      allow_truncate: bool = False):
+    """Save or update a conversation and all its messages.
+
+    Existing history may only shrink when the caller explicitly opts in. Normal
+    autosaves operate on snapshots; a stale or partially hydrated snapshot must
+    never become an accidental delete operation.
+    """
     image_paths: list[tuple[int, str]] = []
     embed_queue: list[tuple] = []
+
+    sig = _messages_signature(messages)
+    now_mono = time.monotonic()
+    maybe_skip_messages = (
+        _saved_msgs_sig.get(conv_id) == sig
+        and now_mono - _saved_msgs_full_at.get(conv_id, 0.0) < _SAVED_SIG_FULL_EVERY
+    )
 
     with _conv_write_lock:
         conn = _conv_conn()
@@ -688,6 +776,23 @@ def save_conversation(conv_id: str, name: str, messages: list[dict],
             "SELECT COUNT(*) FROM messages WHERE conversation_id=?", (conv_id,)
         ).fetchone()[0]
 
+        if existing_count > len(messages) and not allow_truncate:
+            conn.commit()
+            conn.close()
+            print(
+                f"[DB] Refused to shrink conversation {conv_id}: "
+                f"stored={existing_count}, snapshot={len(messages)}",
+                flush=True,
+            )
+            return False
+
+        # Unchanged since last persist (and row count verifies) → metadata-only
+        # save; skip the delete+reinsert of every message row entirely.
+        if maybe_skip_messages and existing_count == len(messages):
+            conn.commit()
+            conn.close()
+            return True
+
         # Replace all messages — batch clear old vectors
         if _has_vec():
             try:
@@ -766,6 +871,9 @@ def save_conversation(conv_id: str, name: str, messages: list[dict],
         conn.commit()
         conn.close()
 
+    _saved_msgs_sig[conv_id] = sig
+    _saved_msgs_full_at[conv_id] = now_mono
+
     image_jobs: list[tuple[int, bytes]] = []
     for position, img_path in image_paths:
         img_bytes = _chat_image_thumbnail_bytes(img_path)
@@ -789,6 +897,7 @@ def save_conversation(conv_id: str, name: str, messages: list[dict],
         import threading
         threading.Thread(target=_embed_messages, args=(embed_queue,), daemon=True).start()
     invalidate_conversation_list_cache()
+    return True
 
 
 def append_message_to_conversation(conv_id: str, role: str, content: str,
@@ -1014,6 +1123,8 @@ def delete_conversation(conv_id: str):
         conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
         conn.commit()
         conn.close()
+    _saved_msgs_sig.pop(conv_id, None)
+    _saved_msgs_full_at.pop(conv_id, None)
     invalidate_conversation_list_cache()
 
 
@@ -1115,7 +1226,15 @@ def set_conversation_debug_turns(conv_id: str, turns: list) -> None:
     it can never balloon the conversations row."""
     if not conv_id:
         return
-    payload = _fit_debug_turns(turns)
+    set_conversation_debug_turns_json(conv_id, _fit_debug_turns(turns))
+
+
+def set_conversation_debug_turns_json(conv_id: str, payload: str) -> None:
+    """Persist a pre-serialized debug-turns payload (see DebugRecorder: the
+    caller serializes under its own lock so the structure can't mutate mid-dump,
+    then hands the finished string here for the plain DB write)."""
+    if not conv_id or payload is None:
+        return
     with _conv_write_lock:
         conn = _conv_conn()
         conn.execute(
@@ -1124,6 +1243,10 @@ def set_conversation_debug_turns(conv_id: str, turns: list) -> None:
         )
         conn.commit()
         conn.close()
+
+
+# Public alias — DebugRecorder serializes buckets itself (under its lock).
+fit_debug_turns = _fit_debug_turns
 
 
 def get_conversation_composer_draft(conv_id: str) -> str:
@@ -1364,6 +1487,7 @@ def enqueue_conversation_save(
     prompt_replace: bool | None = None,
     context_note: str | None = None,
     resolve_name: bool = False,
+    allow_truncate: bool = False,
 ) -> None:
     """Non-blocking save_conversation — latest-wins per conv_id.
 
@@ -1389,6 +1513,7 @@ def enqueue_conversation_save(
             "prompt_replace": prompt_replace,
             "context_note": context_note,
             "resolve_name": resolve_name,
+            "allow_truncate": allow_truncate,
         }
     _conv_save_wake.set()
 
@@ -1440,19 +1565,30 @@ def get_chat_image_path(conv_id: str, position: int) -> str | None:
     """Get a cached file path for a chat image. Extracts from DB on first access."""
     ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
                "image/webp": ".webp", "image/bmp": ".bmp"}
-    cache_path = IMAGE_CACHE_DIR / f"{conv_id}_{position}.png"
-    if cache_path.exists():
-        return str(cache_path)
     conn = _conv_conn()
+    # Resolve the mime-derived path BEFORE the existence check — the cache is
+    # written with the mime's extension (.jpg for jpeg thumbnails), so probing
+    # a hardcoded .png missed every time and re-read the BLOB on each load.
+    # mime_type alone is cheap; the BLOB is only fetched on a cache miss.
     row = conn.execute(
-        "SELECT image_data, mime_type FROM chat_images WHERE conversation_id=? AND position=?",
+        "SELECT mime_type FROM chat_images WHERE conversation_id=? AND position=?",
+        (conv_id, position)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    ext = ext_map.get(row["mime_type"], ".png")
+    cache_path = IMAGE_CACHE_DIR / f"{conv_id}_{position}{ext}"
+    if cache_path.exists():
+        conn.close()
+        return str(cache_path)
+    row = conn.execute(
+        "SELECT image_data FROM chat_images WHERE conversation_id=? AND position=?",
         (conv_id, position)
     ).fetchone()
     conn.close()
     if not row:
         return None
-    ext = ext_map.get(row["mime_type"], ".png")
-    cache_path = IMAGE_CACHE_DIR / f"{conv_id}_{position}{ext}"
     cache_path.write_bytes(bytes(row["image_data"]))
     return str(cache_path)
 
@@ -1515,6 +1651,20 @@ def set_conversation_model(conv_id: str, model: str):
         conn = _conv_conn()
         conn.execute("UPDATE conversations SET model=?, modified_at=? WHERE id=?",
                      (model, time.time(), conv_id))
+        conn.commit()
+        conn.close()
+
+
+def set_conversation_model_provider(conv_id: str, model: str, provider: str):
+    """Persist the model AND provider on the conversation row in one write.
+    The Conversation dialog calls this synchronously on Save — before this,
+    the model choice lived only in the async autosave queue, so a reload that
+    beat the autosave silently reverted the switch to the old model."""
+    with _conv_write_lock:
+        conn = _conv_conn()
+        conn.execute(
+            "UPDATE conversations SET model=?, provider=?, modified_at=? WHERE id=?",
+            (model, provider, time.time(), conv_id))
         conn.commit()
         conn.close()
 

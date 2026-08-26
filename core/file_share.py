@@ -139,7 +139,67 @@ def delete_shared_file(rel: str) -> bool:
     except Exception:
         return False
     _update_tombstones(add={rel.replace("\\", "/").strip("/"): ts})
+    broadcast_tombstone(rel.replace("\\", "/").strip("/"), ts)
     return True
+
+
+def adopt_tombstone(rel: str, ts: float, source: str = "") -> bool:
+    """Adopt a single tombstone pushed or pulled from a peer: if we hold a copy
+    that isn't newer than the delete, remove it, and record the tombstone so we
+    stop offering/re-pulling the file. Returns True only on FIRST adoption
+    (already-known or older news → False), which the caller uses to decide
+    whether to cascade the push onward without looping forever.
+
+    A local copy NEWER than ``ts`` means the file was re-shared after the
+    delete — keep it and don't adopt (we'll resurrect it on the peer)."""
+    rel = (rel or "").replace("\\", "/").strip("/")
+    if not rel:
+        return False
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return False
+    if ts <= load_tombstones().get(rel, 0.0):
+        return False                          # already known (or older news)
+    target = _safe_join(rel)
+    if target is not None and target.is_file():
+        try:
+            if target.stat().st_mtime > ts:
+                return False                  # our copy is newer → resurrect
+            target.unlink()
+        except Exception:
+            return False                      # couldn't enact — pull will retry
+    _update_tombstones(add={rel: ts})
+    return True
+
+
+def broadcast_tombstone(rel: str, ts: float) -> None:
+    """Immediately push a tombstone to every peer so a deleted file vanishes
+    network-wide in ~1s instead of waiting up to _POLL_SECONDS for the next
+    manifest pull. Best-effort and non-blocking (own daemon thread); the pull
+    loop stays as the backstop for any peer that's offline right now."""
+    rel = (rel or "").replace("\\", "/").strip("/")
+    if not rel:
+        return
+
+    def _push():
+        try:
+            from core.network import _post, outbound_identity
+            _, _, peers = outbound_identity()
+        except Exception:
+            return
+        for p in peers or []:
+            url = p.get("url", "")
+            if not url:
+                continue
+            try:
+                _post(url, "/files/delete",
+                      {"path": rel, "deleted_at": ts}, timeout=8)
+            except Exception:
+                continue
+
+    threading.Thread(target=_push, daemon=True,
+                     name="file-share-del-push").start()
 
 
 def list_share_files() -> list[dict]:
@@ -256,20 +316,16 @@ def _sync_once(manager) -> int:
                 continue
             if ts <= tombs.get(rel, 0.0):
                 continue                      # already known (or older news)
-            target = _safe_join(rel)
-            if target is not None and target.is_file():
-                try:
-                    if target.stat().st_mtime > ts:
-                        continue              # our copy is newer → resurrect
-                    target.unlink()
+            had_copy = (_safe_join(rel) or Path()).is_file() \
+                if _safe_join(rel) is not None else False
+            if adopt_tombstone(rel, ts, source=p.get("name") or url):
+                if had_copy:
                     local.pop(rel, None)
                     manager._log(f"file-share: deleted {rel} "
                                  f"(tombstone from {p.get('name') or url})")
-                except Exception:
-                    continue                  # couldn't enact — retry next pass
-            tombs[rel] = ts
-            tomb_add[rel] = ts
-            tomb_remove.discard(rel)
+                tombs[rel] = ts
+                tomb_add[rel] = ts
+                tomb_remove.discard(rel)
 
         for rel, meta in remote.items():
             if _stop.is_set():

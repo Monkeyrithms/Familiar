@@ -18,8 +18,11 @@ CACHE_MAX_AGE = 86400  # 24 hours
 
 DEFAULT_CONTEXT_LIMIT = 128_000
 
-# Minimal fallback for providers with NO metadata API.
-# Keep this SHORT — only things that can't be auto-discovered.
+# Fallback for providers whose metadata API doesn't expose context windows.
+# OpenAI's /v1/models returns NO context_window field, so without these
+# entries every gpt-* model silently resolved to the 128k default — gpt-5.6-sol
+# (real window 400k) was treated as 128k, and worse, any model whose real
+# window is SMALLER than 128k overflowed with no local compaction.
 _STATIC_FALLBACK = {
     # Anthropic (no model list API)
     "claude-opus-4":            200_000,
@@ -30,6 +33,14 @@ _STATIC_FALLBACK = {
     "claude-3-sonnet":          200_000,
     "claude-3-haiku":           200_000,
     "claude-haiku-4":           200_000,
+    # OpenAI (metadata API omits context_window)
+    "gpt-5.6":                  400_000,   # covers gpt-5.6-sol etc.
+    "gpt-5":                    400_000,
+    "gpt-4.1":                  1_000_000,
+    "gpt-4o":                   128_000,
+    "gpt-4-turbo":              128_000,
+    "o3":                       200_000,
+    "o4":                       200_000,
     # DeepSeek (no metadata endpoint)
     "deepseek-chat":            128_000,
     "deepseek-coder":           128_000,
@@ -211,22 +222,35 @@ def refresh_cache(force: bool = False):
         _fetch_lock.release()
 
 
+_last_stale_check = 0.0
+_STALE_CHECK_EVERY = 300  # seconds between on-disk staleness probes
+
+
 def _ensure_cache():
-    """Make sure the cache is loaded, trigger background refresh if stale."""
+    """Make sure the in-memory cache is loaded. NEVER blocks on network:
+    a cold/stale cache kicks a background refresh and lookups fall through
+    to the static table meanwhile. (The old synchronous refresh here made the
+    first turn after a model switch hang up to ~35s on serial provider
+    fetches — the 'changing model froze the app' bug.)"""
+    global _last_stale_check
     _load_cache()
-    if not _cache:
-        # No cache at all — do a synchronous fetch (first run)
-        refresh_cache(force=True)
-    else:
-        # Cache exists but might be stale — refresh in background
+    now = time.time()
+    if now - _last_stale_check < _STALE_CHECK_EVERY:
+        return
+    _last_stale_check = now
+    stale = not _cache
+    if not stale:
         try:
             if CACHE_PATH.exists():
                 data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-                if time.time() - data.get("_timestamp", 0) >= CACHE_MAX_AGE:
-                    t = threading.Thread(target=refresh_cache, daemon=True)
-                    t.start()
+                stale = now - data.get("_timestamp", 0) >= CACHE_MAX_AGE
+            else:
+                stale = True
         except Exception:
-            pass
+            stale = True
+    if stale:
+        threading.Thread(target=refresh_cache, kwargs={"force": True},
+                         daemon=True, name="model-limits-refresh").start()
 
 
 # ── Public API ──────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -25,22 +26,12 @@ DEFAULT_INSTRUCTIONS = "Follow the user request."
 _EMPTY_INPUT_TEXT = "Continue."
 _REQUEST_TIMEOUT_S = 300
 
-# Platform model names that do not exist on the Codex subscription backend.
-_CODEX_MODEL_ALIASES: dict[str, str] = {
-    "gpt-4o": "gpt-5.4",
-    "gpt-4o-mini": "gpt-5.4-mini",
-    "gpt-4-turbo": "gpt-5.4",
-    "gpt-4.1": "gpt-5.4",
-    "gpt-4.1-mini": "gpt-5.4-mini",
-    "gpt-4.1-nano": "gpt-5.4-mini",
-    "o1": "gpt-5.4",
-    "o1-mini": "gpt-5.4-mini",
-    "o1-preview": "gpt-5.4",
-    "o3": "gpt-5.4",
-    "o3-mini": "gpt-5.4-mini",
-    "o4-mini": "gpt-5.4-mini",
-    "chatgpt-4o-latest": "gpt-5.4",
-}
+
+def _request_read_timeout_s() -> float:
+    try:
+        return max(10.0, min(120.0, float(os.environ.get("OPENAI_CODEX_READ_TIMEOUT_S", "120"))))
+    except (TypeError, ValueError):
+        return 120.0
 
 
 class _AttrDict:
@@ -263,11 +254,11 @@ def codex_credentials_ready() -> bool:
 
 
 def _resolve_codex_model(model: str) -> str:
+    """Use the configured model id as-is (strip optional ``provider/`` prefix only)."""
     m = (model or "").strip()
-    if not m:
-        return "gpt-5.4"
-    base = m.split("/")[-1].lower()
-    return _CODEX_MODEL_ALIASES.get(base, m)
+    if "/" in m:
+        m = m.rsplit("/", 1)[-1].strip()
+    return m
 
 
 def _text_from_content(content: Any) -> str:
@@ -309,11 +300,34 @@ def _user_content_blocks(content: Any) -> list[dict]:
 
 
 def _messages_to_codex_request(messages: list[dict]) -> tuple[str, list[dict]]:
-    """Split OpenAI chat messages into Codex ``instructions`` + ``input`` items."""
+    """Split OpenAI chat messages into Codex ``instructions`` + ``input`` items.
+
+    Persisted/compacted history may not retain both halves of every tool
+    exchange. Codex rejects an orphan ``function_call_output`` and that bad
+    history then poisons every later turn. Only emit complete pairs here.
+    """
     system_parts: list[str] = []
     input_items: list[dict] = []
 
+    seen_history_calls: set[str] = set()
+    result_ids: set[str] = set()
+    for history_msg in messages:
+        if not isinstance(history_msg, dict):
+            continue
+        if history_msg.get("role") == "assistant":
+            for call in history_msg.get("tool_calls") or []:
+                if isinstance(call, dict) and call.get("id"):
+                    seen_history_calls.add(str(call["id"]))
+        elif history_msg.get("role") == "tool":
+            cid = str(history_msg.get("tool_call_id") or "")
+            if cid in seen_history_calls:
+                result_ids.add(cid)
+    emitted_call_ids: set[str] = set()
+    emitted_output_ids: set[str] = set()
+
     for msg in messages:
+        if not isinstance(msg, dict):
+            continue
         role = msg.get("role", "")
         if role == "system":
             text = _text_from_content(msg.get("content", "")).strip()
@@ -339,27 +353,39 @@ def _messages_to_codex_request(messages: list[dict]) -> tuple[str, list[dict]]:
                     "content": [{"type": "output_text", "text": text}],
                 })
             for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
                 fn = tc.get("function") or {}
+                call_id = str(tc.get("id") or "")
+                if (not call_id or call_id not in result_ids
+                        or call_id in emitted_call_ids):
+                    continue
                 args = fn.get("arguments", "")
                 if not isinstance(args, str):
                     args = json.dumps(args)
                 input_items.append({
                     "type": "function_call",
-                    "call_id": tc.get("id") or "",
+                    "call_id": call_id,
                     "name": fn.get("name") or "",
                     "arguments": args or "{}",
                 })
+                emitted_call_ids.add(call_id)
             continue
 
         if role == "tool":
+            call_id = str(msg.get("tool_call_id") or "")
+            if (not call_id or call_id not in emitted_call_ids
+                    or call_id in emitted_output_ids):
+                continue
             output = msg.get("content", "")
             if not isinstance(output, str):
                 output = json.dumps(output)
             input_items.append({
                 "type": "function_call_output",
-                "call_id": msg.get("tool_call_id") or "",
+                "call_id": call_id,
                 "output": output or "",
             })
+            emitted_output_ids.add(call_id)
 
     instructions = "\n\n".join(system_parts).strip() or DEFAULT_INSTRUCTIONS
     if not input_items:
@@ -372,23 +398,30 @@ def _messages_to_codex_request(messages: list[dict]) -> tuple[str, list[dict]]:
 
 
 def _convert_tools(tools: list[dict] | None) -> list[dict]:
+    """Convert Chat Completions tool schemas to Codex Responses API shape.
+
+    Chat Completions: ``{type: function, function: {name, description, parameters}}``
+    Codex Responses:  ``{type: function, name, description, parameters}``
+    """
     if not tools:
         return []
     out: list[dict] = []
     for tool in tools:
-        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
-            out.append(tool)
+        fn = tool.get("function") if tool.get("type") == "function" else tool
+        if not isinstance(fn, dict):
             continue
-        fn = tool.get("function") or tool
-        if isinstance(fn, dict) and fn.get("name"):
-            out.append({
-                "type": "function",
-                "function": {
-                    "name": fn["name"],
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
-                },
-            })
+        name = fn.get("name") or tool.get("name")
+        if not name:
+            continue
+        out.append({
+            "type": "function",
+            "name": name,
+            "description": fn.get("description") or tool.get("description") or "",
+            "parameters": fn.get("parameters") or tool.get("parameters") or {
+                "type": "object",
+                "properties": {},
+            },
+        })
     return out
 
 
@@ -404,6 +437,12 @@ def _map_reasoning_effort(effort: str | None) -> str | None:
 
 
 class _OpenAICodexCompletions:
+    """Codex OAuth client: streams SSE internally and accepts ``stream_callback``."""
+
+    # ReasoningClientWrapper must not wrap this with OpenAI-SDK stream=True —
+    # Codex returns a completed response, not a chunk iterator.
+    handles_native_stream_callback = True
+
     def __init__(self, wrapper: "OpenAICodexClientWrapper"):
         self._wrapper = wrapper
 
@@ -412,7 +451,11 @@ class _OpenAICodexCompletions:
         kwargs.pop("stream", None)
         kwargs.pop("stream_options", None)
         kwargs.pop("temperature", None)
-        kwargs.pop("max_tokens", None)
+        # Responses API takes max_output_tokens; carry the cap over instead of
+        # dropping it (an uncapped request can run to the model's ceiling —
+        # slow turns + surprise token burn).
+        max_out = kwargs.pop("max_tokens", None) or kwargs.pop("max_completion_tokens", None)
+        kwargs.pop("max_completion_tokens", None)
         kwargs.pop("top_p", None)
 
         model = _resolve_codex_model(kwargs.get("model", ""))
@@ -434,6 +477,11 @@ class _OpenAICodexCompletions:
             body["tools"] = tools
         if reasoning_effort:
             body["reasoning"] = {"effort": reasoning_effort}
+        # NOTE: the ChatGPT Codex backend rejects max_output_tokens with
+        # HTTP 400 "Unsupported parameter" (observed 2026-07). Do NOT send it;
+        # output length is governed by the model/plan instead. max_out is
+        # still popped above so it never leaks into the request body.
+        _ = max_out
 
         headers = {
             "Authorization": f"Bearer {creds.access_token}",
@@ -447,15 +495,24 @@ class _OpenAICodexCompletions:
         import httpx
 
         try:
-            with httpx.Client(timeout=httpx.Timeout(_REQUEST_TIMEOUT_S, connect=30.0)) as client:
+            # read= caps how long a SINGLE socket read may stall — both the
+            # wait for response headers and gaps between SSE chunks. The old
+            # blanket 300s meant a dead server froze the turn for 5 minutes
+            # PER RETRY (×7 retries ≈ half an hour of "is typing…"). 120s is
+            # generous for the longest legitimate inter-token gap.
+            with httpx.Client(timeout=httpx.Timeout(
+                    _REQUEST_TIMEOUT_S, connect=30.0, read=_request_read_timeout_s(),
+                    write=30.0, pool=30.0)) as client:
                 with client.stream(
                     "POST", CODEX_RESPONSES_URL, headers=headers, json=body
                 ) as resp:
                     if resp.status_code >= 400:
                         err_body = resp.read().decode(errors="replace")
-                        raise RuntimeError(
+                        error = RuntimeError(
                             f"Codex API error {resp.status_code}: {err_body[:800]}"
                         )
+                        error.status_code = resp.status_code
+                        raise error
                     collected_text: list[str] = []
                     saw_text_deltas = False
                     thinking_parts: list[str] = []
@@ -465,39 +522,64 @@ class _OpenAICodexCompletions:
 
                     event_name = "message"
                     data_lines: list[str] = []
+                    stream_terminal = False
 
-                    def _handle_event():
-                        nonlocal event_name, data_lines, finish_reason, saw_text_deltas
+                    def _emit_text(text: str, *, from_delta: bool = True) -> None:
+                        nonlocal saw_text_deltas
+                        if not text:
+                            return
+                        if from_delta:
+                            saw_text_deltas = True
+                        collected_text.append(text)
+                        if stream_callback:
+                            try:
+                                stream_callback(text)
+                            except Exception:
+                                pass
+
+                    def _handle_event() -> None:
+                        nonlocal event_name, data_lines, finish_reason, stream_terminal
                         if not data_lines:
                             return
                         joined = "\n".join(data_lines).strip()
                         data_lines.clear()
+                        if joined == "[DONE]":
+                            stream_terminal = True
+                            event_name = "message"
+                            return
                         try:
                             data = json.loads(joined) if joined else None
                         except json.JSONDecodeError:
+                            event_name = "message"
                             return
 
-                        if event_name == "response.output_text.delta" and isinstance(data, dict):
+                        evt = event_name
+                        if isinstance(data, dict):
+                            evt = str(data.get("type") or event_name)
+
+                        if evt == "response.output_text.delta" and isinstance(data, dict):
                             delta = data.get("delta")
                             if isinstance(delta, str) and delta:
-                                saw_text_deltas = True
-                                collected_text.append(delta)
-                                if stream_callback:
-                                    try:
-                                        stream_callback(delta)
-                                    except Exception:
-                                        pass
-                        elif event_name == "response.reasoning_summary_text.delta" and isinstance(data, dict):
+                                _emit_text(delta, from_delta=True)
+                        elif evt == "response.output_text.done" and isinstance(data, dict):
+                            text = data.get("text")
+                            if isinstance(text, str) and text:
+                                joined_text = "".join(collected_text)
+                                if not joined_text:
+                                    _emit_text(text, from_delta=not saw_text_deltas)
+                                elif text != joined_text and text.startswith(joined_text):
+                                    _emit_text(text[len(joined_text):], from_delta=False)
+                        elif evt == "response.reasoning_summary_text.delta" and isinstance(data, dict):
                             delta = data.get("delta")
                             if isinstance(delta, str):
                                 thinking_parts.append(delta)
-                        elif event_name == "response.function_call_arguments.delta" and isinstance(data, dict):
+                        elif evt == "response.function_call_arguments.delta" and isinstance(data, dict):
                             idx = str(data.get("output_index", 0))
                             slot = tool_calls.setdefault(idx, {"id": "", "name": "", "args": ""})
                             delta = data.get("delta")
                             if isinstance(delta, str):
                                 slot["args"] += delta
-                        elif event_name == "response.output_item.added" and isinstance(data, dict):
+                        elif evt == "response.output_item.added" and isinstance(data, dict):
                             item = data.get("item") if isinstance(data.get("item"), dict) else data
                             if isinstance(item, dict) and item.get("type") == "function_call":
                                 idx = str(data.get("output_index", len(tool_calls)))
@@ -506,7 +588,7 @@ class _OpenAICodexCompletions:
                                     "name": item.get("name") or "",
                                     "args": str(item.get("arguments") or ""),
                                 }
-                        elif event_name == "response.output_item.done" and isinstance(data, dict):
+                        elif evt == "response.output_item.done" and isinstance(data, dict):
                             item = data.get("item") if isinstance(data.get("item"), dict) else data
                             if isinstance(item, dict):
                                 if item.get("type") == "function_call":
@@ -523,29 +605,35 @@ class _OpenAICodexCompletions:
                                         if isinstance(block, dict) and block.get("type") == "output_text":
                                             text = block.get("text")
                                             if isinstance(text, str) and text:
-                                                collected_text.append(text)
-                                                if stream_callback:
-                                                    try:
-                                                        stream_callback(text)
-                                                    except Exception:
-                                                        pass
-                        elif event_name == "response.completed" and isinstance(data, dict):
+                                                _emit_text(text, from_delta=False)
+                        elif evt in ("response.completed", "response.done") and isinstance(data, dict):
                             resp = data.get("response") if isinstance(data.get("response"), dict) else data
                             u = resp.get("usage") if isinstance(resp, dict) else None
                             if isinstance(u, dict):
                                 usage = u
+                            stream_terminal = True
+                        elif evt in ("response.failed", "response.incomplete", "error"):
+                            stream_terminal = True
+                            if isinstance(data, dict):
+                                err = data.get("error") or data.get("message") or data
+                                raise RuntimeError(f"Codex stream ended with {evt}: {err}")
 
                         event_name = "message"
 
                     for line in resp.iter_lines():
+                        if stream_terminal:
+                            break
                         if not line:
                             _handle_event()
+                            if stream_terminal:
+                                break
                             continue
                         if line.startswith("event:"):
                             event_name = line.split(":", 1)[1].strip() or "message"
                         elif line.startswith("data:"):
                             data_lines.append(line.split(":", 1)[1].lstrip())
-                    _handle_event()
+                    if not stream_terminal:
+                        _handle_event()
 
         except httpx.HTTPError as e:
             raise RuntimeError(f"Codex request failed: {e}") from e

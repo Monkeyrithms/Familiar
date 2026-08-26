@@ -21,6 +21,9 @@ pre-computed Authorization header (passed via `headers`) for http transports.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import subprocess
 import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -57,6 +60,7 @@ class ServerState:
     resources: list[dict] = field(default_factory=list)
     prompts: list[dict] = field(default_factory=list)
     task: asyncio.Task | None = None
+    child_pid: int | None = None
 
 
 class MCPManager:
@@ -111,8 +115,17 @@ class MCPManager:
                         env=cfg.get("env"),
                         cwd=cfg.get("cwd"),
                     )
+                    before = self._child_pids_of_self()
                     streams = await stack.enter_async_context(stdio_client(params))
                     read, write = streams[0], streams[1]
+                    # The SDK never exposes the subprocess, so identify it by
+                    # diffing our children across the spawn. Needed because
+                    # cancelling the task drops our pipe without killing the
+                    # child, which is how these accumulate. A missed pid only
+                    # means no reap -- the SDK's own clean-shutdown path still
+                    # terminates the tree when teardown isn't wedged.
+                    new_kids = self._child_pids_of_self() - before
+                    state.child_pid = new_kids.pop() if len(new_kids) == 1 else None
                 elif transport in ("http", "streamable_http"):
                     if streamablehttp_client is None:
                         raise RuntimeError("streamable_http client unavailable in mcp SDK")
@@ -180,6 +193,12 @@ class MCPManager:
                         elif kind == "get_prompt":
                             result = await session.get_prompt(args["name"], args.get("arguments"))
                             fut.set_result(self._prompt_result_to_dict(result))
+                        elif kind == "list_tools":
+                            # Liveness probe. Round-trips the transport, so a
+                            # rotted pipe times out here instead of answering.
+                            result = await session.list_tools()
+                            fut.set_result(
+                                [self._tool_to_dict(t) for t in result.tools])
                         else:
                             fut.set_exception(ValueError(f"Unknown op: {kind}"))
                     except Exception as e:
@@ -196,6 +215,52 @@ class MCPManager:
             "description": getattr(t, "description", "") or "",
             "inputSchema": getattr(t, "inputSchema", None) or {"type": "object", "properties": {}},
         }
+
+    @staticmethod
+    def _child_pids_of_self() -> set[int]:
+        """Pids of live processes whose parent is this process.
+
+        Used to identify the stdio child by diffing before/after spawn, since
+        the SDK gives no handle on it. psutil if present, else platform query.
+        Failure returns an empty set, which only disables reaping."""
+        me = os.getpid()
+        try:
+            import psutil  # type: ignore
+            return {p.pid for p in psutil.Process(me).children()}
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"(Get-CimInstance Win32_Process -Filter "
+                     f"'ParentProcessId={me}').ProcessId"],
+                    capture_output=True, text=True, timeout=15).stdout
+            else:
+                out = subprocess.run(["pgrep", "-P", str(me)],
+                                     capture_output=True, text=True,
+                                     timeout=15).stdout
+            return {int(tok) for tok in out.split() if tok.strip().isdigit()}
+        except Exception:
+            return set()
+
+    @staticmethod
+    def _reap_child(state: "ServerState") -> None:
+        """Kill an abandoned stdio child by pid, with its own children.
+
+        By pid ONLY -- never by image name, which would take down unrelated
+        python processes including this agent."""
+        pid = getattr(state, "child_pid", None)
+        if not isinstance(pid, int) or pid <= 0:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, check=False, timeout=10)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
 
     @staticmethod
     def _call_result_to_dict(result) -> dict:
@@ -288,6 +353,11 @@ class MCPManager:
                     await asyncio.wait_for(state.task, timeout=timeout)
                 except Exception:
                     state.task.cancel()
+                    # Cancelling the task drops our end of the pipe but does
+                    # NOT kill the child, which then lingers forever holding
+                    # its stdin open. That is how these stack up across a
+                    # session. Reap it explicitly by PID.
+                    self._reap_child(state)
             return {"ok": True}
 
         return self._submit(_stop(), timeout=timeout + 5)
@@ -302,7 +372,7 @@ class MCPManager:
                 "resource_count": len(s.resources),
                 "prompt_count": len(s.prompts),
             }
-            for s in self._servers.values()
+            for s in list(self._servers.values())
         ]
 
     def get_tools(self, name: str) -> list[dict]:
@@ -328,7 +398,75 @@ class MCPManager:
         try:
             return self._submit(_call(), timeout=timeout + 5)
         except Exception as e:
-            return {"isError": True, "content": [{"type": "text", "text": str(e)}]}
+            # A stdio pipe can rot while the server behind it stays healthy
+            # (long sessions, respawned peers). Burning the full timeout on
+            # every later call makes the whole surface look dead, so on a
+            # timeout: probe the pipe cheaply, and if it's stale, reconnect
+            # once and retry. Non-timeout errors are real - surface them.
+            if not isinstance(e, (TimeoutError, asyncio.TimeoutError)):
+                return {"isError": True,
+                        "content": [{"type": "text", "text": str(e)}]}
+            if not self._pipe_is_stale(server):
+                return {"isError": True, "content": [{"type": "text",
+                        "text": f"Tool '{tool}' timed out after {timeout}s"}]}
+            retry = self.reconnect_stale(server)
+            if not retry.get("ok"):
+                return {"isError": True, "content": [{"type": "text",
+                        "text": f"Tool '{tool}' timed out and reconnect "
+                                f"failed: {retry.get('error')}"}]}
+            state = self._servers.get(server)
+            if state is None or state.error:
+                return {"isError": True, "content": [{"type": "text",
+                        "text": f"Tool '{tool}' timed out; server "
+                                f"unavailable after reconnect"}]}
+            try:
+                return self._submit(_call(), timeout=timeout + 5)
+            except Exception as retry_exc:
+                return {"isError": True, "content": [{"type": "text",
+                        "text": f"Tool '{tool}' failed after reconnect: "
+                                f"{retry_exc}"}]}
+
+    _PIPE_PROBE_TIMEOUT = 5.0
+
+    def _pipe_is_stale(self, server: str) -> bool:
+        """Cheap liveness probe: can the server still answer tools/list?
+
+        A healthy server replies in milliseconds, so a few seconds is a
+        generous deadline. Timing out here means the transport is gone,
+        not that the work was slow."""
+        state = self._servers.get(server)
+        if state is None:
+            return False
+
+        async def _probe():
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            await state.queue.put(("list_tools", {}, fut))
+            return await asyncio.wait_for(fut,
+                                          timeout=self._PIPE_PROBE_TIMEOUT)
+
+        try:
+            self._submit(_probe(), timeout=self._PIPE_PROBE_TIMEOUT + 2)
+            return False
+        except Exception:
+            return True
+
+    def reconnect_stale(self, server: str, timeout: float = 30) -> dict:
+        """Tear down a dead transport and reconnect with the same config.
+
+        disconnect() reaps the child process, so this cannot leave the old
+        server behind as an orphan holding the port."""
+        state = self._servers.get(server)
+        if state is None:
+            return {"ok": False, "error": f"Unknown server: {server}"}
+        config = dict(state.config)
+        try:
+            self.disconnect(server, timeout=10)
+        except Exception as exc:
+            return {"ok": False, "error": f"disconnect failed: {exc}"}
+        try:
+            return self.connect(server, config, timeout=timeout)
+        except Exception as exc:
+            return {"ok": False, "error": f"reconnect failed: {exc}"}
 
     def read_resource(self, server: str, uri: str, timeout: float = 60) -> dict:
         state = self._servers.get(server)

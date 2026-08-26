@@ -15,6 +15,7 @@ See tools/vector_search.py for the agent-callable interface.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import os
 import sqlite3
@@ -455,8 +456,25 @@ _IGNORE_DIRS = frozenset({
     "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     ".venv", "venv", ".env", "env",
     "dist", "build", "target", "out", ".next", ".nuxt",
+    "logs", "file_share", "sandbox", "Distributable",
     "data",  # agent's own embeddings DB — don't index ourselves
 })
+
+# _connect() used to run the full DDL + meta write (a disk write + commit) on
+# EVERY connection, so even read-only searches paid for a write transaction.
+# The schema only needs to be ensured once per db file per process — track
+# which paths have been initialized. Guarded by a lock for thread safety
+# (reindex runs on background threads).
+_schema_init_lock = threading.Lock()
+_schema_initialized: set[str] = set()
+
+
+def invalidate_schema_cache(db_path) -> None:
+    """Forget that a db file's schema was initialized. Call after dropping
+    tables/meta out-of-band (delete, force-reindex) so the next _connect()
+    re-runs the DDL and rewrites the meta rows."""
+    with _schema_init_lock:
+        _schema_initialized.discard(str(db_path))
 
 
 class CodeIndex:
@@ -474,6 +492,17 @@ class CodeIndex:
         conn = sqlite3.connect(str(self.db_path))
         conn.execute("PRAGMA foreign_keys=ON")
         vec_ok = load_sqlite_vec(conn)
+        db_key = str(self.db_path)
+        with _schema_init_lock:
+            if db_key not in _schema_initialized:
+                # May raise (dims mismatch) — only mark initialized on success.
+                self._init_schema(conn, vec_ok)
+                _schema_initialized.add(db_key)
+        return conn
+
+    def _init_schema(self, conn: sqlite3.Connection, vec_ok: bool) -> None:
+        """Ensure tables/indexes exist and the meta rows are current. Runs once
+        per db path per process (see _connect)."""
         conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 path         TEXT PRIMARY KEY,
@@ -544,7 +573,6 @@ class CodeIndex:
             (self.root,),
         )
         conn.commit()
-        return conn
 
     # ── file discovery + hashing ──
 
@@ -553,19 +581,26 @@ class CodeIndex:
         return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
     def _iter_files(self, patterns: Iterable[str]) -> Iterable[Path]:
-        root = Path(self.root)
-        seen: set[str] = set()
+        # Single os.walk with in-place pruning — rglob-per-pattern descended
+        # into node_modules/.git/venv before filtering, which dominated scan
+        # time on big trees. Simple "*.ext" patterns become a suffix set;
+        # anything fancier falls back to fnmatch.
+        suffixes: set[str] = set()
+        fancy: list[str] = []
         for pat in patterns:
-            for fp in root.rglob(pat):
-                if not fp.is_file():
-                    continue
-                if any(part in _IGNORE_DIRS for part in fp.parts):
-                    continue
-                key = str(fp.resolve())
-                if key in seen:
-                    continue
-                seen.add(key)
-                yield fp
+            if (pat.startswith("*.")
+                    and not any(ch in pat[2:] for ch in "*?[")):
+                suffixes.add(pat[1:].lower())
+            else:
+                fancy.append(pat)
+        for dirpath, dirs, files in os.walk(self.root):
+            dirs[:] = [d for d in dirs if d not in _IGNORE_DIRS]
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in suffixes or any(
+                    fnmatch.fnmatch(fname, pat) for pat in fancy
+                ):
+                    yield Path(dirpath) / fname
 
     # ── full index (walk workspace, incremental per file) ──
 
@@ -1057,6 +1092,8 @@ class CodeIndex:
             self.db_path.unlink()
         except FileNotFoundError:
             pass
+        # The file is gone — a future index with this path must re-run DDL.
+        invalidate_schema_cache(self.db_path)
 
 
 def open_index(name: str) -> CodeIndex | None:

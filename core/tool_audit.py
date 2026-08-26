@@ -12,7 +12,7 @@ Lifecycle:
   3. If count ≥ threshold → build prompt, inject into target conv, emit event
   4. User opens target conv, sees audit prompt, hits Enter to run
   5. Agent reads tool source, proposes changes, asks user to confirm
-  6. On "yes": file_edit + hot_reload
+  6. On "yes": file_edit (takes effect after an app restart)
 """
 
 import json
@@ -214,7 +214,7 @@ def _build_audit_prompt(tool: str, failures: list[dict]) -> str:
         f"type mismatches? required-vs-optional confusion?\n"
         f"4. Propose specific text changes to the description/schema that would reduce these failures\n"
         f"5. Ask me before applying any fix\n\n"
-        f"After I approve, use `file_edit` to update the tool and `hot_reload` to activate the changes."
+        f"After I approve, use `file_edit` to update the tool. Tool edits need an app restart to take effect."
     )
 
 

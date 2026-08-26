@@ -50,6 +50,7 @@ _initialized = False
 _sounds: dict[str, object] = {}
 _channel_index = 0
 _num_channels = 8
+_mixer_lock = threading.RLock()
 
 EDIT_SOUNDS = ["editFile1.mp3", "editFile2.mp3", "editFile3.mp3"]
 
@@ -175,17 +176,38 @@ def play_edit_sound(path: str = "") -> bool:
 
 def _ensure_init():
     global _initialized
-    if _initialized:
-        return True
-    try:
-        import pygame
-        if not pygame.mixer.get_init():
+    with _mixer_lock:
+        try:
+            import pygame
+            if pygame.mixer.get_init():
+                _initialized = True
+                return True
+
+            # The output device can disappear after sleep, docking, or a default
+            # device change. Cached Sound objects belong to the old mixer and
+            # must not survive reinitialization.
+            _initialized = False
+            _sounds.clear()
             pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
             pygame.mixer.set_num_channels(_num_channels)
-        _initialized = True
-        return True
-    except Exception:
-        return False
+            _initialized = True
+            return True
+        except Exception as exc:
+            print(f"[sounds] Mixer initialization failed: {exc}", flush=True)
+            return False
+
+
+def _reset_mixer() -> None:
+    global _initialized
+    with _mixer_lock:
+        _initialized = False
+        _sounds.clear()
+        try:
+            import pygame
+            if pygame.mixer.get_init():
+                pygame.mixer.quit()
+        except Exception:
+            pass
 
 
 def preload_all():
@@ -193,14 +215,15 @@ def preload_all():
     if not _ensure_init() or not SOUNDS_DIR.exists():
         return
     import pygame
-    for p in SOUNDS_DIR.iterdir():
-        if p.suffix.lower() in ('.mp3', '.wav', '.ogg'):
-            key = p.name
-            if key not in _sounds:
-                try:
-                    _sounds[key] = pygame.mixer.Sound(str(p))
-                except Exception:
-                    pass
+    with _mixer_lock:
+        for p in SOUNDS_DIR.iterdir():
+            if p.suffix.lower() in ('.mp3', '.wav', '.ogg'):
+                key = p.name
+                if key not in _sounds:
+                    try:
+                        _sounds[key] = pygame.mixer.Sound(str(p))
+                    except Exception as exc:
+                        print(f"[sounds] Could not preload {key}: {exc}", flush=True)
 
 
 def play_ui(name: str, volume: float = 1.0) -> bool:
@@ -238,9 +261,6 @@ def play(name: str, volume: float = 1.0) -> bool:
     """
     global _channel_index
 
-    if not _ensure_init():
-        return False
-
     # Resolve path
     path = SOUNDS_DIR / name
     if not path.suffix:
@@ -253,23 +273,26 @@ def play(name: str, volume: float = 1.0) -> bool:
     if not path.exists():
         return False
 
-    # Get or cache the Sound object
-    if name not in _sounds:
+    for attempt in range(2):
+        if not _ensure_init():
+            return False
         try:
             import pygame
-            _sounds[name] = pygame.mixer.Sound(str(path))
-        except Exception:
+            with _mixer_lock:
+                if name not in _sounds:
+                    _sounds[name] = pygame.mixer.Sound(str(path))
+                channel = pygame.mixer.Channel(_channel_index)
+                _channel_index = (_channel_index + 1) % _num_channels
+                # Set per-channel volume each play so a softer sound can't leak
+                # onto the next sound that reuses this round-robin channel.
+                channel.set_volume(max(0.0, min(1.0, float(volume))))
+                channel.play(_sounds[name])
+            return True
+        except Exception as exc:
+            if attempt == 0:
+                print(f"[sounds] Playback failed; resetting mixer: {exc}", flush=True)
+                _reset_mixer()
+                continue
+            print(f"[sounds] Playback failed after reset: {exc}", flush=True)
             return False
-
-    # Play on next channel (round-robin for overlap)
-    try:
-        import pygame
-        channel = pygame.mixer.Channel(_channel_index)
-        _channel_index = (_channel_index + 1) % _num_channels
-        # Set per-channel volume each play so a softer sound can't leak its
-        # level onto the next sound that reuses this round-robin channel.
-        channel.set_volume(max(0.0, min(1.0, float(volume))))
-        channel.play(_sounds[name])
-        return True
-    except Exception:
-        return False
+    return False

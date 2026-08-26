@@ -1071,36 +1071,48 @@ class AnthropicClientWrapper:
 # We inject the same system_and_3 breakpoints used by the native Anthropic path.
 
 def _inject_openrouter_cache(messages: list[dict]) -> list[dict]:
-    """Deep-copy messages and add cache_control breakpoints for Claude via OpenRouter.
+    """Add cache_control breakpoints for Claude via OpenRouter.
 
     OpenAI-format system messages stay as role=system; the SDK serialises
     content blocks as plain dicts, so extra keys like cache_control pass through.
     Anthropic max is 4 breakpoints: system + last 3 conversation messages.
+
+    Copies ONLY the ≤4 messages it modifies (shallow list copy otherwise).
+    The old copy.deepcopy of the ENTIRE conversation ran on every call — on a
+    long context that's megabytes of allocation churn per round, and it was a
+    top GC-pressure source in the long-run crash profile.
     """
-    import copy
-    messages = copy.deepcopy(messages)
     marker = {"type": "ephemeral"}
+    messages = list(messages)  # own the list; share unmodified message dicts
 
-    # Breakpoint 1 — system message
-    for msg in messages:
-        if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                msg["content"] = [{"type": "text", "text": content,
-                                   "cache_control": marker}]
-            elif isinstance(content, list) and content:
-                content[-1]["cache_control"] = marker
-            break
-
-    # Breakpoints 2-4 — last 3 non-system messages
-    non_sys = [m for m in messages if m.get("role") != "system"]
-    for msg in non_sys[-3:]:
+    def _with_marker(idx: int) -> None:
+        msg = dict(messages[idx])
         content = msg.get("content", "")
-        if isinstance(content, str) and content:
+        if isinstance(content, str):
+            if not content and msg.get("role") != "system":
+                return
             msg["content"] = [{"type": "text", "text": content,
                                "cache_control": marker}]
         elif isinstance(content, list) and content:
-            content[-1]["cache_control"] = marker
+            parts = list(content)
+            parts[-1] = {**parts[-1], "cache_control": marker} \
+                if isinstance(parts[-1], dict) else parts[-1]
+            msg["content"] = parts
+        else:
+            return
+        messages[idx] = msg
+
+    # Breakpoint 1 — first system message
+    for i, msg in enumerate(messages):
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            _with_marker(i)
+            break
+
+    # Breakpoints 2-4 — last 3 non-system messages
+    non_sys_idx = [i for i, m in enumerate(messages)
+                   if isinstance(m, dict) and m.get("role") != "system"]
+    for i in non_sys_idx[-3:]:
+        _with_marker(i)
 
     return messages
 
@@ -1167,19 +1179,42 @@ class _ReasoningCompletions:
                 extra = {k: v for k, v in extra.items() if k != "extra_body"}
             kwargs.update(extra)
 
-        # Apply and learn per-model unsupported-kwarg quirks.
+        # Proactive shaping for OpenAI reasoning models (gpt-5.x incl. Sol,
+        # o-series): they reject `max_tokens` (wanting max_completion_tokens)
+        # and any temperature != 1. The reactive quirk-stripper only caught
+        # errors matching its regexes — and when it did strip max_tokens the
+        # request went out with NO output cap at all. Convert instead of strip.
         model = kwargs.get("model", "")
+        if self._provider in ("openai",) or (
+                self._provider == "openrouter" and "/gpt-5" in model.lower()):
+            bare = model.split("/")[-1].lower()
+            if bare.startswith(("gpt-5", "o1", "o3", "o4")):
+                if "max_tokens" in kwargs and "max_completion_tokens" not in kwargs:
+                    kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                if kwargs.get("temperature") not in (None, 1, 1.0):
+                    kwargs.pop("temperature", None)
+
+        # Apply and learn per-model unsupported-kwarg quirks.
         kwargs = _strip_quirks(kwargs, self._provider, model)
         for _ in range(3):
             try:
                 if stream_callback is not None:
+                    # Codex OAuth (and Anthropic) stream internally via
+                    # stream_callback; they are not OpenAI-SDK iterators.
+                    if getattr(self._inner, "handles_native_stream_callback", False):
+                        kwargs["stream_callback"] = stream_callback
+                        return self._inner.create(**kwargs)
                     return self._stream_create(kwargs, stream_callback)
                 return self._inner.create(**kwargs)
             except Exception as e:
                 bad = _detect_rejected(str(e))
                 if bad and bad in kwargs:
                     _mark_quirk(self._provider, model, bad)
-                    kwargs.pop(bad, None)
+                    if bad == "max_tokens" and "max_completion_tokens" not in kwargs:
+                        # Convert, don't strip — keep an output cap on the retry.
+                        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                    else:
+                        kwargs.pop(bad, None)
                     continue
                 raise
         raise RuntimeError(

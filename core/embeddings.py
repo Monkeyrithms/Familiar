@@ -61,6 +61,31 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 # Keys live under data/ (user-state / gitignore boundary). Match providers.py.
 KEYS_PATH = Path(__file__).parent.parent / "data" / "keys.json"
 
+# _load_embed_config()/_embeddings_enabled() run on every embed_text/embed_batch
+# call. Parsing config.json/keys.json from disk each time is wasted work, so we
+# cache each parsed dict keyed by file mtime+size (same pattern as load_config
+# in core/agent.py). Callers only read from the result, so no defensive copy.
+_json_file_cache: dict[str, tuple[tuple[int, int], dict]] = {}
+
+
+def _read_json_cached(path: Path) -> Optional[dict]:
+    """Parse a JSON file, reusing the cached dict while (mtime, size) is
+    unchanged. Returns None if the file is missing; raises on parse errors
+    (callers already guard with try/except, matching prior behavior)."""
+    cache_key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        _json_file_cache.pop(cache_key, None)
+        return None
+    stat_key = (st.st_mtime_ns, st.st_size)
+    entry = _json_file_cache.get(cache_key)
+    if entry is not None and entry[0] == stat_key:
+        return entry[1]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    _json_file_cache[cache_key] = (stat_key, data)
+    return data
+
 
 def _load_embed_dims() -> int:
     """Read embedding dimension from config. Override via `embedding_dims` key
@@ -85,8 +110,8 @@ def _load_embed_config() -> tuple[str, str, str]:
     """Returns (model, api_key, base_url). Any may be empty."""
     model = _DEFAULT_MODEL
     try:
-        if CONFIG_PATH.exists():
-            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        cfg = _read_json_cached(CONFIG_PATH)
+        if cfg is not None:
             m = cfg.get("embedding_model", "").strip()
             if m:
                 model = m
@@ -99,8 +124,8 @@ def _load_embed_config() -> tuple[str, str, str]:
     # Find an API key — try OpenRouter first, then OpenAI
     api_key, base_url = "", ""
     try:
-        if KEYS_PATH.exists():
-            keys = json.loads(KEYS_PATH.read_text(encoding="utf-8"))
+        keys = _read_json_cached(KEYS_PATH)
+        if keys is not None:
             or_key = keys.get("openrouter", {}).get("api_key", "")
             oai_key = keys.get("openai", {}).get("api_key", "")
             if or_key:
@@ -164,8 +189,8 @@ def _embeddings_enabled(purpose: str = "general") -> bool:
             return bool(_ACTIVE_POLICY.get("conversation_embeddings", False))
         return True
     try:
-        if CONFIG_PATH.exists():
-            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        cfg = _read_json_cached(CONFIG_PATH)
+        if cfg is not None:
             if not bool(cfg.get("embeddings_enabled", True)):
                 return False
             if purpose == "conversation":

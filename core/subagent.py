@@ -77,6 +77,54 @@ def resolve_subagent_llm(config: dict | None = None, mode: str = "",
     return main_provider, main_model
 
 
+# Providers whose quota is exhausted for the rest of the billing window.
+# A 429 from these is NOT transient — retrying wastes wall-clock and still
+# fails, so we blacklist the provider for the process and fall back.
+_dead_providers: set[str] = set()
+_dead_lock = threading.Lock()
+
+# Substrings that mark a hard quota/billing wall rather than a burst limit.
+_QUOTA_MARKERS = (
+    "usage_limit_reached", "insufficient_quota", "exceeded your current quota",
+    "billing", "payment required", "credit balance", "out of credits",
+)
+
+
+def _is_quota_exhausted(err_str: str) -> bool:
+    return any(marker in err_str for marker in _QUOTA_MARKERS)
+
+
+def mark_provider_dead(provider: str) -> None:
+    with _dead_lock:
+        _dead_providers.add((provider or "").lower())
+
+
+def is_provider_dead(provider: str) -> bool:
+    with _dead_lock:
+        return (provider or "").lower() in _dead_providers
+
+
+def _explore_fallback_llm(failed_provider: str) -> tuple[str, str]:
+    """Pick a (provider, model) for explore summarization when the configured
+    summarizer provider is out of quota.
+
+    Falls back to the main agent's pair — the one that's definitionally working,
+    since it's serving this very conversation. Returns ("", "") when the main
+    provider is the one that just died, so callers surface a real error instead
+    of looping between two dead providers.
+    """
+    config = _load_config()
+    main_provider = config.get("provider") or ""
+    main_model = config.get("model") or ""
+    if not main_provider or not main_model:
+        return "", ""
+    if main_provider.lower() == (failed_provider or "").lower():
+        return "", ""
+    if is_provider_dead(main_provider):
+        return "", ""
+    return main_provider, main_model
+
+
 def _strip_emoji_pictographs(s: str) -> str:
     """Remove emoji and common pictographic symbols from task strings."""
     if not s:
@@ -220,6 +268,12 @@ class TaskQueue:
         with self._lock:
             task = self._tasks.get(task_id)
             if task:
+                # A task already in a terminal state stays there. Otherwise a
+                # timed-out (FAILED) task whose pool thread eventually finishes
+                # would flip to COMPLETED after the job summary was emitted,
+                # unblocking dependents in a shut-down pool.
+                if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                    return
                 task.status = TaskStatus.COMPLETED
                 task.result = result
                 task.completed_at = time.time()
@@ -643,9 +697,16 @@ def _run_explore_single_shot(task: SubTask, model: str, provider: str,
     })
 
     client = get_client(provider)
+    # A provider already known to be out of quota this process — don't even
+    # try it, go straight to the fallback pair.
+    if is_provider_dead(provider):
+        provider, model = _explore_fallback_llm(provider)
+
+    client = get_client(provider)
 
     _MAX_RETRIES = 3
     _TRANSIENT_CODES = {429, 500, 502, 503, 504}
+    tried_fallback = False
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -666,6 +727,31 @@ def _run_explore_single_shot(task: SubTask, model: str, provider: str,
                 or getattr(getattr(e, "response", None), "status_code", None)
             )
             err_str = str(e).lower()
+
+            # Hard quota wall: retrying this provider is pointless (the window
+            # can be days). Blacklist it and re-run this batch once on the
+            # main agent's provider, which has independent credentials.
+            if _is_quota_exhausted(err_str):
+                mark_provider_dead(provider)
+                fb_provider, fb_model = _explore_fallback_llm(provider)
+                if tried_fallback or not fb_model:
+                    raise RuntimeError(
+                        f"Explore summarizer provider '{provider}' is out of "
+                        f"quota and no working fallback is configured. "
+                        f"Original error: {e}"
+                    ) from e
+                tried_fallback = True
+                provider, model = fb_provider, fb_model
+                client = get_client(provider)
+                _notify_status(task.task_id, "running", {
+                    "round": 1,
+                    "max_rounds": 1,
+                    "current_tool": "summarize",
+                    "current_args": f"{len(files)} file(s) [fallback]",
+                    "activity": [f"quota exhausted, falling back to {provider}/{model}"],
+                })
+                continue
+
             is_transient = (
                 status_code in _TRANSIENT_CODES
                 or "rate limit" in err_str
@@ -771,6 +857,21 @@ Return ONLY the JSON array, no other text."""
                 raw = raw.strip()
 
             tasks_data = json.loads(raw)
+            # Models often wrap the array in an object ({"tasks": [...]}) or
+            # return something else entirely — normalize to a list of dicts
+            # so we fall back instead of crashing on str.get() below.
+            if isinstance(tasks_data, dict):
+                for key in ("tasks", "subtasks", "items"):
+                    if isinstance(tasks_data.get(key), list):
+                        tasks_data = tasks_data[key]
+                        break
+                else:
+                    tasks_data = [tasks_data]
+            if not isinstance(tasks_data, list):
+                raise ValueError(f"decompose returned {type(tasks_data).__name__}, not a list")
+            tasks_data = [td for td in tasks_data if isinstance(td, dict)]
+            if not tasks_data:
+                raise ValueError("decompose returned no usable task dicts")
         except Exception as e:
             # Fallback: single task
             tasks_data = [{

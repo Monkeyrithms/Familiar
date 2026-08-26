@@ -50,12 +50,19 @@ OUTPUT — JSON object (no markdown, no explanation):
 
 MEMORY NOTES rules:
 - schema: {stream, category, title, content, keywords}
-- ✓ save: user prefs, corrections, personal details, project decisions, learned patterns, key outcomes, user-taught behaviors
-- ✗ skip: greetings, acks, task progress, facts re-derivable from code
-- update existing (same cat+title) rather than duplicate
-- one fact/note
+- THE DURABILITY TEST (apply to every candidate BEFORE saving): would this still be worth knowing weeks from now, after the current task is long finished? If it is only true "right now," it is NOT a memory note. When in doubt, do NOT save.
+- ✓ save: user preferences, corrections, personal details, standing project decisions & architecture, user-taught behaviors & doctrine, hard-won lessons that change future behavior
+- ✗ NEVER save (these are the crumbs that pollute memory and cause false "live" context):
+    · completion / status crumbs — "fixed X", "shipped Y", "done", "working now", "tested OK", "closed the chapter"
+    · transient reminders — "needs restart", "retest after", "waiting on", "next step is"
+    · one-turn forensic artifacts — a pasted dump, a turn id, the current scene/state, a debugging snapshot, "the bug is on line N right now"
+    · task progress, intermediate values, anything re-derivable from code or the DB
+    · greetings, acks
+- A bug that got fixed is NOT a note. The non-obvious LESSON that stops that bug CLASS from recurring IS a note. Save the rule, never the event.
+- ephemeral operational state belongs in workspace_notes (which auto-sheds), NOT long-term memory
+- update existing (same cat+title) rather than duplicate; one fact/note
 - keywords: comma-sep regex patterns for auto-trigger recall
-- [] if nothing durable
+- [] if nothing durable — this is the COMMON outcome, not a failure. Most turns produce no memory note.
 
 NOTE CONTENT STRUCTURE (use for durable facts that will accumulate evidence over time):
     ## Current

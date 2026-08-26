@@ -257,8 +257,15 @@ class _Cloudflared:
         if not exe:
             self._log("cloudflared not found next to main.py — inbound tunnel disabled")
             return None
+        # --protocol http2 forces the tunnel over TCP 443 instead of cloudflared's
+        # default QUIC (UDP 7844). On networks that block or throttle UDP 7844 the
+        # QUIC tunnel registers only partially (readyConnections < 4) and flaps —
+        # the public URL intermittently 530s while ordinary outbound HTTPS still
+        # works, so the host looks fine to itself but is unreachable to peers.
+        # HTTP/2 over 443 gets through almost any firewall.
         args = [exe, "tunnel", "--url", f"http://127.0.0.1:{self.port}",
-                "--no-autoupdate", "--metrics", f"127.0.0.1:{_CF_METRICS_PORT}"]
+                "--no-autoupdate", "--protocol", "http2",
+                "--metrics", f"127.0.0.1:{_CF_METRICS_PORT}"]
         flags = 0
         if sys.platform == "win32":
             flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
@@ -276,6 +283,13 @@ class _Cloudflared:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{_CF_METRICS_PORT}/quicktunnel", timeout=2) as r:
                     host = json.loads(r.read().decode()).get("hostname", "")
+                # Never accept cloudflared's registration host (api/www.
+                # trycloudflare.com) as our tunnel — only the assigned
+                # hyphenated quick-tunnel subdomain.
+                host = (host or "").strip()
+                if host and (host.startswith("api.") or host.startswith("www.")
+                             or "-" not in host.split(".")[0]):
+                    host = ""
                 if host:
                     self.url = f"https://{host}"
                     self._pid = self._proc.pid
@@ -315,6 +329,14 @@ def _local_conv_list() -> list[dict]:
              "message_count": c.get("message_count", 0)}
             for c in list_conversations()
             if not is_conversation_private(c["id"])]
+
+
+def _local_conv_create(name: str = "") -> dict:
+    from core.conversations import new_conversation_id, save_conversation
+    cid = new_conversation_id()
+    title = (name or "").strip() or "Network Agent Task"
+    save_conversation(cid, title, [])
+    return {"conv_id": cid, "name": title}
 
 
 def _conv_workspace_collapsed(conv_id: str) -> bool:
@@ -357,6 +379,22 @@ def _local_conv_snapshot(conv_id: str) -> dict | None:
 
 # ── Inbound HTTP server ──────────────────────────────────────────────────
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # A peer dropping the connection mid-exchange is normal (closed mirror
+        # tab, timed-out poll). The default handler dumps a full traceback to
+        # stderr, which looks like a crash and spooks the user. Swallow the
+        # benign disconnect class; let anything genuinely unexpected through.
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                            BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class _Handler(BaseHTTPRequestHandler):
     manager: "NetworkManager" = None  # set on the server instance's owner
 
@@ -365,11 +403,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _reply(self, code: int, obj: dict):
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        # The peer can hang up at any point (a mirror that closed its tab, a
+        # timed-out poll). Writing to a half-closed socket raises
+        # ConnectionAborted/Reset/BrokenPipe — there is no one left to answer,
+        # so swallow it quietly instead of letting it bubble into a second
+        # fault. Mark the connection dead so the handler stops.
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError,
+                BrokenPipeError, OSError):
+            self.close_connection = True
 
     def _read_authed(self):
         """Return (ok, body_bytes, parsed_json|None). Returns (None, …) when the
@@ -465,9 +512,21 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(401, {"error": "unauthorized"})
             return
         mgr = _Handler.manager
+        # Passive address self-heal: every authenticated envelope carries the
+        # sender's stable NAME and current reply_url. Match by NAME, never URL.
+        if isinstance(data, dict):
+            try:
+                heal_peer_url(data.get("from", ""),
+                              data.get("url", "") or data.get("reply_url", ""))
+            except Exception:
+                pass
         if self.path == "/ping":
             self._reply(200, {"ok": True, "node": mgr.node_name})
         elif self.path == "/sync":
+            if isinstance(data, dict) and data.get("type") == "peer_announce":
+                self._reply(200, {"ok": True, "healed": True,
+                                  "node": mgr.node_name if mgr else ""})
+                return
             # Inbound chat message → "Network: <node>" conversation.
             if mgr and mgr.on_sync:
                 try:
@@ -483,10 +542,26 @@ class _Handler(BaseHTTPRequestHandler):
                                   "convs": _local_conv_list()})
             except Exception as e:
                 self._reply(500, {"error": str(e)})
+        elif self.path == "/conv/create":
+            try:
+                made = _local_conv_create((data or {}).get("name", ""))
+                self._reply(200, {"ok": True, "node": mgr.node_name, **made})
+            except Exception as e:
+                self._reply(500, {"error": str(e)})
         elif self.path == "/conv/subscribe":
             conv_id = (data or {}).get("conv_id", "")
             reply_url = (data or {}).get("reply_url", "")
             mgr._subscribe_conv(conv_id, reply_url)
+            try:
+                snap = _local_conv_snapshot(conv_id)
+            except Exception as e:
+                self._reply(500, {"error": str(e)}); return
+            if snap is None:
+                self._reply(404, {"error": "no such conversation"})
+            else:
+                self._reply(200, {"ok": True, **snap})
+        elif self.path == "/conv/snapshot":
+            conv_id = (data or {}).get("conv_id", "")
             try:
                 snap = _local_conv_snapshot(conv_id)
             except Exception as e:
@@ -523,6 +598,15 @@ class _Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             self._reply(200, {"ok": True})
+        elif self.path == "/conv/stop":
+            # A viewer mirroring this conversation hit Stop — abort the turn we're
+            # running on its behalf. Ack regardless; the host aborts best-effort.
+            self._reply(200, {"ok": True})
+            if mgr and mgr.on_remote_stop:
+                try:
+                    mgr.on_remote_stop((data or {}).get("conv_id", ""))
+                except Exception:
+                    pass
 
         # ── Remote workspace files (scoped to a conversation's workspace) ──
         elif self.path == "/fs/list":
@@ -646,6 +730,23 @@ class _Handler(BaseHTTPRequestHandler):
                 import base64
                 self._reply(200, {"ok": True,
                                   "data": base64.b64encode(blob).decode()})
+        elif self.path == "/files/delete":
+            # Active delete push: a peer deleted a shared file and is telling us
+            # now instead of waiting for the 12s manifest pull. Adopt the
+            # tombstone, and if it's news to us, cascade it onward so a third
+            # node hears it immediately too. adopt_tombstone returns False once
+            # we already know it → the cascade terminates, no echo storm.
+            try:
+                from core.file_share import adopt_tombstone, broadcast_tombstone
+                rel = (data or {}).get("path", "")
+                ts = float((data or {}).get("deleted_at", 0) or 0)
+                adopted = adopt_tombstone(rel, ts,
+                                          source=(data or {}).get("from", ""))
+                if adopted:
+                    broadcast_tombstone(rel, ts)
+                self._reply(200, {"ok": True, "adopted": adopted})
+            except Exception as e:
+                self._reply(500, {"error": str(e)})
         else:
             self._reply(404, {"error": "not found"})
 
@@ -669,6 +770,8 @@ class NetworkManager:
                                             # peer wants THIS host to run a turn
         self.on_conv_event = None           # callback(dict) — a host we're mirroring
                                             # pushed a live conversation update
+        self.on_remote_stop = None          # callback(conv_id) — a viewer hit Stop
+                                            # on a turn THIS host is running for it
         # Set by the app: a callable(req: dict) that — on the GUI thread —
         # creates a TerminalAttachment for req['conv_id'] into req['attachment']
         # then sets req['event']. Lets the remote-terminal bridge attach to the
@@ -719,7 +822,7 @@ class NetworkManager:
             if inbound:
                 try:
                     _Handler.manager = self
-                    self._server = ThreadingHTTPServer(("127.0.0.1", self.port), _Handler)
+                    self._server = _QuietThreadingHTTPServer(("127.0.0.1", self.port), _Handler)
                     self._server_thread = threading.Thread(
                         target=self._server.serve_forever, daemon=True)
                     self._server_thread.start()
@@ -781,6 +884,19 @@ class NetworkManager:
         else:
             with self._lock:
                 _do()
+
+    def release_for_restart(self):
+        """Free ONLY the inbound HTTP port; leave cloudflared + sidecar alive so
+        an in-place update-restart re-adopts the same public URL."""
+        with self._lock:
+            if self._server is not None:
+                try:
+                    self._server.shutdown()
+                    self._server.server_close()
+                except Exception:
+                    pass
+                self._server = None
+            self.running = False
 
     def peer_reachable_count(self) -> tuple[int, int]:
         """(reachable, total) — pings each peer's /ping. Cheap, short timeouts."""
@@ -910,10 +1026,14 @@ def outbound_identity() -> tuple[str, str, list[dict]]:
     """(node_name, secret, peers) — live manager values when networking is
     running, else straight from config.json so outbound works standalone."""
     m = network_manager
-    if m.running and m.secret:
-        return m.node_name, m.secret, list(m.peers)
+    # Peers are ALWAYS read fresh from config so a URL/peer edit takes effect on
+    # the next outbound pass (e.g. the 12s file-share poll) without needing a
+    # full network restart. Identity (node_name/secret) prefers the live manager
+    # when running, else config — those rarely change and a restart re-binds them.
     net = _load_net_cfg()
     peers = [p for p in net.get("peers", []) if isinstance(p, dict) and p.get("url")]
+    if m.running and m.secret:
+        return m.node_name, m.secret, peers
     return (net.get("node_name") or "familiar"), net.get("secret", ""), peers
 
 
@@ -930,6 +1050,65 @@ def resolve_peer(name_or_url: str) -> dict | None:
                 or p.get("url", "").lower().rstrip("/") == low):
             return p
     return None
+
+
+# -- Address self-heal (crash-recovery URL push) --------------------------
+#
+# Cloudflared quick-tunnel URLs are reminted after crashes/restarts. The
+# recovered machine still has healthy OUTBOUND paths to peers whose tunnels did
+# not crash, so it can announce its new URL and let peers update the stored row
+# by stable node NAME.
+_heal_lock = threading.Lock()
+
+
+def heal_peer_url(node_name: str, new_url: str) -> bool:
+    """Update the configured peer URL for `node_name` if it changed."""
+    name = (node_name or "").strip()
+    url = (new_url or "").strip().rstrip("/")
+    if not name or not url or not url.lower().startswith("http"):
+        return False
+    if name.lower() == (network_manager.node_name or "").strip().lower():
+        return False
+    with _heal_lock:
+        try:
+            cfg = json.loads((APP_DIR / "config.json").read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        net = cfg.get("network")
+        if not isinstance(net, dict):
+            return False
+        peers = net.get("peers")
+        if not isinstance(peers, list):
+            return False
+        changed = False
+        for p in peers:
+            if not isinstance(p, dict):
+                continue
+            if (p.get("name", "").strip().lower() == name.lower()
+                    and (p.get("url", "") or "").strip().rstrip("/") != url):
+                old = p.get("url", "")
+                p["url"] = url
+                changed = True
+                network_manager._log(
+                    f"peer '{name}' address healed: {old or '<none>'} -> {url}")
+        if not changed:
+            return False
+        try:
+            (APP_DIR / "config.json").write_text(
+                json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            network_manager.peers = [q for q in peers
+                                     if isinstance(q, dict) and q.get("url")]
+        except Exception:
+            return False
+        return True
+
+
+def announce_address(url: str = "") -> list[dict]:
+    """Broadcast this node's current public URL so peers repair our row."""
+    pub = (url or network_manager.public_url or "").strip().rstrip("/")
+    if not pub:
+        return []
+    return broadcast({"type": "peer_announce", "url": pub})
 
 
 def _post(base_url: str, path: str, payload: dict,
@@ -982,6 +1161,12 @@ def send_to_peer(url: str, payload: dict, timeout: float = 10) -> tuple[bool, st
     return ok, ("delivered" if ok else detail)
 
 
+def request_peer(url: str, payload: dict, timeout: float = 10) -> dict | None:
+    """POST to /sync and return the peer's JSON body (or None on failure)."""
+    ok, resp, _detail = _post(url, "/sync", dict(payload or {}), timeout=timeout)
+    return resp if ok else None
+
+
 def broadcast(payload: dict, timeout: float = 10) -> list[dict]:
     """send_to_peer() to every configured peer. Returns per-peer results:
     [{'name', 'url', 'ok', 'detail'}, ...]."""
@@ -1003,12 +1188,26 @@ def peer_conv_list(url: str, timeout: float = 8) -> tuple[bool, list, str]:
     return ok, ((resp or {}).get("convs") or []), detail
 
 
+def peer_conv_create(url: str, name: str = "",
+                     timeout: float = 10) -> tuple[bool, dict | None, str]:
+    """Create a new non-private conversation on a peer."""
+    ok, resp, detail = _post(url, "/conv/create", {"name": name}, timeout=timeout)
+    return ok, (resp if ok else None), detail
+
+
 def peer_conv_subscribe(url: str, conv_id: str,
                         timeout: float = 10) -> tuple[bool, dict | None, str]:
     """Subscribe to a peer conversation's live events (the host pushes to our
     reply_url) and get its current snapshot back in one call. Returns
     (ok, snapshot|None, detail); snapshot is {'conv_id','name','messages'}."""
     ok, resp, detail = _post(url, "/conv/subscribe", {"conv_id": conv_id}, timeout=timeout)
+    return ok, (resp if ok else None), detail
+
+
+def peer_conv_snapshot(url: str, conv_id: str,
+                       timeout: float = 10) -> tuple[bool, dict | None, str]:
+    """Read a peer conversation snapshot without subscribing for live events."""
+    ok, resp, detail = _post(url, "/conv/snapshot", {"conv_id": conv_id}, timeout=timeout)
     return ok, (resp if ok else None), detail
 
 
@@ -1026,6 +1225,13 @@ def peer_conv_input(url: str, conv_id: str, text: str,
     ok, _resp, detail = _post(url, "/conv/input",
                               {"conv_id": conv_id, "text": text}, timeout=timeout)
     return ok, ("sent" if ok else detail)
+
+
+def peer_conv_stop(url: str, conv_id: str, timeout: float = 8) -> tuple[bool, str]:
+    """Tell the HOST to abort the turn it's running for a conversation we're
+    mirroring (the remote equivalent of the Stop button)."""
+    ok, _resp, detail = _post(url, "/conv/stop", {"conv_id": conv_id}, timeout=timeout)
+    return ok, ("stopped" if ok else detail)
 
 
 # ── Remote workspace files (browse/read/edit a peer conversation's workspace) ──

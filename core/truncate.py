@@ -44,6 +44,14 @@ _TOOL_REREAD_HINTS = {
         "Body too large. Pass a more specific request, or use a server "
         "endpoint that returns less."
     ),
+    "db_query": (
+        "Cell too large. Use action='cell' (table+column+where) to dump one "
+        "value untruncated, or SELECT fewer columns."
+    ),
+    "json_edit": (
+        "Value too large. Fetch a slice instead: json_path like $.edges[0:40] "
+        "to page through a big array."
+    ),
 }
 
 

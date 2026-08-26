@@ -21,6 +21,13 @@ import json
 # Reserve this fraction of context for the model's output + safety margin
 RESERVE_FRACTION = 0.15
 
+# The `tools` array ships with EVERY request but is invisible to
+# estimate_tokens (it only sees messages). ~40 registered tools with full
+# JSON-schema descriptions is a real, constant chunk of the window — ignoring
+# it let the payload creep past the true ceiling on smaller-window models
+# while the estimator still saw headroom.
+TOOL_SCHEMA_OVERHEAD_TOKENS = 15_000
+
 # Protect this many tokens of recent tool output from pruning
 PRUNE_PROTECT_TOKENS = 40_000
 
@@ -68,6 +75,12 @@ STALE_PRUNE_TRIGGER = 0.50
 SOFT_COMPACT_TRIGGER = 0.70
 
 
+# What one image actually costs the API tokenizer, roughly. Counting base64
+# at chars/4 made a single 4 MB screenshot look like ~1M tokens, which forced
+# max-aggression pruning of everything else on every round (compression thrash).
+IMAGE_FLAT_TOKENS = 1_500
+
+
 def estimate_tokens(messages: list[dict]) -> int:
     """Rough token estimate from character count."""
     total = 0
@@ -78,7 +91,10 @@ def estimate_tokens(messages: list[dict]) -> int:
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict):
-                    total += len(json.dumps(item))
+                    if item.get("type") == "image_url":
+                        total += IMAGE_FLAT_TOKENS * CHARS_PER_TOKEN
+                    else:
+                        total += len(json.dumps(item))
         if msg.get("tool_calls"):
             total += len(json.dumps(msg["tool_calls"], default=str))
     return total // CHARS_PER_TOKEN
@@ -319,6 +335,59 @@ def prune_stale_tool_results(messages: list[dict],
     return messages, pruned
 
 
+# Tool-call ARGUMENTS pruning: a file_write/apply_patch call keeps its whole
+# payload inside the assistant message's tool_calls forever — invisible to the
+# summarizer and untouchable by the tool-result pruners above. Clear old,
+# oversized argument strings down to a self-identifying stub.
+ARGS_PRUNE_MIN_LEN = 2_000
+KEEP_RECENT_TOOL_CALL_ARGS = 6
+# Never clear args for these tools — small and identity-bearing anyway.
+ARGS_PROTECTED_TOOLS = PROTECTED_TOOLS
+
+
+def prune_old_tool_call_args(messages: list[dict],
+                             keep_recent: int = KEEP_RECENT_TOOL_CALL_ARGS) -> tuple[list[dict], int]:
+    """Replace oversized `function.arguments` on old assistant tool_calls with
+    a stub that keeps the identifying keys (path/pattern/etc.). The full args
+    are already persisted to the on-disk tool-call meta store for the UI; the
+    tool has long since executed, so the payload is dead weight in context."""
+    seen = 0
+    pruned = 0
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+        seen += 1
+        if seen <= keep_recent:
+            continue
+        tcs = msg.get("tool_calls")
+        if not isinstance(tcs, list):
+            continue
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            if fn.get("name") in ARGS_PROTECTED_TOOLS:
+                continue
+            raw = fn.get("arguments", "")
+            if not isinstance(raw, str) or len(raw) <= ARGS_PRUNE_MIN_LEN:
+                continue
+            stub: dict = {"_args_cleared": f"{len(raw)} chars cleared to save context"}
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    for k in ("path", "file", "pattern", "query", "url", "cwd", "command"):
+                        if parsed.get(k):
+                            stub[k] = str(parsed[k])[:200]
+            except (json.JSONDecodeError, TypeError):
+                pass
+            fn["arguments"] = json.dumps(stub, ensure_ascii=False)
+            pruned += 1
+    return messages, pruned
+
+
 def compress_if_needed(messages: list[dict],
                        model: str = "",
                        max_tokens_override: int = 0,
@@ -351,7 +420,8 @@ def compress_if_needed(messages: list[dict],
         from core.providers import get_model_context_limit
         context_limit = get_model_context_limit(model)
 
-    usable = int(context_limit * (1.0 - RESERVE_FRACTION))
+    usable = int(context_limit * (1.0 - RESERVE_FRACTION)) - TOOL_SCHEMA_OVERHEAD_TOKENS
+    usable = max(usable, int(context_limit * 0.5))  # floor for tiny windows
     tokens = estimate_tokens(messages)
 
     # Tier 1: age-based pruning — BUDGET-GATED. Below the trigger we mutate
@@ -360,6 +430,9 @@ def compress_if_needed(messages: list[dict],
     if tokens >= int(usable * stale_trigger):
         messages, stale_pruned = prune_stale_tool_results(
             messages, keep_recent, protect_tokens)
+        # Same tier: clear oversized arguments on old tool calls (file_write
+        # payloads etc.) — the result pruners can't reach these.
+        messages, _args_pruned = prune_old_tool_call_args(messages)
         if stale_pruned > 0:
             messages = fix_orphaned_tool_pairs(messages)
 
