@@ -66,6 +66,8 @@ class _ToolNameItem(QTableWidgetItem):
 
 
 class SettingsDialog(GlassDialog):
+    _rejoin_done = pyqtSignal(int, int, list)
+
     def __init__(self, agent: Agent, parent=None):
         super().__init__(
             title="Settings", parent=parent, width=680, height=720,
@@ -78,6 +80,7 @@ class SettingsDialog(GlassDialog):
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.agent = agent
         self._dirty = False
+        self._rejoin_done.connect(self._on_rejoin_done)
         self._build_ui()
         self._wire_dirty_tracking()
         # Authoritative change detection: snapshot every input's value now, and
@@ -784,6 +787,75 @@ class SettingsDialog(GlassDialog):
         row.addWidget(btn)
         return row
 
+    def _reveal_widget(self, field: QLineEdit) -> QWidget:
+        """Password field + Show/Hide toggle wrapped in a QWidget for show/hide rows."""
+        w = QWidget()
+        w.setLayout(self._reveal_row(field))
+        return w
+
+    def _add_oauth_capable_provider_rows(
+        self,
+        form: QFormLayout,
+        pid: str,
+        info: dict,
+        entry: dict,
+        field: QLineEdit,
+    ) -> None:
+        """Auth mode radios; API key row hidden when OAuth is selected."""
+        amode = (entry.get("auth_mode") or "api_key").strip().lower()
+        oauth_modes = {
+            "anthropic": ("claude_code_oauth", "anthropic_oauth", "oauth"),
+            "openai": ("openai_codex_oauth", "codex_oauth", "oauth"),
+        }
+        oauth_labels = {
+            "anthropic": "Claude Code (OAuth)",
+            "openai": "Codex / ChatGPT (OAuth file)",
+        }
+        oauth_values = {
+            "anthropic": "claude_code_oauth",
+            "openai": "openai_codex_oauth",
+        }
+        use_oauth = amode in oauth_modes[pid]
+
+        auth_widget = QWidget()
+        auth_layout = QHBoxLayout(auth_widget)
+        auth_layout.setContentsMargins(0, 0, 0, 0)
+        auth_layout.setSpacing(12)
+
+        rb_api = QRadioButton("API key")
+        rb_oauth = QRadioButton(oauth_labels[pid])
+        if use_oauth:
+            rb_oauth.setChecked(True)
+        else:
+            rb_api.setChecked(True)
+
+        group = QButtonGroup(auth_widget)
+        group.addButton(rb_api, 0)
+        group.addButton(rb_oauth, 1)
+
+        auth_layout.addWidget(rb_api)
+        auth_layout.addWidget(rb_oauth)
+        auth_layout.addStretch()
+
+        form.addRow(QLabel(info["name"]), auth_widget)
+
+        key_label = QLabel("  └ API key")
+        key_row = self._reveal_widget(field)
+        form.addRow(key_label, key_row)
+
+        self._auth_mode_groups[pid] = group
+        self._auth_mode_oauth_values[pid] = oauth_values[pid]
+        self._auth_key_rows[pid] = (key_label, key_row)
+
+        def _sync_key_visibility(_checked: bool = False) -> None:
+            show_key = not rb_oauth.isChecked()
+            key_label.setVisible(show_key)
+            key_row.setVisible(show_key)
+
+        rb_api.toggled.connect(_sync_key_visibility)
+        rb_oauth.toggled.connect(_sync_key_visibility)
+        _sync_key_visibility()
+
     def _build_keys_tab(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -794,7 +866,9 @@ class SettingsDialog(GlassDialog):
         form.setContentsMargins(10, 10, 10, 10)
 
         self._key_fields = {}
-        self._auth_mode_combos: dict[str, QComboBox] = {}
+        self._auth_mode_groups: dict[str, QButtonGroup] = {}
+        self._auth_mode_oauth_values: dict[str, str] = {}
+        self._auth_key_rows: dict[str, tuple[QLabel, QWidget]] = {}
         keys = load_keys()
         cfg_keys = load_config()
 
@@ -811,26 +885,11 @@ class SettingsDialog(GlassDialog):
             field = QLineEdit(initial)
             field.setPlaceholderText(f"Enter {info['name']} API key...")
             self._key_fields[pid] = field
-            form.addRow(QLabel(info["name"]), self._reveal_row(field))
 
-            if pid == "anthropic":
-                auth = QComboBox()
-                auth.addItem("API key", "api_key")
-                auth.addItem("Claude Code (OAuth)", "claude_code_oauth")
-                amode = (entry.get("auth_mode") or "api_key").strip().lower()
-                idx = 1 if amode in ("claude_code_oauth", "anthropic_oauth", "oauth") else 0
-                auth.setCurrentIndex(idx)
-                self._auth_mode_combos[pid] = auth
-                form.addRow(QLabel("  └ Auth"), auth)
-            elif pid == "openai":
-                auth = QComboBox()
-                auth.addItem("API key", "api_key")
-                auth.addItem("Codex / ChatGPT (OAuth file)", "openai_codex_oauth")
-                amode = (entry.get("auth_mode") or "api_key").strip().lower()
-                idx = 1 if amode in ("openai_codex_oauth", "codex_oauth", "oauth") else 0
-                auth.setCurrentIndex(idx)
-                self._auth_mode_combos[pid] = auth
-                form.addRow(QLabel("  └ Auth"), auth)
+            if pid in ("anthropic", "openai"):
+                self._add_oauth_capable_provider_rows(form, pid, info, entry, field)
+            else:
+                form.addRow(QLabel(info["name"]), self._reveal_row(field))
 
         # Tool keys
         sep = QLabel("--- Tool API Keys ---")
@@ -3236,12 +3295,20 @@ class SettingsDialog(GlassDialog):
         self._net_stop_btn.clicked.connect(self._net_stop_clicked)
         self._net_check_btn = QPushButton("Check peers")
         self._net_check_btn.clicked.connect(self._net_check_peers_clicked)
+        self._net_rejoin_btn = QPushButton("Rejoin")
+        self._net_rejoin_btn.setToolTip(
+            "Broadcast this Familiar's current tunnel URL so peers update your row")
+        self._net_rejoin_btn.clicked.connect(self._net_rejoin_clicked)
         ctl.addWidget(self._net_start_btn)
         ctl.addWidget(self._net_stop_btn)
         ctl.addWidget(self._net_check_btn)
+        ctl.addWidget(self._net_rejoin_btn)
         ctl.addStretch(1)
         self._net_status = QLabel("")
         self._net_status.setStyleSheet(f"color:{PALETTE['muted_text']};")
+        self._net_status.setWordWrap(True)
+        self._net_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         ctl.addWidget(self._net_status)
         outer.addLayout(ctl)
         # Reflect a tunnel that's already up from a prior start.
@@ -3556,6 +3623,14 @@ class SettingsDialog(GlassDialog):
                 save_config(c)
             except Exception:
                 pass
+            try:
+                from core.network import announce_address
+                import threading as _th
+                _th.Thread(target=announce_address,
+                           args=(network_manager.public_url,),
+                           daemon=True).start()
+            except Exception:
+                pass
         elif network_manager.running and network_manager._cf is None:
             self._net_status.setText("inbound up (tunnel off)")
             self._net_poll_timer.stop()
@@ -3569,6 +3644,37 @@ class SettingsDialog(GlassDialog):
         network_manager.stop()
         self._net_public_edit.setText("")
         self._net_status.setText("stopped")
+
+    def _net_rejoin_clicked(self):
+        """Push this node's current public URL to peers after a tunnel remint."""
+        import threading
+        pub = (network_manager.public_url or self._net_public_edit.text() or "").strip()
+        if not pub:
+            self._net_status.setText("rejoin needs a public URL — Start first")
+            return
+        self._net_rejoin_btn.setEnabled(False)
+        self._net_status.setText("rejoining peers…")
+
+        def _work():
+            try:
+                from core.network import announce_address
+                results = announce_address(pub)
+            except Exception as e:
+                results = [{"ok": False, "name": "rejoin", "detail": str(e)}]
+            ok = sum(1 for r in results if r.get("ok"))
+            total = len(results)
+            bits = [f"{r.get('name') or r.get('url')}: "
+                    f"{'ok' if r.get('ok') else r.get('detail', 'failed')}"
+                    for r in results]
+            self._rejoin_done.emit(ok, total, bits)
+
+        threading.Thread(target=_work, daemon=True, name="familiar-rejoin").start()
+
+    def _on_rejoin_done(self, ok: int, total: int, bits: list) -> None:
+        self._net_rejoin_btn.setEnabled(True)
+        self._net_status.setText(
+            f"rejoin announced to {ok}/{total} peer(s)"
+            + (f" — {'; '.join(bits)}" if bits else ""))
 
     def _net_check_peers_clicked(self):
         """Probe each peer off-thread on BOTH levels: an unauthenticated /ping
@@ -3591,17 +3697,57 @@ class SettingsDialog(GlassDialog):
         def _probe():
             import json as _json, time as _time, urllib.request, urllib.error
             from core.network import sign
-            total = len(peers)
-            reachable = authed = 0
+
+            def _classify(exc):
+                """Translate a connection exception into a plain-English cause +
+                the raw detail, so 'unreachable' actually says WHY."""
+                reason = getattr(exc, "reason", exc)
+                errno = getattr(reason, "errno", None)
+                winerr = getattr(reason, "winerror", None)
+                raw = str(reason) or type(exc).__name__
+                low = raw.lower()
+                if isinstance(exc, TimeoutError) or "timed out" in low or "timeout" in low:
+                    return ("timed out", "no response in time — host firewalled, "
+                            "tunnel down, or wrong port")
+                if winerr == 10061 or errno == 111 or "refused" in low:
+                    return ("connection refused", "host is up but nothing is "
+                            "listening there — app not running / wrong port")
+                if winerr == 11001 or "getaddrinfo" in low or "name or service" in low \
+                        or "nodename nor servname" in low:
+                    return ("can't resolve host", "DNS/hostname failed — the URL is "
+                            "wrong or the tunnel address is dead")
+                if winerr == 10060 or errno == 110 or "10060" in low:
+                    return ("no route / timed out", "host unreachable on the network "
+                            "— firewall or it's offline")
+                if "ssl" in low or "certificate" in low or "tls" in low:
+                    return ("TLS error", f"https handshake failed — {raw}")
+                if "connection reset" in low or winerr == 10054:
+                    return ("connection reset", "something answered then dropped — "
+                            "proxy/tunnel mismatch")
+                return (type(exc).__name__, raw)
+
+            results = []
             for p in peers:
                 url = p["url"].rstrip("/")
+                name = (p.get("name") or "").strip() or url
+                state = "unreachable"
+                detail = ""
+                # Level 1 — unauthenticated reachability.
                 try:
                     with urllib.request.urlopen(url + "/ping", timeout=4) as r:
-                        if r.status == 200:
-                            reachable += 1
-                except Exception:
-                    continue  # unreachable → can't be authed either
-                # Signed probe of an authenticated endpoint.
+                        reachable = (r.status == 200)
+                except Exception as e:
+                    short, why = _classify(e)
+                    results.append({"name": name, "url": url, "state": "unreachable",
+                                    "detail": short, "why": why})
+                    continue
+                if not reachable:
+                    results.append({"name": name, "url": url, "state": "unreachable",
+                                    "detail": "bad /ping status",
+                                    "why": "answered, but not with 200 — "
+                                    "a different service may be on that URL"})
+                    continue
+                # Level 2 — signed probe of an authenticated endpoint.
                 try:
                     body = _json.dumps({"from": node, "sent_at": _time.time()}).encode()
                     ts = str(_time.time())
@@ -3610,11 +3756,19 @@ class SettingsDialog(GlassDialog):
                         headers={"Content-Type": "application/json", "X-Timestamp": ts,
                                  "X-Signature": sign(secret, body, ts)})
                     with urllib.request.urlopen(req, timeout=5) as r:
-                        if r.status == 200:
-                            authed += 1
-                except Exception:
-                    pass
-            self._net_peer_check_result = (reachable, authed, total)
+                        state = "ok" if r.status == 200 else "reachable"
+                        if r.status != 200:
+                            detail = f"auth HTTP {r.status}"
+                except urllib.error.HTTPError as e:
+                    state = "auth_failed"
+                    detail = "secret mismatch / clock skew" if e.code in (401, 403) \
+                        else f"auth HTTP {e.code}"
+                except Exception as e:
+                    state = "auth_failed"
+                    short, _why = _classify(e)
+                    detail = short
+                results.append({"name": name, "url": url, "state": state, "detail": detail})
+            self._net_peer_check_result = results
 
         threading.Thread(target=_probe, daemon=True, name="net-peer-check").start()
 
@@ -3624,18 +3778,29 @@ class SettingsDialog(GlassDialog):
                 QTimer.singleShot(200, _poll)
                 return
             self._net_check_btn.setEnabled(True)
-            reachable, authed, total = res
-            if authed == total:
-                msg = f"✓ {authed}/{total} connected & authenticated"
-            elif reachable and not authed:
-                msg = (f"reachable {reachable}/{total} but AUTH FAILED — shared "
-                       f"secret must match exactly on both machines, and clocks "
-                       f"within 30s")
-            elif reachable:
-                msg = f"reachable {reachable}/{total}, authenticated {authed}/{total}"
-            else:
-                msg = f"unreachable 0/{total} — check the peer URL / tunnel"
-            self._net_status.setText(msg)
+            _ICON = {"ok": "✓", "auth_failed": "✗", "reachable": "•",
+                     "unreachable": "✗"}
+            _WORD = {"ok": "connected & authenticated",
+                     "auth_failed": "AUTH FAILED",
+                     "reachable": "reachable, auth inconclusive",
+                     "unreachable": "unreachable"}
+            lines = []
+            for r in res:
+                icon = _ICON.get(r["state"], "?")
+                word = _WORD.get(r["state"], r["state"])
+                line = f"{icon} {r['name']} — {word}"
+                if r["detail"]:
+                    line += f" ({r['detail']})"
+                lines.append(line)
+                why = r.get("why")
+                if why:
+                    lines.append(f"      ↳ {why}")
+                    lines.append(f"      ↳ {r['url']}")
+            ok = sum(1 for r in res if r["state"] == "ok")
+            header = f"{ok}/{len(res)} connected & authenticated"
+            if any(r["state"] == "auth_failed" for r in res):
+                header += "  — secret must match exactly on both machines, clocks within 30s"
+            self._net_status.setText(header + "\n" + "\n".join(lines))
         QTimer.singleShot(200, _poll)
 
     def _save_and_close(self):
@@ -3646,9 +3811,12 @@ class SettingsDialog(GlassDialog):
             if pid not in keys:
                 keys[pid] = {}
             keys[pid]["api_key"] = val
-            combo = self._auth_mode_combos.get(pid)
-            if combo is not None:
-                keys[pid]["auth_mode"] = combo.currentData() or "api_key"
+            group = self._auth_mode_groups.get(pid)
+            if group is not None:
+                oauth_val = self._auth_mode_oauth_values[pid]
+                keys[pid]["auth_mode"] = (
+                    oauth_val if group.checkedId() == 1 else "api_key"
+                )
         save_keys(keys)
 
         # Save model config

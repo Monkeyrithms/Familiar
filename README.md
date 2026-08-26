@@ -227,7 +227,6 @@ Tools self-register on import (`tools/registry.py`, `tools/__init__.py`). Each d
 | `workspace_terminal` | Send commands to the active workspace terminal tab |
 | `lsp` | LSP actions (diagnostics, definition, references, hover, symbols) for Python/JS/Go/Rust |
 | `lint` | Auto-lint after edits (ruff → pyflakes → py_compile; subprocess linters for other langs) |
-| `hot_reload` | Reload tool modules |
 
 </details>
 

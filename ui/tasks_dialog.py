@@ -1145,6 +1145,13 @@ class TasksDialog(GlassDialog):
         if not prompt:
             prompt = next((a["content"] for a in actions), "")
 
+        # A task created from a conversation belongs to that conversation unless
+        # the user explicitly selected another target.
+        if not targets["conversations"] and not targets["streams"]:
+            current_conv_id = getattr(self._chat, "_current_conv_id", "")
+            if current_conv_id:
+                targets["conversations"].append(current_conv_id)
+
         # Use first conversation target for backend compat
         conv_id = targets["conversations"][0] if targets["conversations"] else ""
 

@@ -589,6 +589,19 @@ class ConversationDialog(GlassDialog):
             self.agent.set_provider(pid)
         if model:
             self.agent.set_model(model)
+        # Persist the switch to the conversation row NOW (synchronously).
+        # Relying on the later async autosave meant any reload racing it
+        # re-read the OLD row and silently reverted the model.
+        if self._conv_id and (pid or model):
+            try:
+                from core.database import set_conversation_model_provider
+                set_conversation_model_provider(
+                    self._conv_id,
+                    model or (self.agent._model_override or self.agent.model),
+                    pid or self.agent.provider,
+                )
+            except Exception:
+                pass
         # Per-conversation reasoning level ("off" → cleared). Persists to the
         # conversation row so it survives reloads and column switches.
         level = self._reasoning_combo.currentData() or "off"

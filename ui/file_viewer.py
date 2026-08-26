@@ -6,6 +6,7 @@ import functools
 import os
 import subprocess
 import sys
+import threading
 from PyQt6.QtWidgets import (
     QFrame,
     QVBoxLayout,
@@ -1983,8 +1984,24 @@ class FileViewer(QFrame):
         if not getattr(self, "_remote_expand_wired", False):
             self._file_tree.expanded.connect(self._on_remote_expand)
             self._remote_expand_wired = True
-        self._materialize_remote_dir("")            # top-level listing
+        # The top-level listing is a BLOCKING network call (peer_fs_list, up to a
+        # 10s timeout). Running it here would freeze the whole UI while opening a
+        # mirror against a slow/dead peer. Show the (empty) shadow root now and
+        # fetch the listing on a worker thread; it materializes when it lands.
         self.set_explorer_root(root, pinned=True)
+        rw = self._remote_ws
+        def _bg():
+            try:
+                self._materialize_remote_dir("")    # blocking; safe off-thread
+            except Exception:
+                return
+            # Re-point the tree on the UI thread so the now-materialized
+            # placeholders show, but only if this mirror is still active.
+            def _apply():
+                if getattr(self, "_remote_ws", None) is rw:
+                    self.set_explorer_root(rw["root"], pinned=True)
+            QTimer.singleShot(0, _apply)
+        threading.Thread(target=_bg, daemon=True).start()
 
     def exit_remote_workspace(self) -> None:
         self._remote_ws = None
@@ -2011,11 +2028,16 @@ class FileViewer(QFrame):
             return
         from core.network import peer_fs_list
         from PyQt6.QtWidgets import QApplication
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # Only touch the cursor (a UI op) when we're on the GUI thread. The
+        # initial top-level fetch now runs on a worker thread.
+        on_ui = threading.current_thread() is threading.main_thread()
+        if on_ui:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             ok, res, _ = peer_fs_list(rw["peer_url"], rw["conv_id"], rel)
         finally:
-            QApplication.restoreOverrideCursor()
+            if on_ui:
+                QApplication.restoreOverrideCursor()
         if not ok or not res:
             return
         rw["dirs"].add(rel)

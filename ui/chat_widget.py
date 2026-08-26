@@ -112,6 +112,7 @@ from core.database import (
     set_conversation_composer_draft,
     enqueue_composer_draft_save,
     get_conversation_composer_pastes,
+    get_workspace_notes,
     enqueue_composer_pastes_save,
     enqueue_conversation_save,
 )
@@ -342,13 +343,28 @@ def _md_emphasis_style() -> str:
     must include this or that path renders in flat body color."""
     p = PALETTE
     hot = p.get("glow_hot", p.get("accent_bright", "#aeffff"))
+    code_bg = p.get("panel_alt", p.get("panel", "#11171a"))
+    code_fg = p.get("text", "#d6e4e8")
+    code_brd = p.get("border", "#2a3a40")
     return (
         f'<style>'
         f'p {{ margin-top: 0; margin-bottom: 0; }} '
         f'strong, b {{ color: {hot}; }} '
         f'h1, h2, h3, h4, h5, h6 {{ color: {hot}; margin-top: 6px; margin-bottom: 2px; }} '
         f'ul, ol {{ margin-top: 2px; margin-bottom: 2px; }} '
-        f'li {{ color: {hot}; }}'
+        f'li {{ color: {hot}; }} '
+        # Fenced code blocks + inline code: markdown2 emits <pre><code>…</code></pre>
+        # for ``` fences and <code> for `inline`. Qt RichText renders these flat
+        # without explicit styling, so give them a panel background, monospace
+        # face, and a subtle border so code reads as code.
+        f'pre {{ background: {code_bg}; color: {code_fg}; '
+        f'font-family: Consolas, "Cascadia Mono", monospace; '
+        f'border: 1px solid {code_brd}; border-radius: 4px; '
+        f'padding: 6px 8px; margin: 4px 0; white-space: pre-wrap; }} '
+        f'pre code {{ background: transparent; border: none; padding: 0; color: {code_fg}; }} '
+        f'code {{ background: {code_bg}; color: {code_fg}; '
+        f'font-family: Consolas, "Cascadia Mono", monospace; '
+        f'border: 1px solid {code_brd}; border-radius: 3px; padding: 0 3px; }}'
         f'</style>'
     )
 
@@ -473,12 +489,16 @@ class InferenceThread(QThread):
     tool_called = pyqtSignal(str, dict)  # tool_name, args — fires mid-inference
     chunk = pyqtSignal(str)        # streamed answer-text delta (live rendering)
     round_started = pyqtSignal()   # a new model round began — reset live view
+    round_discarded = pyqtSignal() # a failed attempt's partial must be dropped (retry)
+    steer_partial = pyqtSignal(str)  # answer completed, then a steer extended the turn
 
-    def __init__(self, agent: Agent, message: str, image_path: str = None):
+    def __init__(self, agent: Agent, message: str, image_path: str = None,
+                 conversation_id: str = ""):
         super().__init__()
         self.agent = agent
         self.message = message
         self.image_path = image_path
+        self.conversation_id = conversation_id or getattr(agent, "_conv_id", "")
 
     def run(self):
         try:
@@ -490,11 +510,18 @@ class InferenceThread(QThread):
             stream_live = bool(getattr(self.agent, "_stream_live", True))
             self.agent._stream_callback = self.chunk.emit if stream_live else None
             self.agent._on_round_start = self.round_started.emit if stream_live else None
+            self.agent._on_round_discard = self.round_discarded.emit if stream_live else None
+            # Fires when the model had finished answering but a mid-turn steer
+            # kept the turn alive — the finished text must be sealed into the
+            # transcript now, since the turn continues past it.
+            self.agent._on_steer_partial = self.steer_partial.emit
             reply = self.agent.chat(self.message, image_path=self.image_path)
             self.agent._tool_callback = None
             self.agent._tool_batch_callback = None
             self.agent._stream_callback = None
             self.agent._on_round_start = None
+            self.agent._on_round_discard = None
+            self.agent._on_steer_partial = None
             reply_html = ""
             try:
                 extras = ["fenced-code-blocks", "tables", "code-friendly"]
@@ -530,6 +557,7 @@ class InferenceThread(QThread):
         self.agent._tool_batch_callback = None
         self.agent._stream_callback = None
         self.agent._on_round_start = None
+        self.agent._on_steer_partial = None
 
     def _on_tool(self, name: str, args: dict):
         self.tool_called.emit(name, args)
@@ -2909,6 +2937,8 @@ class ChatWindow(QWidget):
     remote_input_received = pyqtSignal(str, str, str)
     # A host we're mirroring pushed a live conversation event (dict).
     conv_event_received = pyqtSignal(object)
+    # A viewer mirroring us hit Stop — abort the turn we run for it (conv_id).
+    remote_stop_received = pyqtSignal(str)
     # The network terminal bridge asks (from a server thread) for an attachment
     # to a conversation's live shell; built on the GUI thread.
     terminal_attach_requested = pyqtSignal(object)
@@ -2923,6 +2953,13 @@ class ChatWindow(QWidget):
         self.tool_batch.connect(self._on_tool_batch)
         self._question_requested.connect(self._show_question_board)
         self._thread = None
+        # Abandoned-but-still-running workers. NEVER terminate() a live Python
+        # QThread (it can die holding the GIL / heap / sqlite locks → the
+        # long-run access-violation crashes and permanent save hangs). Instead
+        # we keep a strong ref here until the thread exits on its own — dropping
+        # the last ref to a running QThread aborts the process.
+        self._zombie_threads: list[QThread] = []
+        self._zombie_sweeper: QTimer | None = None
         self._queued_message = None  # message submitted mid-job, auto-sent on finish
         self._stream_did_split = False  # set when a diff card splits the live bubble this turn
         # True while the agent is BLOCKED on an ask_user_question board — it's
@@ -2932,6 +2969,13 @@ class ChatWindow(QWidget):
         self._thinking = None
         self._conv_threads: dict[str, dict] = {}  # conv_id -> {"thread", "meta", "agent_state"}
         self._current_conv_id = ""
+        # The conv_id that the in-memory _message_meta currently belongs to.
+        # _load_conv is async: _current_conv_id flips to the target the instant
+        # the user clicks, but _message_meta still holds the PREVIOUS chat until
+        # the background load lands. Any autosave in that gap would write the old
+        # transcript into the new conv's row (data loss). _auto_save refuses to
+        # save while this tag != _current_conv_id.
+        self._meta_owner_cid = ""
         self._pending_image: str | None = None
         self._message_meta: list[dict] = []  # full history
         self._cutoff_meta_cache_key: tuple | None = None
@@ -2967,6 +3011,8 @@ class ChatWindow(QWidget):
         self._stream_active = False
         self._stream_live_meta_idx: int | None = None
         self._inferring = False
+        self._worker_recovery_attempts = 0
+        self._worker_recovery_max = 3
         self._composer_draft_cache: dict[str, str] = {}
         self._composer_pastes_cache: dict[str, list] = {}
         self._conv_load_generation = 0
@@ -3086,16 +3132,20 @@ class ChatWindow(QWidget):
         # is installed unconditionally so a later Settings → Start works too.
         self._remote_mirror = None      # active remote-conversation mirror (viewer side)
         self._remote_convs_by_peer = {}  # peer_name -> [conv dicts] for the dropdown
+        self._peer_health_by_name = {}   # peer_name -> {name,url,online,detail}
         try:
             from core.network import network_manager
             self.network_event.connect(self._on_network_event)
             self.remote_input_received.connect(self._on_remote_input)
             self.conv_event_received.connect(self._on_conv_event)
+            self.remote_stop_received.connect(self._on_remote_stop)
             network_manager.on_sync = self.network_event.emit
             network_manager.on_remote_input = (
                 lambda cid, text, reply_url: self.remote_input_received.emit(
                     cid or "", text or "", reply_url or ""))
             network_manager.on_conv_event = self.conv_event_received.emit
+            network_manager.on_remote_stop = (
+                lambda cid: self.remote_stop_received.emit(cid or ""))
             self.terminal_attach_requested.connect(self._on_terminal_attach_request)
             network_manager.terminal_attach_request = self.terminal_attach_requested.emit
             # Poll peers for their conversation lists. The timer ALWAYS runs and
@@ -3106,7 +3156,17 @@ class ChatWindow(QWidget):
             self._remote_conv_timer.timeout.connect(self._refresh_remote_convs)
             self._remote_conv_timer.start(15000)
             if (self.agent.config.get("network") or {}).get("enabled"):
-                network_manager.start({"network": self.agent.config.get("network", {})})
+                def _announce_new_url(url):
+                    if not url:
+                        return
+                    try:
+                        from core.network import announce_address
+                        threading.Thread(target=announce_address, args=(url,),
+                                         daemon=True).start()
+                    except Exception:
+                        pass
+                network_manager.start({"network": self.agent.config.get("network", {})},
+                                      on_ready=_announce_new_url)
                 QTimer.singleShot(4000, self._refresh_remote_convs)
         except Exception:
             pass
@@ -4027,6 +4087,7 @@ class ChatWindow(QWidget):
         self.agent.set_system_prompt_override("")
         self.agent._system_prompt_replace = False
         self.agent._context_note = ""
+        self.agent._workspace_notes = []
         self._set_ws_combo_to(default_ws)
         self._set_provider_combo_to(self.agent.provider)
         self._update_conv_summary_label()
@@ -4034,6 +4095,7 @@ class ChatWindow(QWidget):
         self._message_meta = []
         self._refresh_conv_bar()
         self._persist_active_conv()
+        self._meta_owner_cid = cid  # fresh empty transcript belongs to the new conv
         # Reset file viewer + browser for fresh conversation. The terminal
         # panel doesn't need wiping — set_active_conv on a fresh conv_id
         # creates a brand new per-conv panel; previous conv's tabs and
@@ -4145,6 +4207,10 @@ class ChatWindow(QWidget):
             bg_agent._system_prompt_override = self.agent._system_prompt_override
             bg_agent._system_prompt_replace = self.agent._system_prompt_replace
             bg_agent._context_note = getattr(self.agent, "_context_note", "")
+            bg_agent._conversation_streams = list(
+                getattr(self.agent, "_conversation_streams", []) or [])
+            bg_agent._workspace_notes = list(
+                getattr(self.agent, "_workspace_notes", []) or [])
             bg_agent.set_conv_id(cid)
             # Swap the thread's agent reference to the isolated copy
             self._thread.agent = bg_agent
@@ -4172,6 +4238,10 @@ class ChatWindow(QWidget):
             # like chunk/finished; the bg buffer below keeps accumulating raw text.
             try:
                 self._thread.round_started.disconnect(self._on_stream_round_start)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self._thread.round_discarded.disconnect(self._on_stream_round_discard)
             except (TypeError, RuntimeError):
                 pass
             self.agent._tool_callback = None
@@ -4245,6 +4315,7 @@ class ChatWindow(QWidget):
             self._thread = snap["thread"]
             self._thread.agent = self.agent  # point thread back to shared agent
             self._message_meta = snap["meta"]
+            self._meta_owner_cid = conv_id  # adopted live transcript is this conv's
 
             # Copy bg_agent state back into the shared agent
             self.agent.context = bg_agent.context
@@ -4256,6 +4327,11 @@ class ChatWindow(QWidget):
             self.agent._system_prompt_override = bg_agent._system_prompt_override
             self.agent._system_prompt_replace = getattr(bg_agent, "_system_prompt_replace", False)
             self.agent._context_note = getattr(bg_agent, "_context_note", "")
+            self.agent._conversation_streams = list(
+                getattr(bg_agent, "_conversation_streams", []) or [])
+            self.agent._workspace_notes = list(
+                getattr(bg_agent, "_workspace_notes", []) or [])
+            self.agent.set_conv_id(conv_id)
 
             # Reconnect signals
             try:
@@ -4274,6 +4350,11 @@ class ChatWindow(QWidget):
             except (TypeError, RuntimeError):
                 pass
             self._thread.round_started.connect(self._on_stream_round_start)
+            try:
+                self._thread.round_discarded.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self._thread.round_discarded.connect(self._on_stream_round_discard)
             self.agent._tool_callback = lambda n, a: self.tool_activity.emit(n, a)
             self.agent._tool_batch_callback = lambda ns: self.tool_batch.emit(ns)
 
@@ -4314,6 +4395,10 @@ class ChatWindow(QWidget):
             # No active thread — load from disk normally
             self._conv_threads.pop(conv_id, None)
             self._thread = None
+            # Clear the busy flag: the turn we backgrounded belongs to the OTHER
+            # conversation now. Left set, _agent_busy() reports busy in this idle
+            # conv and every send raises a spurious interrupt dialog.
+            self._set_inferring(False)
             self._reset_stream_state()  # don't carry a live stream across the switch
             self._load_conv(conv_id)
 
@@ -4449,6 +4534,9 @@ class ChatWindow(QWidget):
         self.agent.clear_context()
         self._clear_message_widgets()
         self._message_meta = []
+        # The async load for this conv has landed — meta now belongs to conv_id,
+        # which re-enables autosave (it was gated during the load gap).
+        self._meta_owner_cid = conv_id
         self.agent._provider_override = ""
         self.agent._model_override = ""
         self.agent._system_prompt_override = ""
@@ -4474,6 +4562,7 @@ class ChatWindow(QWidget):
             'core.summarizer', fromlist=['RollingSummarizer']).RollingSummarizer(conv_id)
         conv_streams = data.get("streams", [])
         self.agent.set_conversation_streams(conv_streams)
+        self.agent._workspace_notes = get_workspace_notes(conv_id)
         try:
             stream_configs = self.agent._get_stream_configs()
             self.agent.summarizer._ensure_streams(stream_configs)
@@ -4639,10 +4728,16 @@ class ChatWindow(QWidget):
                 return
         self._refresh_conv_bar()
 
-    def _auto_save(self, *, immediate: bool = False):
+    def _auto_save(self, *, immediate: bool = False, allow_truncate: bool = False):
         """Save the current conversation to disk (background thread by default)."""
         if not self._current_conv_id or self._is_remote_id(self._current_conv_id):
             return  # a remote mirror has no local row to write
+        # Guard the async-load race: if _message_meta still belongs to a
+        # different conversation (target picked, background load not landed yet),
+        # saving now would clobber the target conv's row with the previous
+        # chat's transcript. Skip until ownership matches.
+        if self._meta_owner_cid != self._current_conv_id:
+            return
 
         model = self.agent._model_override or self.agent.model
         provider = self.agent._provider_override
@@ -4672,6 +4767,7 @@ class ChatWindow(QWidget):
                 prompt_replace=getattr(self.agent, "_system_prompt_replace", False),
                 context_note=getattr(self.agent, "_context_note", ""),
                 include_timestamps=getattr(self.agent, "_include_context_timestamps", True),
+                allow_truncate=allow_truncate,
             )
             self._save_viewer_state()
         else:
@@ -4686,6 +4782,7 @@ class ChatWindow(QWidget):
                 context_note=getattr(self.agent, "_context_note", ""),
                 include_timestamps=getattr(self.agent, "_include_context_timestamps", True),
                 resolve_name=True,
+                allow_truncate=allow_truncate,
             )
             self._viewer_state_save_timer.start()
 
@@ -4854,6 +4951,20 @@ class ChatWindow(QWidget):
         c = len(meta.get("content", ""))
         if role in ("terminal_card", "plan_card", "subagent_card", "chart_card", "diff_card"):
             return min(c, self._CARD_CHAR_CAP)
+        timeline = meta.get("_stream_timeline")
+        if isinstance(timeline, list):
+            timeline_cost = 0
+            for item in timeline:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    timeline_cost += len(item.get("content", ""))
+                else:
+                    # Inline tools/cards have real rendered height even when the
+                    # assistant's flattened content is short. Budget each one so
+                    # a restored mega-turn cannot masquerade as a tiny message.
+                    timeline_cost += self._CARD_CHAR_CAP
+            c = max(c, timeline_cost)
         # Cap a SINGLE message's budget cost. A message larger than _char_limit
         # used to blow the whole window budget, so _calc_range and the slide trim
         # loops collapsed the window down to that one message — evicting the
@@ -4878,6 +4989,11 @@ class ChatWindow(QWidget):
                 break
             total_chars += c
             start = i
+        # Never hydrate the display in the middle of a turn. Starting on an
+        # assistant/tool card after restart looks exactly like transcript loss,
+        # even though the preceding user prompt is still on disk.
+        while start > 0 and self._message_meta[start].get("role") != "user":
+            start -= 1
         return start, end
 
     def _insert_msg_widget(self, meta_idx: int, widget, ordered_indices: list):
@@ -5190,12 +5306,6 @@ class ChatWindow(QWidget):
                 return i
         return None
 
-    def _find_live_stream_idx(self) -> int | None:
-        for i, meta in enumerate(self._message_meta):
-            if meta.get("role") == "assistant" and meta.get("_streaming"):
-                return i
-        return None
-
     def _live_stream_meta(self) -> dict | None:
         idx = self._stream_live_meta_idx
         if idx is None:
@@ -5223,6 +5333,24 @@ class ChatWindow(QWidget):
             t.setSingleShot(True)
             t.timeout.connect(self._resurface_live_plan)
         t.start(350)
+
+    @staticmethod
+    def _plan_signature(pd: dict) -> tuple:
+        """Visible identity of a plan card: title + each step's label/status.
+
+        Two cards with the same signature render identically, so surfacing the
+        second one is pure duplication.
+        """
+        pd = pd or {}
+        steps = pd.get("steps") or []
+        return (
+            pd.get("title") or pd.get("goal") or "",
+            tuple(
+                (s.get("label", ""), s.get("status", ""))
+                if isinstance(s, dict) else (str(s), "")
+                for s in steps
+            ),
+        )
 
     def _resurface_live_plan(self):
         """Re-show the live checklist beside the latest work.
@@ -5254,20 +5382,33 @@ class ChatWindow(QWidget):
         )
         if not has_new_work:
             return
-        # Fold any in-flight narration in first, so the frozen card sits above it.
-        self._seal_stream_text_to_timeline(meta)
-        # Freeze the old card on the last-shown state (render path stored it).
+        # Freeze the old card on its BASELINE — the plan state as it was when
+        # that card was surfaced — and let the new card carry the current
+        # state. This used to copy get_current_plan() into the frozen card,
+        # which made it byte-identical to the fresh live card below it: the
+        # checklist appeared to post twice (one static, one "· live").
+        import copy
         try:
             from tools.plan import get_current_plan
-            import copy
-            cur = get_current_plan()
-            if cur:
-                tl[tl_idx]["plan_data"] = copy.deepcopy(cur)
+            cur = get_current_plan() or {}
         except Exception:
-            pass
+            cur = {}
+        baseline = tl[tl_idx].get("_baseline") or {}
+        if not baseline:
+            baseline = copy.deepcopy(cur)
+        # Nothing visibly changed since this card was surfaced → a second card
+        # would be an exact twin. Leave the live one where it is.
+        if cur and self._plan_signature(baseline) == self._plan_signature(cur):
+            return
+        # Fold any in-flight narration in first, so the frozen card sits above it.
+        self._seal_stream_text_to_timeline(meta)
+        tl[tl_idx]["plan_data"] = baseline
         tl[tl_idx]["live"] = False
         # Append a fresh live card at the bottom and re-point the live ref to it.
-        tl.append({"type": "plan", "live": True, "plan_data": {}})
+        # Its baseline is the state as of NOW, so the next re-surface can tell
+        # whether anything actually changed underneath it.
+        tl.append({"type": "plan", "live": True, "plan_data": {},
+                   "_baseline": copy.deepcopy(cur)})
         self._live_plan_timeline_ref = (meta_idx, len(tl) - 1)
         self._refresh_live_stream_display(show_ellipsis=self._stream_active)
         QTimer.singleShot(50, self._scroll_to_bottom)
@@ -6629,6 +6770,8 @@ class ChatWindow(QWidget):
 
     def _on_stream_round_start(self):
         """New model round — append prior narration or reset the preview panel."""
+        if not self._accept_inference_signal():
+            return
         self._publish_host_turn_event("round_start")
         self._mirror_text_last = 0.0
         if self._stream_in_chat():
@@ -6639,10 +6782,29 @@ class ChatWindow(QWidget):
         if hasattr(self, "_stream_preview"):
             self._stream_preview.clear()
 
+    def _on_stream_round_discard(self):
+        """A mid-stream attempt FAILED and is being retried — drop its partial
+        tokens WITHOUT committing them. (Contrast _on_stream_round_start, which
+        seals the prior round into the timeline as a kept transition.) Only the
+        in-flight buffer is cleared; already-committed rounds are left intact, so
+        the retry re-streams just the failed round cleanly instead of doubling."""
+        if not self._accept_inference_signal():
+            return
+        self._stream_buffer = []
+        self._stream_dirty = False
+        if self._stream_in_chat():
+            self._refresh_live_stream_display(show_ellipsis=True)
+        elif hasattr(self, "_stream_preview"):
+            self._stream_preview.clear()
+
     def _on_stream_chunk(self, delta: str):
         """Buffer a streamed token. The flush timer paints it (throttled)."""
-        if not delta:
+        if not delta or not self._accept_inference_signal():
             return
+        try:
+            self.window()._note_agent_activity()
+        except Exception:
+            pass
         self._stream_buffer.append(delta)
         self._stream_dirty = True
         # Text is flowing again — the bubble's trailing ellipsis takes over the
@@ -7580,61 +7742,15 @@ class ChatWindow(QWidget):
         # Persist the attachment NOW (before any _clear_pending_image deletes the
         # clipboard temp) so the sent image stays visible in the chat.
         pending_img = self._persist_attachment(self._pending_image) if self._pending_image else None
-        if self._thread is not None:
-            # Mid-job: ask whether to INTERRUPT the agent now or QUEUE the
-            # message to auto-send the moment the current turn finishes.
-            # Either way the queue drain in _finish_inference delivers it —
-            # interrupt just stops the turn first (Stop keeps whatever was
-            # produced, then the message runs against that context).
-            from ui.interrupt_queue_dialog import InterruptQueueDialog
-            dlg = InterruptQueueDialog(text, parent=self)
-            # Flag for _drain_queued_message: exec() spins an event loop, so
-            # the running turn can finish (and try to drain) underneath us.
-            self._midjob_dialog_open = True
-            try:
-                dlg.exec()
-            finally:
-                self._midjob_dialog_open = False
-            choice = dlg.result_action()
-            if choice == "cancel":
-                return  # message stays in the composer untouched
-            if self._thread is not None:
-                # Merge with anything already queued so an earlier mid-job
-                # submit isn't silently clobbered.
-                prev = getattr(self, "_queued_message", None) or {}
-                merged_typed = typed_text
-                if prev.get("typed") and merged_typed:
-                    merged_typed = prev["typed"] + "\n\n" + merged_typed
-                elif prev.get("typed"):
-                    merged_typed = prev["typed"]
-                merged_pastes = list(prev.get("pastes") or []) + list(sent_pastes)
-                if merged_pastes:
-                    blocks = "\n\n".join(p["text"] for p in merged_pastes)
-                    merged_full = ((merged_typed + "\n\n" + blocks) if merged_typed
-                                   else blocks).strip()
-                else:
-                    merged_full = merged_typed.strip()
-                self._queued_message = {
-                    "typed": merged_typed,
-                    "pastes": merged_pastes,
-                    "text": merged_full,
-                    "image": pending_img or prev.get("image"),
-                }
-                self._clear_pending_image()
-                self._clear_pending_pastes(persist=False)
-                self.input.clear()
-                try:
-                    self.input.setPlaceholderText(
-                        "Interrupting — your message sends next…"
-                        if choice == "interrupt" else
-                        "Queued — sends when the current reply finishes…")
-                except Exception:
-                    pass
-                if choice == "interrupt":
-                    self._stop_inference()
+        if self._agent_busy():
+            # Mid-job: STEER. The message goes straight into the running turn
+            # (picked up at the next round boundary) instead of raising a modal
+            # or waiting for the turn to end. No second worker is ever started,
+            # which is what made mid-turn sends corrupt the transcript.
+            if self._steer_running_turn(text, typed_text, sent_pastes, pending_img):
                 return
-            # else: the turn finished while the dialog was open — fall
-            # through and send normally.
+            # Steering unavailable (turn ended underneath us / no agent) —
+            # fall through and send normally.
 
         # Interrupt any ongoing TTS playback — user is speaking now
         self._interrupt_voice()
@@ -7690,13 +7806,19 @@ class ChatWindow(QWidget):
         self.input.clear()
         self._clear_pending_pastes()  # message committed — drop the pending pills
         self._set_inferring(True)
+        self._worker_recovery_attempts = 0
         self._show_thinking()
         self._stream_committed_text = ""
         self._stream_did_split = False  # reset per turn; set when a diff card splits the bubble
+        try:
+            self.window()._note_agent_activity()
+        except Exception:
+            pass
 
         self._thread = InferenceThread(
             self.agent, send_text,
-            image_path=pending_img)
+            image_path=pending_img,
+            conversation_id=self._current_conv_id)
         self._clear_pending_image()
         self.agent._tool_callback = lambda n, a: self.tool_activity.emit(n, a)
         self.agent._tool_batch_callback = lambda ns: self.tool_batch.emit(ns)
@@ -7705,6 +7827,8 @@ class ChatWindow(QWidget):
         self._thread.stopped.connect(self._on_stopped)
         self._thread.chunk.connect(self._on_stream_chunk)
         self._thread.round_started.connect(self._on_stream_round_start)
+        self._thread.round_discarded.connect(self._on_stream_round_discard)
+        self._thread.steer_partial.connect(self._on_steer_partial)
         self._thread.start()
         self._arm_inference_watchdog()
 
@@ -7712,8 +7836,8 @@ class ChatWindow(QWidget):
     # Catches the "agent just stopped" failure: the QThread ended but NO
     # signal (finished/errored/stopped) ever reached the UI — e.g. a C-level
     # crash inside a provider lib, or a signal lost during conv switching.
-    # Without this the UI stays in limbo: no typing indicator, no error, no
-    # interrupt dialog — and the user has to prompt "continue" blind.
+    # Auto-retries with a silent "continue" up to 3 times before surfacing an
+    # error to the user.
 
     def _arm_inference_watchdog(self):
         if getattr(self, "_inference_watchdog", None) is None:
@@ -7723,6 +7847,61 @@ class ChatWindow(QWidget):
             self._inference_watchdog = t
         self._watchdog_dead_ticks = 0
         self._inference_watchdog.start()
+
+    def _cleanup_dead_inference_thread(self):
+        """Join a worker that exited without emitting finished/errored/stopped."""
+        th = self._thread
+        self._thread = None
+        if th is not None and not self._wait_qthread(th, 100):
+            self._retire_thread(th)
+        try:
+            # Rebuild state owned by the crashed turn and repair Codex history.
+            self.agent.recover_after_worker_crash()
+            from core.tool_context import reset_global_abort
+            reset_global_abort()
+        except Exception:
+            pass
+        self._parallel_tool_pending.clear()
+        self._abort_live_stream()
+        self._end_stream()
+
+    def _recover_worker_turn(self):
+        """Silent auto-continue after a worker died without reporting a result."""
+        attempt = self._worker_recovery_attempts
+        print(
+            f"[ChatWidget] Worker died without result — auto-recover "
+            f"({attempt}/{self._worker_recovery_max})",
+            flush=True,
+        )
+        self._stream_committed_text = ""
+        self._stream_did_split = False
+        self._set_inferring(True)
+        self._set_typing_prefix(
+            f"{AGENT_LABEL} is retrying ({attempt}/{self._worker_recovery_max})")
+        self._show_thinking()
+        try:
+            self._thinking_delay.stop()
+            self._reveal_typing()
+        except (RuntimeError, AttributeError):
+            pass
+        try:
+            self.window()._note_agent_activity()
+        except Exception:
+            pass
+
+        self._thread = InferenceThread(
+            self.agent, "continue", conversation_id=self._current_conv_id)
+        self.agent._tool_callback = lambda n, a: self.tool_activity.emit(n, a)
+        self.agent._tool_batch_callback = lambda ns: self.tool_batch.emit(ns)
+        self._thread.finished.connect(self._on_response)
+        self._thread.errored.connect(self._on_error)
+        self._thread.stopped.connect(self._on_stopped)
+        self._thread.chunk.connect(self._on_stream_chunk)
+        self._thread.round_started.connect(self._on_stream_round_start)
+        self._thread.round_discarded.connect(self._on_stream_round_discard)
+        self._thread.steer_partial.connect(self._on_steer_partial)
+        self._thread.start()
+        self._arm_inference_watchdog()
 
     def _check_inference_alive(self):
         thread = getattr(self, "_thread", None)
@@ -7739,11 +7918,19 @@ class ChatWindow(QWidget):
             return
         self._inference_watchdog.stop()
         self._hide_thinking()
+        self._cleanup_dead_inference_thread()
+
+        if self._worker_recovery_attempts < self._worker_recovery_max:
+            self._worker_recovery_attempts += 1
+            self._recover_worker_turn()
+            return
+
         self._add_message(
             AGENT_LABEL,
-            "⚠ The worker thread ended without reporting a result (likely a "
-            "crash inside a provider/tool library). The turn was recovered — "
-            "context is intact; say `continue` to resume.")
+            f"⚠ This turn failed {self._worker_recovery_max} times (likely a "
+            "crash inside a provider/tool library). Your message is still in "
+            "context — try `continue` or switch models.")
+        self._worker_recovery_attempts = 0
         self._finish_inference()
 
     def _on_tool_batch(self, names: list):
@@ -7764,6 +7951,10 @@ class ChatWindow(QWidget):
 
     def _apply_tool_chip_and_sound(self, name: str, args: dict):
         """One chip on the shared tool row + optional terminal sound."""
+        try:
+            self.window()._note_agent_activity()
+        except Exception:
+            pass
         verb = self._verb_for_tool(name, args)
         # Mark a tool as in-flight so the status stays visible even mid-stream;
         # cleared the moment text resumes (_on_stream_chunk) or the turn ends.
@@ -7805,7 +7996,17 @@ class ChatWindow(QWidget):
                     if meta is not None:
                         self._seal_stream_text_to_timeline(meta)
                         tl = meta.setdefault("_stream_timeline", [])
-                        tl.append({"type": "plan", "live": True, "plan_data": {}})
+                        # _baseline = plan state when this card was surfaced;
+                        # _resurface_live_plan diffs against it to decide
+                        # whether a second card would just be a twin.
+                        try:
+                            from tools.plan import get_current_plan
+                            import copy as _copy
+                            _base = _copy.deepcopy(get_current_plan() or {})
+                        except Exception:
+                            _base = {}
+                        tl.append({"type": "plan", "live": True,
+                                   "plan_data": {}, "_baseline": _base})
                         self._live_plan_timeline_ref = (
                             self._stream_live_meta_idx, len(tl) - 1)
                         self._refresh_live_stream_display(show_ellipsis=True)
@@ -7887,9 +8088,12 @@ class ChatWindow(QWidget):
         if name == "screenshot":
             import tempfile
             tmp = os.path.join(tempfile.gettempdir(), "agent_screenshot.jpg")
+            import time as _shot_time
+            capture_started = _shot_time.time()
 
-            def _show_screenshot_card():
-                if os.path.isfile(tmp):
+            def _show_screenshot_card(attempt=0):
+                if (os.path.isfile(tmp)
+                        and os.path.getmtime(tmp) >= capture_started - 0.1):
                     import time as _time
                     # Mirror the screenshot to any peer watching this
                     # conversation, so a remote operator sees this machine's screen.
@@ -7927,6 +8131,9 @@ class ChatWindow(QWidget):
                             "_timestamp": _time.time(),
                         })
                         self._recalc_and_sync()
+                elif attempt < 30:
+                    QTimer.singleShot(
+                        500, lambda: _show_screenshot_card(attempt + 1))
                     QTimer.singleShot(50, self._scroll_to_bottom)
 
             # Delay slightly — the file is saved on the inference thread
@@ -8178,14 +8385,38 @@ class ChatWindow(QWidget):
 
         _tick()
 
+    def _accept_inference_signal(self) -> bool:
+        """Reject queued signals from a worker that no longer owns this view."""
+        sender = self.sender()
+        if not isinstance(sender, InferenceThread):
+            return True
+        return (
+            sender is self._thread
+            and sender.conversation_id == self._current_conv_id
+        )
+
     def _on_response(self, reply: str, tool_log: list, reply_html: str = ""):
+        if not self._accept_inference_signal():
+            return
+        self._worker_recovery_attempts = 0
+        try:
+            self.window()._note_agent_activity()
+        except Exception:
+            pass
         self._hide_thinking()
 
         if not reply and not tool_log:
-            self._abort_live_stream()
-            self._end_stream()
-            self._finish_inference()
-            return
+            try:
+                partial = self._compose_live_stream_text(show_ellipsis=False).strip()
+            except Exception:
+                partial = ""
+            if partial:
+                reply = partial
+            else:
+                self._abort_live_stream()
+                self._end_stream()
+                self._finish_inference()
+                return
         tool_names = [t["tool"] for t in tool_log
                       if t.get("success") is not False] if tool_log else []
         display = reply or "(Agent returned empty response)"
@@ -8301,6 +8532,13 @@ class ChatWindow(QWidget):
         self._finish_inference()
 
     def _on_error(self, error: str):
+        if not self._accept_inference_signal():
+            return
+        self._worker_recovery_attempts = 0
+        try:
+            self.window()._note_agent_activity()
+        except Exception:
+            pass
         self._hide_thinking()
         self._abort_live_stream()
         self._end_stream()
@@ -8334,24 +8572,73 @@ class ChatWindow(QWidget):
         self._finish_inference()
 
     @staticmethod
-    def _wait_qthread(thread: QThread | None, wait_ms: int = 2500) -> None:
-        """Block until a worker QThread exits so Qt can tear down thread-local storage.
+    def _wait_qthread(thread: QThread | None, wait_ms: int = 2500) -> bool:
+        """Block until a worker QThread exits (bounded). Returns True if it did.
 
-        Destroying a QThread (or letting it GC) while ``run()`` is still active
-        prints the ``QThreadStorage: entry N destroyed before end of thread`` spam
-        on stderr at process exit.
+        NEVER terminates: QThread.terminate() on Windows kills the thread at an
+        arbitrary instruction — it can die holding the GIL, the CRT heap lock,
+        or the sqlite write lock. That corrupted the native heap (access-
+        violation crashes hours later) and left every subsequent DB save
+        blocked forever ("stops responding until restart"). A thread that
+        doesn't exit in time must be retired via _retire_thread instead.
         """
         if thread is None:
-            return
+            return True
         try:
             if thread.isRunning():
-                if not thread.wait(max(0, int(wait_ms))):
-                    thread.terminate()
-                    thread.wait(500)
-            else:
-                thread.wait(100)
+                return bool(thread.wait(max(0, int(wait_ms))))
+            thread.wait(100)
+            return True
         except RuntimeError:
-            pass
+            return True
+
+    def _retire_thread(self, thread: QThread | None) -> None:
+        """Abandon a worker without killing it: disconnect every signal so a
+        late emit can't touch this widget, keep a strong ref until run() truly
+        exits, and let the agent's stop flags wind it down."""
+        if thread is None:
+            return
+        for sig_name in ("finished", "errored", "stopped", "chunk",
+                         "round_started", "round_discarded", "tool_called"):
+            try:
+                getattr(thread, sig_name).disconnect()
+            except (TypeError, RuntimeError, AttributeError):
+                pass
+        try:
+            still_running = thread.isRunning()
+        except RuntimeError:
+            return
+        if still_running:
+            self._zombie_threads.append(thread)
+            self._ensure_zombie_sweeper()
+        else:
+            try:
+                thread.wait(100)
+            except RuntimeError:
+                pass
+
+    def _ensure_zombie_sweeper(self) -> None:
+        if self._zombie_sweeper is None:
+            t = QTimer(self)
+            t.setInterval(5000)
+            t.timeout.connect(self._sweep_zombie_threads)
+            self._zombie_sweeper = t
+        if not self._zombie_sweeper.isActive():
+            self._zombie_sweeper.start()
+
+    def _sweep_zombie_threads(self) -> None:
+        alive: list[QThread] = []
+        for th in self._zombie_threads:
+            try:
+                if th.isRunning():
+                    alive.append(th)
+                else:
+                    th.wait(50)
+            except RuntimeError:
+                pass  # C++ side already gone
+        self._zombie_threads = alive
+        if not alive and self._zombie_sweeper is not None:
+            self._zombie_sweeper.stop()
 
     def _shutdown_workers(self, wait_ms: int = 2500) -> None:
         """Join every chat-owned QThread before the GUI is torn down."""
@@ -8401,7 +8688,11 @@ class ChatWindow(QWidget):
                 th.finished.disconnect()
             except Exception:
                 pass
-            self._wait_qthread(th, wait_ms)
+            if not self._wait_qthread(th, wait_ms):
+                # Still running at teardown — keep a ref so Qt doesn't destroy
+                # a live QThread (that aborts the process). Process exit will
+                # reap it; never terminate().
+                self._retire_thread(th)
 
         self._thread = None
         self._conv_load_thread = None
@@ -8409,11 +8700,36 @@ class ChatWindow(QWidget):
         if hasattr(self, "_task_threads"):
             self._task_threads.clear()
 
+        # Persist any pending debug-recorder snapshots (writes are debounced
+        # on a background thread during normal operation).
+        try:
+            debug_recorder.flush()
+        except Exception:
+            pass
+
     def _stop_inference(self):
         """User hit STOP — signal agent to abort. Force-kill if it doesn't exit."""
-        if self._thread is None:
+        # Mirroring a peer: the real turn runs on the HOST, not in a local
+        # thread. Send a network Stop instead of no-opping on `_thread is None`.
+        if self._remote_mirror is not None:
+            self._stop_remote()
             return
-        self.agent._stop_requested = True
+        # NOT gated on `_thread is not None`: the worker ref is nulled while a
+        # turn is still genuinely alive (zombie threads, watchdog recovery,
+        # backgrounded streams). Gating here made Stop a silent no-op in exactly
+        # those windows — the turn kept running tools while the user hammered X.
+        # Signal the agent unconditionally; it's idempotent and harmless if idle.
+        if not self._agent_busy() and self._thread is None:
+            # Still flag it: a turn may be starting on another thread right now.
+            try:
+                self.agent.request_stop()
+            except Exception:
+                pass
+            return
+        try:
+            self.agent.request_stop()
+        except Exception:
+            self.agent._stop_requested = True
         # Also signal tool-level abort so long-running tools exit immediately
         try:
             from core.tool_context import trigger_abort
@@ -8438,16 +8754,36 @@ class ChatWindow(QWidget):
             except RuntimeError:
                 pass
             self._active_pipe_timer = None
-        # Give it 2s to exit gracefully, then force-terminate
+        # Give it 2s to exit gracefully, then abandon the worker (no terminate)
         QTimer.singleShot(2000, self._force_stop)
 
+    def _stop_is_pending(self) -> bool:
+        """True if the user asked to stop and the turn hasn't honoured it yet."""
+        try:
+            return bool(self.agent._stop_requested)
+        except Exception:
+            return False
+
     def _force_stop(self):
-        """Force-kill the thread if it's still stuck (e.g. blocked on API call)."""
-        if self._thread is None:
+        """The worker didn't stop gracefully in time (e.g. blocked in a provider
+        read). Abandon it — signals disconnected, strong ref kept until it
+        exits — and release the UI now. Agent.chat()'s per-agent lock keeps a
+        new turn from racing the abandoned one on shared context."""
+        th = self._thread
+        if th is None:
+            # No live ref, but the UI can still be stuck in the inferring state
+            # with a zombie worker running. Release the UI so Stop always has a
+            # visible effect.
+            if self._agent_busy():
+                self._on_stopped()
             return
-        if self._thread.isRunning():
-            self._thread.terminate()
-            self._thread.wait(1000)
+        if th.isRunning():
+            try:
+                self.agent.request_stop()
+            except Exception:
+                pass
+            self._thread = None
+            self._retire_thread(th)
             self._on_stopped()
 
     def _on_stopped(self):
@@ -8463,6 +8799,13 @@ class ChatWindow(QWidget):
             with a synthetic 'interrupted' result so the NEXT turn's API call is
             still valid.
         """
+        if not self._accept_inference_signal():
+            return
+        self._worker_recovery_attempts = 0
+        try:
+            self.window()._note_agent_activity()
+        except Exception:
+            pass
         self._hide_thinking()
         # Seal (don't drop) the in-progress streamed reply, then clear timers.
         self._seal_interrupted_stream()
@@ -8562,6 +8905,105 @@ class ChatWindow(QWidget):
         else:
             self._polish_send_attach_buttons()
 
+    def _agent_busy(self) -> bool:
+        """True while a turn is genuinely in flight.
+
+        `self._thread is not None` alone is NOT a safe busy test: a worker can
+        be nulled while its run() is still executing (late/queued signals, the
+        watchdog recovery path). Gating the mid-job interrupt dialog on it let
+        a send slip through mid-turn — two workers then streamed into one
+        transcript and the user's message landed out of order. `_inferring` is
+        the authoritative flag; the thread check is the belt.
+        """
+        if getattr(self, "_inferring", False):
+            return True
+        th = getattr(self, "_thread", None)
+        if th is None:
+            return False
+        try:
+            return bool(th.isRunning())
+        except RuntimeError:
+            return False  # C++ side already gone
+
+    def _steer_running_turn(self, text: str, typed_text: str,
+                            sent_pastes: list, pending_img: str) -> bool:
+        """Inject a mid-turn user message into the ALREADY RUNNING turn.
+
+        Returns True if the message was handed to the live agent. The turn is
+        never killed and no second worker is started: the agent folds the
+        message into its context at the next round boundary, so it can change
+        course while keeping the work it has already done.
+        """
+        agent = getattr(self, "agent", None)
+        if agent is None or not hasattr(agent, "steer"):
+            return False
+        if not (text or "").strip() and not pending_img:
+            return False
+
+        # Seal the in-flight assistant bubble so the user's message lands BELOW
+        # everything streamed so far, and subsequent tokens open a fresh bubble
+        # underneath it. Without this the transcript interleaves out of order —
+        # exactly the bug this replaces.
+        if self._stream_in_chat():
+            try:
+                self._close_live_stream_bubble()
+                self._stream_did_split = True
+            except Exception as e:
+                print(f"[steer] bubble seal failed: {type(e).__name__}: {e}")
+
+        self._add_message("You", text, image_path=pending_img,
+                          typed=typed_text, pastes=sent_pastes)
+        if self._message_meta:
+            self._message_meta[-1]["_steered"] = True
+            if pending_img:
+                try:
+                    _ensure_thumb(self._message_meta[-1])
+                except Exception:
+                    pass
+
+        try:
+            agent.steer(text, image_path=pending_img or "")
+        except Exception as e:
+            print(f"[steer] agent.steer failed: {type(e).__name__}: {e}")
+            return False
+
+        self._clear_pending_image()
+        self._clear_pending_pastes(persist=False)
+        self.input.clear()
+        try:
+            self.input.setPlaceholderText("Steering — folded into the current reply…")
+            QTimer.singleShot(2500, lambda: self.input.setPlaceholderText(""))
+        except Exception:
+            pass
+        self._interrupt_voice()
+        self._recalc_and_sync(immediate=True)
+        self._scroll_to_bottom(force=True)
+        return True
+
+    def _on_steer_partial(self, reply: str):
+        """The model finished an answer, then a steer extended the same turn.
+
+        Seal that answer into the transcript as its own bubble so it isn't
+        overwritten when the (now continuing) turn produces its real final
+        reply. Runs on the UI thread via a queued signal.
+        """
+        if not self._accept_inference_signal():
+            return
+        display = (reply or "").strip()
+        if not display:
+            return
+        if self._stream_in_chat():
+            try:
+                self._close_live_stream_bubble()
+                self._stream_did_split = True
+            except Exception as e:
+                print(f"[steer] partial seal failed: {type(e).__name__}: {e}")
+        else:
+            self._add_message(AGENT_LABEL, display)
+        self._stream_buffer = []
+        self._stream_committed_text = ""
+        self._recalc_and_sync(immediate=True)
+
     def _set_inferring(self, active: bool):
         """Visually dim send/attach during inference. Input stays usable but muted."""
         self._inferring = active
@@ -8585,13 +9027,21 @@ class ChatWindow(QWidget):
             self.input._apply_styles()
 
     def _finish_inference(self):
-        if self._thread is not None:
-            self._wait_qthread(self._thread, 100)
+        th = self._thread
         self._thread = None
+        if th is not None and not self._wait_qthread(th, 100):
+            # run() hasn't returned yet (signal arrived before thread teardown,
+            # or the turn was abandoned) — park it, never block the GUI on it.
+            self._retire_thread(th)
+        elif th is not None:
+            # Exited cleanly, but its signals are still connected: a late queued
+            # emit would re-enter the finish path (or stream into the NEXT turn's
+            # bubble). Detach unconditionally, not just on the timeout path.
+            self._retire_thread(th)
         # Clear any leftover interrupt state so a force-terminated turn can't
         # make the NEXT turn (incl. a queued message) stop the instant it starts.
         try:
-            self.agent._stop_requested = False
+            self.agent.reset_stop()
             from core.tool_context import reset_global_abort
             reset_global_abort()
         except Exception:
@@ -8663,7 +9113,8 @@ class ChatWindow(QWidget):
         For conversation-targeted tasks: use the stored conversation_id.
         For stream-targeted tasks: find a conversation subscribed to that stream,
         preferring the currently active conversation.
-        Falls back to creating a new conversation if nothing matches.
+        Legacy conversation-targeted tasks without a stored ID use the active
+        conversation rather than creating a fresh conversation on every run.
         """
         from core.conversations import (
             list_conversations, load_conversation,
@@ -8704,6 +9155,8 @@ class ChatWindow(QWidget):
 
         # Conversation-targeted (default)
         conv_id = task.get("conversation_id", "")
+        if not conv_id and self._current_conv_id:
+            return self._current_conv_id
         if not conv_id:
             conv_id = new_conversation_id()
             save_conversation(conv_id, f"Task: {task.get('name', 'Task')}", [])
@@ -8973,12 +9426,38 @@ class ChatWindow(QWidget):
         if not hasattr(self, '_task_threads'):
             self._task_threads = []
         self._task_threads.append(t)
+        # Register this peer-driven turn so a remote Stop can find and abort it.
+        if not hasattr(self, "_remote_host_turns"):
+            self._remote_host_turns = {}
+        self._remote_host_turns[conv_id] = {"agent": agent, "thread": t}
+        t.finished.connect(
+            lambda cid=conv_id: getattr(self, "_remote_host_turns", {}).pop(cid, None))
         t.user_saved.connect(self._on_remote_host_turn_done)   # live: show incoming msg
         t.refreshed.connect(self._on_remote_host_turn_done)    # show the reply
         t.finished.connect(lambda th=t: QTimer.singleShot(
             100, lambda: self._task_thread_done(th)))
         t.start()
 
+    def _on_remote_stop(self, conv_id: str):
+        """A viewer mirroring us hit Stop. Abort whatever turn we're running for
+        that conversation — either a dedicated remote-host turn thread, or, if
+        the host had the conv open and ran it through the local path, the local
+        turn. Mirrors _stop_inference's signal: agent stop flag + tool abort."""
+        if not conv_id:
+            return
+        turn = getattr(self, "_remote_host_turns", {}).get(conv_id)
+        if turn is not None:
+            ag = turn.get("agent")
+            if ag is not None:
+                ag._stop_requested = True
+                try:
+                    ag._abort_event.set()
+                except Exception:
+                    pass
+            return
+        # Fell through the local turn path (host had the conv focused and idle).
+        if conv_id == self._current_conv_id and self._thread is not None:
+            self._stop_inference()
     def _on_remote_host_turn_done(self, conv_id: str):
         """A peer-driven turn finished on this host. Refresh the local view if
         that conversation happens to be open, and play the message cue."""
@@ -9029,28 +9508,74 @@ class ChatWindow(QWidget):
             return
         _, _, peers = outbound_identity()
         if not peers:
+            self._peer_health_by_name.clear()
+            self._publish_peer_health()
             return
+        changed = False
         for p in peers:
+            name = p.get("name") or p.get("url", "")
+            if name and name not in self._peer_health_by_name:
+                self._peer_health_by_name[name] = {
+                    "name": name, "url": p.get("url", ""), "online": False,
+                    "detail": "probing",
+                }
+                changed = True
             threading.Thread(target=self._fetch_peer_convs, args=(dict(p),),
                              daemon=True).start()
+        if changed:
+            self._publish_peer_health()
 
     def _fetch_peer_convs(self, peer: dict):
         from core.network import peer_conv_list
-        ok, convs, _detail = peer_conv_list(peer.get("url", ""))
-        if not ok:
-            return
+        ok, convs, detail = peer_conv_list(peer.get("url", ""))
         name = peer.get("name") or peer.get("url", "")
         # Marshal back to the GUI thread through the conv-event sink.
         self.conv_event_received.emit(
             {"kind": "_peer_conv_list", "peer": name, "url": peer.get("url", ""),
-             "convs": convs})
+             "convs": convs if ok else [], "ok": bool(ok), "detail": detail})
 
-    def _apply_peer_conv_list(self, peer: str, url: str, convs: list):
-        self._remote_convs_by_peer[peer] = [
-            {"id": f"remote::{peer}::{c.get('id')}", "name": c.get("name", ""),
-             "peer": peer, "peer_url": url, "remote_id": c.get("id")}
-            for c in convs if c.get("id")]
+    def _publish_peer_health(self):
         try:
+            from core.network import outbound_identity
+            local_name, _secret, peers = outbound_identity()
+            roster = []
+            for p in peers or []:
+                name = p.get("name") or p.get("url", "")
+                if not name:
+                    continue
+                rec = dict(self._peer_health_by_name.get(name) or {})
+                rec.setdefault("name", name)
+                rec.setdefault("url", p.get("url", ""))
+                rec.setdefault("online", False)
+                rec.setdefault("detail", "probing")
+                roster.append(rec)
+            if roster:
+                roster.append({
+                    "name": local_name or "local",
+                    "url": "",
+                    "online": True,
+                    "detail": "this machine",
+                    "local": True,
+                })
+            self._conv_bar.set_network_peers(roster)
+        except Exception:
+            pass
+
+    def _apply_peer_conv_list(self, peer: str, url: str, convs: list,
+                              ok: bool = True, detail: str = ""):
+        self._peer_health_by_name[peer] = {
+            "name": peer, "url": url, "online": bool(ok),
+            "detail": detail or ("online" if ok else "unreachable"),
+        }
+        if ok:
+            self._remote_convs_by_peer[peer] = [
+                {"id": f"remote::{peer}::{c.get('id')}", "name": c.get("name", ""),
+                 "peer": peer, "peer_url": url, "remote_id": c.get("id")}
+                for c in convs if c.get("id")]
+        else:
+            self._remote_convs_by_peer.pop(peer, None)
+        try:
+            self._publish_peer_health()
             self._conv_bar.set_remote_conversations(self._remote_convs_by_peer)
         except Exception:
             pass
@@ -9069,6 +9594,15 @@ class ChatWindow(QWidget):
             return
         self._exit_remote_mirror()      # leave any prior mirror cleanly
         self._auto_save()               # persist the local conversation we're leaving
+        # Persist the draft of the conversation we're leaving and CLEAR the
+        # composer. Without this, unsent local text stays visible in the box and
+        # would be delivered to the remote host on the next send — the exact bug
+        # where a half-written local message got fired at a remote agent.
+        self._composer_draft_timer.stop()
+        self._persist_current_composer_draft()
+        self.input.blockSignals(True)
+        self.input.clear()
+        self.input.blockSignals(False)
         try:
             self._save_viewer_state()   # remember the local conv's splitter/tools layout
         except Exception:
@@ -9172,6 +9706,25 @@ class ChatWindow(QWidget):
                     {"kind": "_send_result", "combo_id": combo, "detail": detail})
         threading.Thread(target=_send, daemon=True).start()
 
+    def _stop_remote(self):
+        """Stop button while mirroring: ask the host to abort the turn it's
+        running for us. Best-effort and off-thread so the UI never blocks; the
+        host's 'final' (or its absence) ends the spinner as usual."""
+        m = self._remote_mirror
+        if not m:
+            return
+        peer_url, remote_id = m["peer_url"], m["remote_id"]
+        self._set_typing_prefix(f"{AGENT_LABEL} (remote) · stopping…")
+
+        def _stop():
+            from core.network import peer_conv_stop
+            ok, detail = peer_conv_stop(peer_url, remote_id)
+            if not ok:
+                self.conv_event_received.emit(
+                    {"kind": "_send_result", "combo_id": m["combo_id"],
+                     "detail": f"stop not delivered: {detail}"})
+        threading.Thread(target=_stop, daemon=True).start()
+
     def _remote_notice(self, text: str):
         """Render a plain agent-bubble notice in the mirror (the 'Error' sender
         doesn't map to a real role, so it would silently render nothing)."""
@@ -9213,7 +9766,9 @@ class ChatWindow(QWidget):
         # Internal (locally-emitted) control messages.
         if kind == "_peer_conv_list":
             self._apply_peer_conv_list(data.get("peer", ""), data.get("url", ""),
-                                       data.get("convs", []))
+                                       data.get("convs", []),
+                                       bool(data.get("ok", True)),
+                                       data.get("detail", ""))
             return
         if kind == "_remote_snapshot":
             self._apply_remote_snapshot(data)
@@ -9788,7 +10343,7 @@ class ChatWindow(QWidget):
             except Exception as e:
                 print(f"[clear_chat] clear summaries failed: {e}")
 
-        self._auto_save()
+        self._auto_save(allow_truncate=True)
 
     def _undo_last_turn(self):
         """Smart undo:
@@ -9885,7 +10440,7 @@ class ChatWindow(QWidget):
         # Refresh display
         self._clear_message_widgets()
         self._recalc_and_sync(immediate=True)
-        self._auto_save()
+        self._auto_save(allow_truncate=True)
         self._set_inferring(False)
         QTimer.singleShot(0, self.input.setFocus)
 

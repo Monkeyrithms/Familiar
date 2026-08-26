@@ -13,9 +13,10 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QInputDialog, QMenu, QWidgetAction, QCheckBox,
     QStyledItemDelegate,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF, QPointF
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF, QPointF, QSize
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QFontMetrics, QLinearGradient, QBrush, QPen,
+    QIcon,
 )
 from ui.theme import PALETTE
 from core.agent import load_config
@@ -121,10 +122,17 @@ class _HoverDelegate(QStyledItemDelegate):
         painter.setPen(QPen(QColor(p["border"])))
         painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
 
+        icon = index.data(Qt.ItemDataRole.DecorationRole)
+        icon_w = 0
+        if isinstance(icon, QIcon) and not icon.isNull():
+            icon_w = 18
+            pm = icon.pixmap(QSize(14, 14))
+            painter.drawPixmap(rect.left() + 8, rect.center().y() - 7, pm)
+
         text = index.data() or ""
         painter.setPen(QPen(text_color))
         painter.setFont(QFont("Consolas", 9))
-        tr = rect.adjusted(10, 0, -10, 0)
+        tr = rect.adjusted(10 + icon_w, 0, -10, 0)
         painter.drawText(tr, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                          str(text))
         painter.restore()
@@ -264,6 +272,89 @@ class _CappedCombo(QComboBox):
 
     _PREFERRED_W = 300  # roomy resting width that shows the conversation name
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._indicator_hot = False
+        self._indicator_icon_cache = {}
+        self._network_peers: list[dict] = []
+
+    def set_indicator_hot(self, hot: bool) -> None:
+        self._indicator_hot = bool(hot)
+        self.update()
+
+    def set_network_peers(self, peers: list[dict]) -> None:
+        self._network_peers = [p for p in peers or [] if isinstance(p, dict)]
+        self.update()
+
+    def _network_tooltip(self) -> str:
+        p = PALETTE
+        if not self._network_peers:
+            return ""
+        lines = [
+            f"<div style='background:{p['panel']}; color:{p['text']};"
+            " font-family:Consolas; font-size:9pt;'>",
+            f"<b style='color:{p['glow_hot']}'>Familiar-Net</b><br>",
+        ]
+        for peer in self._network_peers:
+            name = str(peer.get("name") or peer.get("url") or "peer")
+            online = bool(peer.get("online"))
+            detail = str(peer.get("detail") or ("online" if online else "unreachable"))
+            color = p["glow_hot"] if online else p.get("accent_muted", p["muted_text"])
+            state = "online" if online else "offline"
+            lines.append(
+                f"<span style='color:{color}'>◆</span> "
+                f"<span style='color:{p['text']}'>{name}</span> "
+                f"<span style='color:{p['muted_text']}'>— {state}: {detail}</span><br>"
+            )
+        lines.append("</div>")
+        return "".join(lines)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = PALETTE
+        self.setToolTip(self._network_tooltip())
+        peers = self._network_peers or [{"name": "local", "online": True}]
+        dim = 14
+        gap = 2
+        total_w = len(peers) * dim + max(0, len(peers) - 1) * gap
+        r = self.rect()
+        x = r.right() - total_w - 4
+        y = r.center().y() - dim // 2
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        from ui.app_icon import build_app_icon
+        hot = self._indicator_hot or self.underMouse()
+        for peer in peers:
+            online = bool(peer.get("online", True))
+            if online:
+                accent = p.get("glow_hot" if hot else "accent", p["accent"])
+                core = p.get("glow_hot", p.get("accent_bright", accent))
+            else:
+                # Lightbulb-off: same hue family, just dimmer than before.
+                off = QColor(p.get("accent_muted", p["accent"]))
+                accent = QColor(max(0, int(off.red() * 0.68)),
+                                max(0, int(off.green() * 0.68)),
+                                max(0, int(off.blue() * 0.68))).name()
+                core = QColor(max(0, int(off.red() * 0.88)),
+                              max(0, int(off.green() * 0.88)),
+                              max(0, int(off.blue() * 0.88))).name()
+            key = (accent, core)
+            icon = self._indicator_icon_cache.get(key)
+            if icon is None:
+                icon = build_app_icon(accent, core)
+                self._indicator_icon_cache[key] = icon
+            painter.drawPixmap(x, y, icon.pixmap(QSize(dim, dim)))
+            x += dim + gap
+        painter.end()
+
     def sizeHint(self):
         # Prefer the roomy width (so the box rests at ~300px when there's space)
         # rather than the tiny content-based hint. With a Preferred size policy
@@ -316,6 +407,7 @@ class ConversationBar(QWidget):
         self._active_id: str = ""
         self._convs: list[dict] = []          # [{id, name}] in display order
         self._remote_groups: dict[str, list[dict]] = {}  # peer -> [{id, name}]
+        self._network_peers: list[dict] = []
         self._blink_ids: set[str] = set()
         self._loading = False
         # The conversation whose name the user is actively editing in the combo.
@@ -430,11 +522,48 @@ class ConversationBar(QWidget):
         self._remote_groups = dict(groups or {})
         self._rebuild_items()
 
+    def set_network_peers(self, peers: list[dict]) -> None:
+        """Update Familiar-Net health shown by the dropdown icon row."""
+        self._network_peers = [p for p in peers or [] if isinstance(p, dict)]
+        self._combo.set_network_peers(self._network_peers)
+        self._combo.setStyleSheet(self._combo_qss())
+        self._rebuild_items()
+
+    def _peer_icon(self, online: bool = True) -> QIcon:
+        from ui.app_icon import build_app_icon
+        p = PALETTE
+        if online:
+            return build_app_icon(p["accent"], p.get("glow_hot") or p["accent_bright"])
+        off = QColor(p.get("accent_muted", p["accent"]))
+        accent = QColor(max(0, int(off.red() * 0.68)),
+                        max(0, int(off.green() * 0.68)),
+                        max(0, int(off.blue() * 0.68))).name()
+        core = QColor(max(0, int(off.red() * 0.88)),
+                      max(0, int(off.green() * 0.88)),
+                      max(0, int(off.blue() * 0.88))).name()
+        return build_app_icon(accent, core)
+
+    def _local_peer(self) -> dict:
+        return next((p for p in self._network_peers if p.get("local")), {})
+
+    def _peer_health(self, peer: str) -> dict:
+        target = str(peer or "")
+        return next((h for h in self._network_peers
+                     if str(h.get("name") or "") == target), {})
+
     def _rebuild_items(self):
         self._loading = True
         self._combo.clear()
         active_idx = 0
         idx = 0
+        local_peer = self._local_peer()
+        networked = bool(self._network_peers)
+        if networked and local_peer:
+            label = f"{local_peer.get('name') or 'Local'} (this machine)"
+            hdr = self._combo.count()
+            self._combo.addItem(self._peer_icon(True), label, None)
+            self._combo.model().item(hdr).setEnabled(False)
+            idx += 1
         for c in self._convs:
             label = ("● " if c["id"] in self._blink_ids else "") + c["name"]
             self._combo.addItem(label, c["id"])
@@ -449,7 +578,9 @@ class ConversationBar(QWidget):
             self._combo.insertSeparator(self._combo.count())
             idx += 1
             hdr = self._combo.count()
-            self._combo.addItem(f"🌐 {peer}", None)
+            health = self._peer_health(peer)
+            self._combo.addItem(self._peer_icon(bool(health.get("online", True))),
+                                str(peer), None)
             self._combo.model().item(hdr).setEnabled(False)   # header, not selectable
             idx += 1
             for c in convs:
@@ -624,6 +755,7 @@ class ConversationBar(QWidget):
         p = PALETTE
         color = p["glow_hot"] if hot else p["accent"]
         self._combo.setStyleSheet(self._combo_qss(border_color=color))
+        self._combo.set_indicator_hot(hot)
 
     # ── Styling ───────────────────────────────────────────────────────
     def _brick_bg(self) -> str:
@@ -641,13 +773,16 @@ class ConversationBar(QWidget):
         # 1px so the flash only changes color and never reflows/shifts the UI.
         p = PALETTE
         border_color = border_color or p["border"]
+        peer_count = max(1, len(self._network_peers))
+        indicator_w = min(92, 8 + peer_count * 16)
+        pad_right = indicator_w + 6
         return f"""
             QComboBox#ConvCombo {{
                 background: {self._brick_bg()};
                 color: {p['accent_bright']};
                 border: {border_w}px solid {border_color};
                 border-radius: 0px;
-                padding: 2px 8px;
+                padding: 2px {pad_right}px 2px 8px;
             }}
             QComboBox#ConvCombo:hover {{ border-color: {p['accent_bright']}; }}
             QComboBox#ConvCombo QLineEdit {{
@@ -658,12 +793,11 @@ class ConversationBar(QWidget):
                 selection-background-color: {p['accent_muted']};
                 selection-color: {p['glow_hot']};
             }}
-            QComboBox#ConvCombo::drop-down {{ border: none; width: 18px; }}
+            QComboBox#ConvCombo::drop-down {{ border: none; width: {indicator_w}px; }}
             QComboBox#ConvCombo::down-arrow {{
-                width: 0; height: 0; margin-right: 6px;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid {p['accent']};
+                width: 0; height: 0;
+                image: none;
+                border: none;
             }}
         """
 

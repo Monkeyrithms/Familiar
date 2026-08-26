@@ -1,12 +1,165 @@
 import sys
 import signal
+import time
+import faulthandler
+
+# ── Crash supervisor ────────────────────────────────────────────────────
+# Runs BEFORE any Qt import. The first process to start becomes a tiny
+# supervisor: it spawns the real app as a marked child and relaunches it
+# whenever it dies with a non-zero exit code. This is the only way to survive
+# native Qt/C++ aborts (qFatal, segfaults) — those kill the process below
+# Python, so no in-process hook can recover. Clean exit (code 0) ends the
+# supervisor too. A crash-loop cap (default 3 crashes in 5 minutes) prevents
+# runaway restart storms; `--no-supervise` or FAMILIAR_SUPERVISED=1 opts out.
+
+
+def _supervisor_log(msg: str):
+    try:
+        import os
+        from datetime import datetime
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "supervisor.log"), "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} {msg}\n")
+    except Exception:
+        pass
+
+
+def _rotate_log(path, max_bytes=5 * 1024 * 1024):
+    """Rename an append-only log to .1 once it exceeds max_bytes."""
+    try:
+        import os
+        if os.path.exists(path) and os.path.getsize(path) > max_bytes:
+            backup = str(path) + ".1"
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.replace(path, backup)
+    except Exception:
+        pass
+
+
+def _acquire_single_instance_lock():
+    """Hold an exclusive lock on data/familiar.lock for the process lifetime.
+
+    Returns the open file handle on success (keep a reference!), or None if
+    another instance already holds it. README/help have always advertised a
+    single-instance guard; this is it — two instances sharing conversations.db
+    and the tunnel port corrupt state.
+    """
+    import os
+    try:
+        import msvcrt
+        lock_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        os.makedirs(lock_dir, exist_ok=True)
+        fh = open(os.path.join(lock_dir, "familiar.lock"), "a+")
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            fh.close()
+            return None
+        return fh
+    except Exception:
+        # Lock machinery itself failing must never block startup.
+        return object()
+
+
+def _supervise():
+    """Supervisor loop. Returns only in the supervised child."""
+    import os
+    if os.environ.get("FAMILIAR_SUPERVISED") == "1" or "--no-supervise" in sys.argv:
+        return None
+
+    # Retry briefly: the auto-update path launches the replacement instance
+    # BEFORE the old one exits, so the lock may be held for a moment during
+    # the handoff.
+    lock = None
+    _deadline = time.monotonic() + 10
+    while True:
+        lock = _acquire_single_instance_lock()
+        if lock is not None:
+            break
+        if time.monotonic() >= _deadline:
+            sys.stderr.write("[Familiar] Another instance is already running — exiting.\n")
+            _supervisor_log("second instance blocked by single-instance lock")
+            os._exit(0)
+        time.sleep(0.5)
+
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    _rotate_log(os.path.join(here, "logs", "supervisor.log"))
+    env = dict(os.environ, FAMILIAR_SUPERVISED="1")
+    crash_times: list[float] = []
+    MAX_CRASHES, WINDOW_SEC = 3, 300
+
+    while True:
+        started = time.monotonic()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
+                env=env, cwd=here)
+            code = proc.wait()
+        except KeyboardInterrupt:
+            try:
+                code = proc.wait(timeout=15)
+            except Exception:
+                proc.kill()
+                code = 0
+        if code == 0:
+            os._exit(0)
+
+        ran_for = time.monotonic() - started
+        _supervisor_log(f"app exited with code {code} after {ran_for:.0f}s — relaunching")
+        now = time.monotonic()
+        crash_times = [t for t in crash_times if now - t < WINDOW_SEC] + [now]
+        if len(crash_times) > MAX_CRASHES:
+            _supervisor_log(
+                f"{len(crash_times)} crashes within {WINDOW_SEC}s — giving up. "
+                f"Check logs/errors.log and logs/native_crash.log.")
+            os._exit(code)
+        time.sleep(2 * len(crash_times))  # 2s, 4s, 6s backoff
+
+
+_supervise()
+
+# Rotate crash logs before faulthandler pins native_crash.log open.
+try:
+    from pathlib import Path as _PathRot
+    _logs = _PathRot(__file__).resolve().parent / "logs"
+    _rotate_log(_logs / "native_crash.log")
+    _rotate_log(_logs / "errors.log")
+except Exception:
+    pass
+
+# Native-crash forensics. A Qt/C++ abort() or a segfault (e.g. a worker thread
+# touching a widget directly, or a C++ object deleted mid-signal) kills the
+# process BELOW Python — sys.excepthook and threading.excepthook never run, so
+# errors.log stays empty and the window just vanishes. faulthandler dumps the
+# C-level stack of EVERY thread to native_crash.log the instant that happens,
+# turning a silent disappearance into a named, timestamped traceback. The log
+# file is held open for the life of the process (faulthandler writes to the
+# raw fd at fault time, when the interpreter may be too broken to open files).
+try:
+    from pathlib import Path as _Path
+    _native_log_path = _Path(__file__).resolve().parent / "logs" / "native_crash.log"
+    _native_log_path.parent.mkdir(parents=True, exist_ok=True)
+    _native_log = _native_log_path.open("a", encoding="utf-8")
+    _native_log.write(
+        f"\n=== session start {__import__('datetime').datetime.now().isoformat()} ===\n")
+    _native_log.flush()
+    faulthandler.enable(file=_native_log, all_threads=True)
+except Exception:
+    # Never let instrumentation setup break startup — fall back to stderr.
+    try:
+        faulthandler.enable(all_threads=True)
+    except Exception:
+        pass
 
 # Qt imports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
 )
 from PyQt6.QtCore import (
-    Qt, QSize, QRect, QPoint, QEvent, QObject, QTimer, QAbstractItemModel,
+    Qt, QSize, QRect, QPoint, QEvent, QObject, QTimer, QAbstractItemModel, pyqtSignal,
 )
 from PyQt6.QtGui import QIcon, QFont, QMouseEvent, QPainter, QPen, QColor
 
@@ -30,6 +183,18 @@ APP_NAME = "Familiar"
 # Pixels from each edge that count as a resize grip (frameless window).
 GRIP = 6
 
+_AUTO_UPDATE_IDLE_SEC = 10 * 60
+_AUTO_UPDATE_WAIT_SEC = 5 * 60
+_AUTO_UPDATE_POLL_MS = 30 * 1000
+_USER_ACTIVITY_EVENTS = frozenset({
+    QEvent.Type.MouseButtonPress,
+    QEvent.Type.MouseButtonRelease,
+    QEvent.Type.KeyPress,
+    QEvent.Type.Wheel,
+    QEvent.Type.TouchBegin,
+    QEvent.Type.TouchUpdate,
+})
+
 # Patches for known issues
 def _patch_qt():
     """Patch some minor Qt quirks before we start."""
@@ -45,6 +210,8 @@ def _patch_qt():
 class MainWindow(QMainWindow):
     """Main app window: title bar over the chat coordinator (which owns the
     chat columns and the shared right-side workspace)."""
+
+    _source_update_notify = pyqtSignal()
 
     def __init__(self, agent: Agent):
         super().__init__()
@@ -115,18 +282,21 @@ class MainWindow(QMainWindow):
         
         # Restore window geometry / state
         self._restore_geometry()
+        self._source_update_notify.connect(self._on_source_update_notify)
+        self._init_update_banner()
 
         # App-wide event filter: catches mouse events anywhere in the window so
         # the frameless edges work as resize grips (and don't get swallowed by
         # child widgets). Mirrors the root Familiar window.
         QApplication.instance().installEventFilter(self)
 
-        # Preload all sounds in the background so the first play is instant.
-        import threading
-        threading.Thread(target=self._preload_sounds, daemon=True).start()
+        # SDL audio initialization belongs on the UI thread. Starting its mixer
+        # from a short-lived worker can leave Windows with a stale device handle.
+        QTimer.singleShot(0, self._preload_sounds)
         # Warm the Settings dialog's import chain (tools.registry → mcp/httpx
         # → numpy, ~1s cold) so the first click on Settings opens instantly.
         # Module import only — no QWidget is constructed off-thread.
+        import threading
         threading.Thread(target=self._preload_settings_module,
                          daemon=True).start()
 
@@ -185,6 +355,9 @@ class MainWindow(QMainWindow):
         return False
 
     def eventFilter(self, obj, event):
+        if event.type() in _USER_ACTIVITY_EVENTS:
+            self._note_user_activity()
+
         if self._resize_edge:
             if event.type() == QEvent.Type.MouseMove:
                 self._do_resize(event.globalPosition().toPoint())
@@ -368,7 +541,203 @@ class MainWindow(QMainWindow):
             save_config(cfg)
         except Exception as e:
             print(f"[MainWindow] Failed to save geometry: {e}", flush=True)
-    
+
+    # -- Source-update banner (Familiar-Net source sync) --------------------
+    def _init_update_banner(self) -> None:
+        from ui.update_banner import UpdateBanner
+        self._update_banner = UpdateBanner(
+            self, on_restart=self._apply_update_and_restart)
+        self._update_settle = QTimer(self)
+        self._update_settle.setSingleShot(True)
+        self._update_settle.timeout.connect(self._show_update_banner_if_pending)
+        self._last_user_activity = time.monotonic()
+        self._last_agent_activity = 0.0
+        self._remote_update_notice_ts: float | None = None
+        self._auto_update_timer = QTimer(self)
+        self._auto_update_timer.setInterval(_AUTO_UPDATE_POLL_MS)
+        self._auto_update_timer.timeout.connect(self._check_auto_remote_update)
+        self._auto_update_timer.start()
+        QTimer.singleShot(5000, self._show_update_banner_if_pending)
+
+    def _on_source_update_notify(self) -> None:
+        if getattr(self, "_update_settle", None) is not None:
+            self._update_settle.start(4000)
+
+    def _note_user_activity(self) -> None:
+        aw = QApplication.activeWindow()
+        if aw is not None and aw is not self and not self.isAncestorOf(aw):
+            return
+        self._last_user_activity = time.monotonic()
+
+    def _note_agent_activity(self) -> None:
+        self._last_agent_activity = time.monotonic()
+
+    def _activity_clock(self) -> float:
+        return max(self._last_user_activity, self._last_agent_activity)
+
+    def _agent_work_active(self) -> bool:
+        chat = getattr(self, "chat", None)
+        # Authoritative first: the chat window's own busy test. `_thread` alone
+        # is not safe — it gets nulled while run() is still executing (late
+        # signals, watchdog recovery, conversation backgrounding), which would
+        # let the auto-updater restart the app MID-TURN and lose the work.
+        try:
+            probe = getattr(chat, "_agent_busy", None)
+            if callable(probe) and probe():
+                return True
+        except Exception:
+            pass
+        try:
+            th = getattr(chat, "_thread", None)
+            if th is not None and th.isRunning():
+                return True
+        except Exception:
+            pass
+        try:
+            for th in list(getattr(chat, "_zombie_threads", []) or []):
+                if th is not None and th.isRunning():
+                    return True
+        except Exception:
+            pass
+        try:
+            for rec in (getattr(chat, "_conv_threads", {}) or {}).values():
+                th = rec.get("thread") if isinstance(rec, dict) else None
+                if th is not None and th.isRunning():
+                    return True
+        except Exception:
+            pass
+        try:
+            for th in list(getattr(chat, "_task_threads", []) or []):
+                if th is not None and th.isRunning():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _record_remote_update_notice(self) -> None:
+        self._remote_update_notice_ts = time.monotonic()
+
+    def _auto_update_countdown_seconds(self, staged_count: int) -> int | None:
+        if staged_count <= 0 or self._remote_update_notice_ts is None:
+            return None
+        now = time.monotonic()
+        if self._agent_work_active():
+            return None
+        if now - self._activity_clock() < _AUTO_UPDATE_IDLE_SEC:
+            return None
+        remaining = int(_AUTO_UPDATE_WAIT_SEC - (now - self._remote_update_notice_ts))
+        return max(0, remaining)
+
+    def _refresh_update_banner_countdown(self) -> None:
+        try:
+            from core.source_sync import source_sync
+            staged, local = source_sync.pending_detail()
+            pending = source_sync.pending()
+        except Exception:
+            return
+        if not pending:
+            return
+        banner = getattr(self, "_update_banner", None)
+        if banner is not None and banner.isVisible():
+            banner.show_for(
+                len(pending), staged=len(staged), local=len(local),
+                auto_seconds=self._auto_update_countdown_seconds(len(staged)))
+
+    def _check_auto_remote_update(self) -> None:
+        try:
+            from core.source_sync import source_sync
+            staged, _local = source_sync.pending_detail()
+        except Exception:
+            return
+        if not staged:
+            self._remote_update_notice_ts = None
+            return
+        notice = self._remote_update_notice_ts
+        if notice is None:
+            return
+        now = time.monotonic()
+        if self._agent_work_active():
+            self._note_agent_activity()
+            self._refresh_update_banner_countdown()
+            return
+        if now - self._activity_clock() < _AUTO_UPDATE_IDLE_SEC:
+            self._refresh_update_banner_countdown()
+            return
+        remaining = _AUTO_UPDATE_WAIT_SEC - (now - notice)
+        if remaining > 0:
+            self._refresh_update_banner_countdown()
+            return
+        print("[update] auto-applying remote update (idle recipient)", flush=True)
+        banner = getattr(self, "_update_banner", None)
+        if banner is not None:
+            banner.hide()
+        self._apply_update_and_restart()
+
+    def _show_update_banner_if_pending(self) -> None:
+        try:
+            from core.source_sync import source_sync
+            staged, local = source_sync.pending_detail()
+            pending = source_sync.pending()
+        except Exception:
+            staged, local, pending = [], [], []
+        if staged:
+            self._record_remote_update_notice()
+        elif not pending:
+            self._remote_update_notice_ts = None
+        if pending and getattr(self, "_update_banner", None) is not None:
+            self._update_banner.show_for(
+                len(pending), staged=len(staged), local=len(local),
+                auto_seconds=self._auto_update_countdown_seconds(len(staged)))
+
+    def _apply_update_and_restart(self) -> None:
+        if self._agent_work_active():
+            print("[update] restart deferred — agent is running", flush=True)
+            return
+        import os
+        import subprocess
+        try:
+            from core.source_sync import source_sync
+            had_pending = bool(source_sync.pending())
+            applied = source_sync.apply_staged()
+        except Exception as e:
+            print(f"[update] apply failed: {e}")
+            return
+        if not had_pending:
+            banner = getattr(self, "_update_banner", None)
+            if banner is not None:
+                banner.hide()
+            return
+        if applied:
+            print(f"[update] applied {len(applied)} staged file(s)", flush=True)
+        try:
+            self._save_geometry()
+            self.chat._auto_save(immediate=True)
+        except Exception as e:
+            print(f"[update] state save before restart failed: {e}")
+        try:
+            from core.network import network_manager
+            network_manager.release_for_restart()
+        except Exception as e:
+            print(f"[update] tunnel handoff warning: {e}")
+        try:
+            main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+            args = [sys.executable, main_py] + sys.argv[1:]
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = getattr(subprocess, "DETACHED_PROCESS", 0)
+            subprocess.Popen(args, cwd=os.path.dirname(main_py),
+                             creationflags=creationflags, close_fds=True)
+        except Exception as e:
+            print(f"[update] relaunch failed: {e}")
+            return
+        os._exit(0)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        banner = getattr(self, "_update_banner", None)
+        if banner is not None and banner.isVisible():
+            banner._reposition()
+
     def closeEvent(self, event):
         """Save state and tear down every background process/thread so the
         process actually exits instead of lingering in the terminal."""
@@ -701,6 +1070,35 @@ def main():
     threading.excepthook = lambda args: _crash_guard(
         args.exc_type, args.exc_value, args.exc_traceback)
 
+    # Qt's own message stream (warnings + critical + FATAL). A qFatal prints a
+    # one-line reason and then aborts the process in C++ — by default that
+    # reason goes nowhere, so the window vanishes with no clue why. Capturing it
+    # gives the breadcrumb that names the culprit (e.g. "QObject: Cannot create
+    # children for a parent in a different thread", the classic worker-thread-
+    # touches-a-widget abort). We log Critical/Fatal to errors.log; Warning and
+    # below stay on stderr to avoid spamming the file with benign Qt chatter.
+    from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
+
+    def _qt_message_handler(mode, context, message):
+        try:
+            from datetime import datetime
+            from pathlib import Path
+            sys.stderr.write(f"[Qt] {message}\n")
+            sys.stderr.flush()
+            if mode in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+                tag = "FATAL" if mode == QtMsgType.QtFatalMsg else "CRITICAL"
+                loc = ""
+                if context is not None and context.file:
+                    loc = f" ({context.file}:{context.line})"
+                log_path = Path(__file__).resolve().parent / "logs" / "errors.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(f"\n=== {datetime.now().isoformat()} — Qt {tag} ===\n"
+                            f"{message}{loc}\n")
+        except Exception:
+            pass
+    qInstallMessageHandler(_qt_message_handler)
+
     # Windows taskbar identity. Set BEFORE any window: without an explicit
     # AppUserModelID, Windows groups us under "pythonw.exe" (generic Python icon,
     # and pinning pins pythonw, not Familiar). Giving the process its own ID makes
@@ -789,6 +1187,33 @@ def main():
     except Exception as e:
         print(f"[Familiar] Failed to create MainWindow: {e}", flush=True)
         sys.exit(1)
+
+    _source_sync = None
+    try:
+        from core.source_sync import source_sync as _source_sync
+        _source_sync.attach_window(window)
+        _source_sync.set_notify(lambda: window._source_update_notify.emit())
+        _source_sync.start()
+    except Exception as e:
+        print(f"[Familiar] source-update watch not started: {e}", flush=True)
+
+    try:
+        from core.network import network_manager
+        _prior_sync = network_manager.on_sync
+        def _sync_chained(data, _p=_prior_sync, _ss=_source_sync):
+            if _ss is not None:
+                out = _ss.handle(data)
+                if out is not None:
+                    return out
+            if _p is not None:
+                return _p(data)
+            return None
+        network_manager.on_sync = _sync_chained
+    except Exception as e:
+        print(f"[Familiar] source-sync inbound chain failed: {e}", flush=True)
+
+    if _source_sync is not None:
+        atexit.register(_source_sync.stop)
 
     # Signal handlers
     def sigint_handler(sig, frame):
